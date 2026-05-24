@@ -104,6 +104,8 @@ struct SchedulerConfig {
     bool enable_mamba{false};
     std::int32_t mamba_cache_chunk_size{64};
     std::int32_t mamba_pool_total_chunks{0};
+
+    std::int32_t retract_promotion_threshold{16};
 };
 
 }  // namespace tokenspeed

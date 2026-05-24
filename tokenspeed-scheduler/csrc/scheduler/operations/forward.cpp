@@ -89,6 +89,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::int32_t num_tokens = loadback_tokens + tokens_this_round + decode_input_tokens;
     std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
 
+    device_pages_needed += static_cast<std::int32_t>(config_.num_pages_reserved_for_retracted_or_running);
+
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
 
     // Evict unlocked prefix-cache nodes before allocating request-local pages.
@@ -480,6 +482,14 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             return config_.enable_mixed_prefill_decode ? 0 : 3;
         }
         if (req->Is<fsm::Retracted>()) return 4;
+        // if (req->Is<fsm::Retracted>()) {
+        //     // After K rounds without recovery, promote to top priority (same as Prefilling)
+        //     if (config_.retract_promotion_threshold > 0 &&
+        //         req->GetRetractedWaitingRounds() >= config_.retract_promotion_threshold) {
+        //         return 1;
+        //     }
+        //     return 4;
+        // }
         return 9;
     };
     std::sort(candidates.begin(), candidates.end(),
@@ -541,6 +551,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
                     loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, op_id));
                 }
+                request->ResetRetractedWaitingRounds();
             }
         }
     }

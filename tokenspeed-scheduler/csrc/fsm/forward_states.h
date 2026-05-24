@@ -379,6 +379,8 @@ struct Retracted {
     std::unique_ptr<LocalKVAllocator> TakeKVAllocator() && { return std::move(local_kv_allocator_); }
     std::unique_ptr<LocalMambaAllocator> TakeMambaAllocator() && { return std::move(local_mamba_allocator_); }
 
+    std::int32_t waiting_rounds{0};
+
     // Returns only the pages held by the local KV allocator (tail page kept after retraction).
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         return local_kv_allocator_ ? local_kv_allocator_->Pages() : std::vector<std::int32_t>{};

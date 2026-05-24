@@ -61,6 +61,7 @@ def make_config(
     enable_l3_storage: bool,
     prefetch_threshold: int,
     role: str,
+    num_pages_reserved: int,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     disable_prefix_cache: bool = False,
@@ -92,6 +93,7 @@ def make_config(
     cfg.decode_input_tokens = decode_input_tokens
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.disable_l2_cache = disable_l2_cache
+    cfg.num_pages_reserved_for_retracted_or_running = num_pages_reserved
 
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size

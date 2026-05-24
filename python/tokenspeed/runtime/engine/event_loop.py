@@ -266,6 +266,8 @@ class EventLoop:
             and attn_tp_rank == 0
         )
 
+        num_pages_reserved = min(per_rank_max_batch, num_total_pages // 20)
+
         if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
                 f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
@@ -279,8 +281,9 @@ class EventLoop:
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
+
         scheduler_cfg = make_config(
-            num_device_pages=self.max_total_num_tokens // server_args.block_size,
+            num_device_pages=num_total_pages,
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
             page_size=server_args.block_size,
@@ -302,6 +305,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
+            num_pages_reserved=num_pages_reserved,
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "

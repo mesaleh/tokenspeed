@@ -239,7 +239,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
-        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks);
+        .def_rw("mamba_pool_total_chunks", &tokenspeed::SchedulerConfig::mamba_pool_total_chunks)
+        .def_rw("num_pages_reserved_for_retracted_or_running", &tokenspeed::SchedulerConfig::num_pages_reserved_for_retracted_or_running)
+        .def_rw("retract_promotion_threshold", &tokenspeed::SchedulerConfig::retract_promotion_threshold);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())

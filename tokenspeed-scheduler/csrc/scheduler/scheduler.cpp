@@ -295,6 +295,16 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
 ExecutionPlan Scheduler::NextExecutionPlan() {
     ExecutionPlan plan;
 
+    // if (RetractedSize() > 0) {
+    //     spdlog::info("Scheduling Round: DecodingSize={} PrefillSize={} Retracted={} Waiting={}", DecodingSize(), PrefillSize(), RetractedSize(), WaitingSize());
+    // }
+
+    for (auto& [id, req] : requests_) {
+        if (req->Is<fsm::Retracted>()) {
+            req->IncrementRetractedWaitingRounds();
+        }
+    }
+
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
 

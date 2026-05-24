@@ -252,6 +252,27 @@ public:
             state_);
     }
 
+    std::int32_t GetRetractedWaitingRounds() const {
+        return std::visit(Overloaded{
+            [](const fsm::Retracted& s) -> std::int32_t { return s.waiting_rounds; },
+            [](const auto&) -> std::int32_t { return 0; }
+        }, state_);
+    }
+
+    void IncrementRetractedWaitingRounds() {
+        std::visit(Overloaded{
+            [](fsm::Retracted& s) { s.waiting_rounds++; },
+            [](auto&) {}
+        }, state_);
+    }
+
+    void ResetRetractedWaitingRounds() {
+        std::visit(Overloaded{
+            [](fsm::Retracted& s) { s.waiting_rounds = 0; },
+            [](auto&) {}
+        }, state_);
+    }
+
     // Returns the (device_page, host_page) pairs that were captured immediately after
     // host pages were allocated inside the state transition event.
     // S must be fsm::Draining (captured in FinishEvent) or
