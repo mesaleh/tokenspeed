@@ -666,7 +666,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-            self.forward_absorb(
+            decode_attn_output = self.forward_absorb(
                 positions[num_prefill_tokens:],
                 q[num_prefill_tokens:],
                 latent_cache[num_prefill_tokens:],
@@ -676,9 +676,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
 
         if ctx.draft_first_step_reduce:
-            # KV already written; drop dead-position rows so o_proj / MLP /
-            # post-norms only run on one live row per request.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
+            attn_output = decode_attn_output
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -819,6 +817,14 @@ class DeepseekV3AttentionMLA(nn.Module):
             out_cache_loc,
             save_kv_cache=need_save_kv,
         )
+        if ctx.draft_first_step_reduce:
+            # KV already written; drop dead-position rows before the value
+            # projection so MLA does not spend BMM work on rejected draft slots.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+            output = output.new_empty(
+                (attn_output.size(0), self.num_local_heads * self.v_head_dim)
+            )
+
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
         torch.bmm(
