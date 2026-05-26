@@ -1413,7 +1413,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP"],
+            choices=["EAGLE3", "MTP", "DFLASH"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

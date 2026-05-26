@@ -1362,6 +1362,11 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        # DFlash checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+
     def get_param(self, params_dict, name):
         if name in params_dict:
             return params_dict[name]

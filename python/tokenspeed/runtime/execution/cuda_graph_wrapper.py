@@ -354,6 +354,7 @@ class CudaGraphWrapper:
         # attention warmup does not read an impossible q_len > seq_len state.
         tokens_per_req = self.max_tokens_per_req
         self.input_buffers.seq_lens_buf[:bs].fill_(tokens_per_req)
+        self.input_buffers.input_lengths_buf[:bs].fill_(tokens_per_req)
 
         # Capture block tables point at synthetic per-request pages. Write the
         # dummy KV tokens into those same slots so attention warmup/capture reads
