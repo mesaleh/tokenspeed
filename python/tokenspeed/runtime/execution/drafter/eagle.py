@@ -212,6 +212,23 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
 
+        # Models declare ``supports_draft_first_step_reduce`` to opt in; MLA /
+        # NextN heads that don't declare it fall back to the standard path.
+        draft_first_step_reduce = forward_mode.is_decode() and getattr(
+            self.draft_model_runner.model, "supports_draft_first_step_reduce", False
+        )
+
+        if draft_first_step_reduce and self.attn_backend.support_kv_cache_prewrite:
+            # Prewrite path slices Q to one row per request and uses the decode
+            # kernel, which reads seq_lens as the attention upper bound. Trim
+            # by the rejected-draft count so the live query does not read dead
+            # positions. Non-prewrite runs full multi-token attention with
+            # per-position causal masking, so seq_lens must stay unchanged.
+            correction = (self.spec_num_tokens - draft_input.accept_lengths).to(
+                self.draft_seq_lens_buf.dtype
+            )
+            self.draft_seq_lens_buf[:bs].sub_(correction)
+
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -225,6 +242,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
+            draft_first_step_reduce=draft_first_step_reduce,
         )
 
         return self.draft_model_runner.forward(

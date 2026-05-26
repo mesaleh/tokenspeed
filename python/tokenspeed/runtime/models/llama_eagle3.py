@@ -35,6 +35,7 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -185,17 +186,37 @@ class LlamaAttention(nn.Module):
                 output_q_rope=q_rope,
                 enable_pdl=pdl_enabled(),
             )
-            attn_output = self.attn(
-                q_rope,
-                None,
-                None,
-                save_kv_cache=False,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-            )
+            if ctx.draft_first_step_reduce:
+                # KV already written via fused_set_kv_buffer_arg above; slice Q
+                # to one query per request and route attn as decode.
+                q_rope = q_rope.index_select(0, ctx.gather_ids)
+                attn_output = ctx.attn_backend.forward(
+                    q_rope,
+                    None,
+                    None,
+                    self.attn,
+                    out_cache_loc,
+                    ctx.token_to_kv_pool,
+                    ForwardMode.DECODE,
+                    ctx.bs,
+                    save_kv_cache=False,
+                )
+            else:
+                attn_output = self.attn(
+                    q_rope,
+                    None,
+                    None,
+                    save_kv_cache=False,
+                    ctx=ctx,
+                    out_cache_loc=out_cache_loc,
+                )
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
+            if ctx.draft_first_step_reduce:
+                # KV written by self.attn above; slice attn_output so o_proj
+                # and the rest of the layer only run on the live rows.
+                attn_output = attn_output.index_select(0, ctx.gather_ids)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -361,6 +382,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
+        if ctx.draft_first_step_reduce:
+            # self_attn returned [bs, H]; gather residual to match before the
+            # fused allreduce+norm.
+            residual = residual.index_select(0, ctx.gather_ids)
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -426,6 +451,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             ctx=ctx,
             out_cache_loc=out_cache_loc,
         )
+        if ctx.draft_first_step_reduce:
+            # self_attn returned [bs, H]; gather residual to match before the
+            # post-attn norm+comm.
+            residual = residual.index_select(0, ctx.gather_ids)
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )
@@ -543,6 +572,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
     model_cls = Eagle3LlamaModel
+    supports_draft_first_step_reduce = True
 
     def __init__(
         self,

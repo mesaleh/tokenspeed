@@ -675,6 +675,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[num_prefill_tokens:],
             )
 
+        if ctx.draft_first_step_reduce:
+            # KV already written; drop dead-position rows so o_proj / MLP /
+            # post-norms only run on one live row per request.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1697,6 +1701,10 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
+            if ctx.draft_first_step_reduce:
+                # self_attn returned [bs, H]; gather residual to match before
+                # the fused reduce+norm.
+                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1823,6 +1831,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
     Eagle3MlaModel internally with a single MLA decoder layer that accepts
     concatenated [embeds || hidden_states] as input.
     """
+
+    supports_draft_first_step_reduce = True
 
     def __init__(
         self,
