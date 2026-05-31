@@ -29,8 +29,9 @@ No padding required — kernel handles ragged varlen directly.
 import functools
 import logging
 import math
-import os
-from typing import Optional, Tuple
+
+LOG2_E = math.log2(math.exp(1.0))  # ≈ 1.4426950408889634
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -39,7 +40,6 @@ from cutlass import Float32, Int32
 from cutlass.base_dsl.arch import Arch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
-from tokenspeed_mla import fmha_binary as _fmha_binary
 from tokenspeed_mla import fmha_helpers as fmha_utils
 from tokenspeed_mla.fmha import (
     BlackwellFusedMultiHeadAttentionForward,
@@ -47,27 +47,6 @@ from tokenspeed_mla.fmha import (
 from tokenspeed_mla.utils import torch_to_cutlass_dtype
 
 logger = logging.getLogger(__name__)
-LOG2_E = math.log2(math.exp(1.0))  # ≈ 1.4426950408889634
-
-# Backend selection via env var. Values: "cutedsl" (default) or "binary" (AOT SO).
-_PREFILL_BACKEND_ENV = os.environ.get(
-    "TOKENSPEED_MLA_PREFILL_BACKEND", "cutedsl"
-).lower()
-
-
-@functools.lru_cache(maxsize=None)
-def _resolve_backend() -> str:
-    """Resolve the effective prefill backend, called once on first inference."""
-    if _PREFILL_BACKEND_ENV == "binary":
-        if not _fmha_binary.has_binary_prefill():
-            raise RuntimeError(
-                "TOKENSPEED_MLA_PREFILL_BACKEND=binary requested but no binary SO "
-                "found for this GPU. Check tokenspeed_mla/objs/ or set "
-                "TOKENSPEED_MLA_FMHA_BINARY_SO to the .so path."
-            )
-        logger.info("MLA prefill: using binary backend")
-        return "binary"
-    return "cutedsl"
 
 
 def _to_cute(src: torch.Tensor, dtype):
@@ -296,7 +275,6 @@ def tokenspeed_mla_prefill(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     enable_pdl: bool = False,
-    out: Optional[torch.Tensor] = None,
 ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
     """CuTe DSL FMHA prefill kernel for MLA on Blackwell SM100.
 
@@ -304,7 +282,6 @@ def tokenspeed_mla_prefill(
       Q shape: [sum(q_lens), h_q, d_qk]
       K shape: [sum(kv_lens), h_k, d_qk]
       V shape: [sum(kv_lens), h_k, d_v]
-    If provided, out must be contiguous BF16 with shape [sum(q_lens), h_q, d_v].
     """
     total_q_tokens, h_q, d_qk = query.shape
     total_kv_tokens, h_k, _ = key.shape
@@ -348,77 +325,12 @@ def tokenspeed_mla_prefill(
 
     # Output: BF16, same 5D layout. The kernel writes (out=0, lse=-inf) for
     # rows in batches where seqlen_k==0, so no pre-init is required.
-    if out is None:
-        o_torch = torch.empty(
-            total_q_tokens, h_q, d_v, dtype=out_torch_dtype, device=query.device
-        )
-    else:
-        expected_shape = (total_q_tokens, h_q, d_v)
-        if out.shape != expected_shape:
-            raise ValueError(f"out shape must be {expected_shape}, got {out.shape}")
-        if out.dtype != out_torch_dtype:
-            raise TypeError(f"out dtype must be {out_torch_dtype}, got {out.dtype}")
-        if out.device != query.device:
-            raise ValueError(f"out device {out.device} must match query {query.device}")
-        if not out.is_contiguous():
-            raise ValueError("out must be contiguous")
-        o_torch = out
+    o_torch = torch.empty(
+        total_q_tokens, h_q, d_v, dtype=out_torch_dtype, device=query.device
+    )
     o_5d = o_torch.view(1, total_q_tokens, h_k, h_r, d_v)
     o_ct = _to_cute(o_5d, out_cutlass_dtype)
 
-    # Cumulative sequence lengths.
-    # Keep backing tensors alive until after kernel launch.
-    cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q)
-    cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv)
-
-    if _resolve_backend() == "binary":
-        # Binary backend: LSE layout is (1, h_k, h_r, total_q) — differs from CuteDSL's
-        # (total_q, h_q). The binary SO was AOT-compiled with that layout.
-        if return_lse:
-            lse_binary = torch.empty(
-                1, h_k, h_r, total_q_tokens, dtype=torch.float32, device=query.device
-            )
-            lse_binary_ct = _to_cute(lse_binary, cutlass.Float32)
-        else:
-            lse_binary = None
-            lse_binary_ct = None
-
-        _fmha_binary.call_binary_prefill(
-            q_ct,
-            k_ct,
-            v_ct,
-            o_ct,
-            lse_binary_ct,
-            (
-                batch_size,
-                max_seq_len_q,
-                total_q_tokens,
-                max_seq_len_kv,
-                h_q,
-                h_k,
-                d_qk,
-                d_v,
-            ),
-            cum_q_ct,
-            cum_k_ct,
-            softmax_scale * LOG2_E,
-            softmax_scale,
-            is_causal,
-            return_lse,
-        )
-
-        if return_lse:
-            # Reshape (1, h_k, h_r, total_q) → (total_q, h_q) to match CuteDSL output.
-            lse_torch = (
-                lse_binary.squeeze(0)
-                .permute(2, 0, 1)
-                .reshape(total_q_tokens, h_q)
-                .contiguous()
-            )
-            return o_torch, lse_torch
-        return o_torch
-
-    # CuteDSL backend (default): JIT-compile kernel on first use, cache thereafter.
     if return_lse:
         lse_torch = torch.empty(
             (total_q_tokens, h_q),
@@ -429,6 +341,11 @@ def tokenspeed_mla_prefill(
     else:
         lse_torch = None
         lse_ct = None
+
+    # Cumulative sequence lengths.
+    # Keep backing tensors alive until after kernel launch.
+    cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q)
+    cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv)
 
     # Cache by static config — all shapes are symbolic at compile time, but
     # ``enable_pdl`` and ``enable_ex2_emulation`` flip constexpr paths inside

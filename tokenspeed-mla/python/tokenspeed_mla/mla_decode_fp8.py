@@ -74,7 +74,6 @@ try:
         ceil_div,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
-        get_mla_decode_fold_sq_factor,
     )
 except ImportError:
     from mla_helpers import (
@@ -85,7 +84,6 @@ except ImportError:
         ceil_div,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
-        get_mla_decode_fold_sq_factor,
     )
 
 """
@@ -121,7 +119,7 @@ The above example runs Multi-Head Latent Attention (MLA) with the following conf
 - Sequence length of K: 1024
 - Latent dimension: 512
 - RoPE dimension: 64
-- Number of heads: up to 128
+- Number of heads: 128
 - Data types: Float8E4M3FN (input), Float8E4M3FN (output), Float32 (accumulation and LSE)
 
 It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
@@ -145,12 +143,12 @@ Constraints for this example:
   - Input/output: Float8E4M3FN
   - Accumulation and LSE: Float32
 * Fixed architecture parameters:
-  - Number of attention heads: up to 128
+  - Number of attention heads: 128
   - Latent dimension: 512
   - RoPE dimension: 64
 * Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ, BatchSize)
 * Input kv latent/rope modes should be (SeqLenK, LatentDim/RopeDim, BatchSize)
-* Query sequence length must be positive
+* Query sequence length must be 1-4
 * Only supports 2-CTA instructions
 * Variable sequence length requires page table storage enabled
 """
@@ -169,10 +167,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
-        fold_sq_factor: int = 1,
+        fold_sq: bool = False,
         is_causal: bool = False,
         num_heads: int = 128,
         seq_len_q: int = 1,
+        tree_mask_mode: bool = False,
+        fold_q_chunk_size: int = 0,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -210,14 +210,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
-        self.fold_sq_factor = fold_sq_factor
+        self.fold_sq = fold_sq
         self.is_causal = is_causal
         # Original (pre-fold) num_heads and seq_len_q used for per-row causal
-        # q_token_index computation. When fold_sq_factor > 1, each S_q group folds
-        # fold_sq_factor tokens into M: M_fold = H * fold_sq_factor.
-        # row r → (q_tok_in_group = r // num_heads, head = r % num_heads).
+        # q_token_index computation. When fold_sq is True, the M tile is laid
+        # out as [S_q * H] with row r → (q_tok = r // num_heads, head = r % num_heads).
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
+        # Small-head larger-q specialization: keep the good folded-M geometry but
+        # split q into fixed chunks along the effective S dimension. For Kimi
+        # verify H=16, fold_q_chunk_size=8 maps q16 to M=128,S_eff=2 in one launch.
+        self.fold_q_chunk_size = fold_q_chunk_size
+        # Tree-spec mask (EAGLE tree drafting for MLA): when True, the per-row
+        # causal k_bound is replaced by a direct read of SGLang's flattened tree
+        # attention mask (custom_mask) at [cmask_off[b] + q_tok*K + kcol]; history
+        # cols read True automatically and the last seq_len_q cols carry the tree
+        # ancestry. Reading SGLang's own (GPU-built, CUDA-graph-persistent) mask
+        # keeps the path graph-safe and avoids a per-step host-side ancestor build.
+        # tree_mask_mode=False leaves the existing causal path byte-identical.
+        self.tree_mask_mode = tree_mask_mode
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -323,6 +334,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         c_latent: cute.Tensor,
         c_rope: cute.Tensor,
         page_table: cute.Tensor,
+        custom_mask: cute.Tensor,
+        cmask_off: cute.Tensor,
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
         workspace: cute.Tensor,
@@ -443,31 +456,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             else None
         )
 
-        # When num_heads < M tile (128), fold fold_sq_factor query tokens into
-        # the head dimension to better fill MMA M dimension per S_q group.
-        # E.g., H=64, S_q=4, fold_sq_factor=2 → M_eff=128, S_q_eff=2.
+        # When num_heads < M tile (128), fold seq_len_q into the head dimension
+        # to fill the MMA M dimension. E.g., H=32, S_q=4 → M_eff=128, S_q_eff=1.
         # This works because MLA shares KV across all heads/queries independently.
-        if cutlass.const_expr(self.fold_sq_factor > 1):
+        if cutlass.const_expr(self.fold_sq):
 
             def _fold_sq_4d(t):
-                # [H, D, S_q, B] → [H*F, D, S_q/F, B], where F=fold_sq_factor.
-                # Use S_q//F to keep dynamic value type in MLIR.
-                fold_groups = t.shape[2] // self.fold_sq_factor
+                # [H, D, S_q, B] → [H*S_q, D, 1, B]
+                # Use S_q//S_q to get a "dynamic 1" preserving MLIR value type
+                dyn_one = t.shape[2] // t.shape[2]
                 return cute.make_tensor(
                     t.iterator,
                     cute.make_layout(
-                        (
-                            t.shape[0] * self.fold_sq_factor,
-                            t.shape[1],
-                            fold_groups,
-                            t.shape[3],
-                        ),
-                        stride=(
-                            t.stride[0],
-                            t.stride[1],
-                            t.stride[2] * self.fold_sq_factor,
-                            t.stride[3],
-                        ),
+                        (t.shape[0] * t.shape[2], t.shape[1], dyn_one, t.shape[3]),
+                        stride=(t.stride[0], t.stride[1], t.stride[3], t.stride[3]),
                     ),
                 )
 
@@ -475,19 +477,55 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             q_rope = _fold_sq_4d(q_rope)
             o = _fold_sq_4d(o)
             if cutlass.const_expr(not self.skip_lse):
-                # [H, S_q, B] → [H*F, S_q/F, B], where F=fold_sq_factor.
-                fold_groups = lse.shape[1] // self.fold_sq_factor
+                # [H, S_q, B] → [H*S_q, 1, B]
+                dyn_one = lse.shape[1] // lse.shape[1]
                 lse = cute.make_tensor(
                     lse.iterator,
                     cute.make_layout(
-                        (lse.shape[0] * self.fold_sq_factor, fold_groups, lse.shape[2]),
+                        (lse.shape[0] * lse.shape[1], dyn_one, lse.shape[2]),
+                        stride=(lse.stride[0], lse.stride[2], lse.stride[2]),
+                    ),
+                )
+        elif cutlass.const_expr(self.fold_q_chunk_size > 0):
+
+            def _fold_q_chunk_4d(t):
+                # [H, D, S_q, B] -> [H*chunk, D, S_q/chunk, B].
+                # Row order remains q_inner-major then head, so row stride stays
+                # the original H stride and the effective S stride jumps by chunk.
+                chunk = self.fold_q_chunk_size
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (
+                            t.shape[0] * chunk,
+                            t.shape[1],
+                            t.shape[2] // chunk,
+                            t.shape[3],
+                        ),
                         stride=(
-                            lse.stride[0],
-                            lse.stride[1] * self.fold_sq_factor,
-                            lse.stride[2],
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[2] * chunk,
+                            t.stride[3],
                         ),
                     ),
                 )
+
+            def _fold_q_chunk_3d(t):
+                chunk = self.fold_q_chunk_size
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (t.shape[0] * chunk, t.shape[1] // chunk, t.shape[2]),
+                        stride=(t.stride[0], t.stride[1] * chunk, t.stride[2]),
+                    ),
+                )
+
+            q_latent = _fold_q_chunk_4d(q_latent)
+            q_rope = _fold_q_chunk_4d(q_rope)
+            o = _fold_q_chunk_4d(o)
+            if cutlass.const_expr(not self.skip_lse):
+                lse = _fold_q_chunk_3d(lse)
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -818,6 +856,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tma_atom_c_latent_transpose,
             tma_tensor_c_latent_transpose,
             page_table,
+            custom_mask,
+            cmask_off,
             o,
             lse if not self.skip_lse else None,
             acc_o,
@@ -923,6 +963,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
         mCLT: cute.Tensor,
         mPT: cute.Tensor,
+        mCmask: cute.Tensor,
+        mCmaskOff: cute.Tensor,
         mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mAccO: Optional[cute.Tensor],
@@ -1400,6 +1442,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        cmask=mCmask,
+                        cmask_off=mCmaskOff,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -2735,9 +2779,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Causal mask: emulate single-token-per-CTA causal masking for
         # spec-decoding / MTP generation. Each row represents one (q_token, head)
         # pair; row r's effective K bound is K - (S_q - 1 - q_tok(r)).
-        #   fold_sq_factor>1 : q_tok(r) = blk_coord[1] * F + (r_global // num_heads),
-        #                      where F=fold_sq_factor and M is laid out as [F, H].
-        #   fold_sq_factor=1 : q_tok(r) = blk_coord[1] (single q token per work tile)
+        #   fold_sq=True : q_tok(r) = r_global // num_heads (M laid out as [S_q, H])
+        #   fold_sq=False: q_tok(r) = blk_coord[1] (single q token per work tile)
         # r_global = row_in_cta + cluster_idx * (M_tile / cluster_m)
         # Masked positions are filled with a large negative sentinel (not -inf).
         # With -inf, rows that become entirely masked in a tile produce NaN in
@@ -2755,29 +2798,85 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_consumer_state.advance()
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
-                    if cutlass.const_expr(self.is_causal):
-                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                    if cutlass.const_expr(self.tree_mask_mode):
+                        if cutlass.const_expr(self.fold_q_chunk_size > 0):
                             q_tok = (
-                                common_params.blk_coord[1] * self.fold_sq_factor
+                                common_params.blk_coord[1] * self.fold_q_chunk_size
                                 + (
                                     tTR_tS[i][0]
                                     + common_params.blk_coord[0] * cta_m_rows
                                 )
                                 // self.num_heads
                             )
+                        elif cutlass.const_expr(self.fold_sq):
+                            q_tok = (
+                                tTR_tS[i][0] + common_params.blk_coord[0] * cta_m_rows
+                            ) // self.num_heads
                         else:
                             q_tok = common_params.blk_coord[1]
-                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
-                    else:
-                        k_bound = common_params.K
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            k_bound,
+                        kcol = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+                        # custom_mask is SGLang's flattened tree attention mask. For
+                        # request b it is row-major [seq_len_q x K] (True=attend): the
+                        # history cols are all-True and the last seq_len_q cols carry
+                        # the tree ancestry. Base offset for request b is cmask_off[b]
+                        # (= seq_len_q * sum of prior requests' K). kcol is clamped to
+                        # [0, K-1] so the gmem read stays in-bounds for tile-padding
+                        # cols (kcol >= K when K is not a multiple of tile_n); those
+                        # padding cols are masked out via within_kv. History cols read
+                        # True automatically, so no separate history branch is needed.
+                        within_kv = cute.elem_less(kcol, common_params.K)
+                        kcol_in = (
+                            kcol
+                            if within_kv
+                            else cutlass.Int32(common_params.K - 1)
                         )
-                        else self.acc_dtype(-1.0e6)
-                    )
+                        cm_idx = (
+                            common_params.cmask_off[common_params.blk_coord[2]]
+                            + q_tok * common_params.K
+                            + kcol_in
+                        )
+                        cm_keep = cute.elem_less(
+                            cutlass.Int32(0),
+                            cutlass.Int32(common_params.cmask[cm_idx]),
+                        )
+                        tTR_rAcc[i] = (
+                            (
+                                tTR_rAcc[i]
+                                if cm_keep
+                                else self.acc_dtype(-1.0e6)
+                            )
+                            if within_kv
+                            else self.acc_dtype(-1.0e6)
+                        )
+                    else:
+                        if cutlass.const_expr(self.is_causal):
+                            if cutlass.const_expr(self.fold_q_chunk_size > 0):
+                                q_tok = (
+                                    common_params.blk_coord[1] * self.fold_q_chunk_size
+                                    + (
+                                        tTR_tS[i][0]
+                                        + common_params.blk_coord[0] * cta_m_rows
+                                    )
+                                    // self.num_heads
+                                )
+                            elif cutlass.const_expr(self.fold_sq):
+                                q_tok = (
+                                    tTR_tS[i][0]
+                                    + common_params.blk_coord[0] * cta_m_rows
+                                ) // self.num_heads
+                            else:
+                                q_tok = common_params.blk_coord[1]
+                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        else:
+                            k_bound = common_params.K
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                                k_bound,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
@@ -2808,32 +2907,88 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    if cutlass.const_expr(self.is_causal):
-                        if cutlass.const_expr(self.fold_sq_factor > 1):
+                    if cutlass.const_expr(self.tree_mask_mode):
+                        if cutlass.const_expr(self.fold_q_chunk_size > 0):
                             q_tok = (
-                                common_params.blk_coord[1] * self.fold_sq_factor
+                                common_params.blk_coord[1] * self.fold_q_chunk_size
                                 + (
                                     tTR_tS[i][0]
                                     + common_params.blk_coord[0] * cta_m_rows
                                 )
                                 // self.num_heads
                             )
+                        elif cutlass.const_expr(self.fold_sq):
+                            q_tok = (
+                                tTR_tS[i][0] + common_params.blk_coord[0] * cta_m_rows
+                            ) // self.num_heads
                         else:
                             q_tok = common_params.blk_coord[1]
-                        # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
-                        # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
-                        # Int32 __rsub__ quirks when self.seq_len_q==1.
-                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
-                    else:
-                        k_bound = common_params.K
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            k_bound,
+                        kcol = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+                        # custom_mask is SGLang's flattened tree attention mask. For
+                        # request b it is row-major [seq_len_q x K] (True=attend): the
+                        # history cols are all-True and the last seq_len_q cols carry
+                        # the tree ancestry. Base offset for request b is cmask_off[b]
+                        # (= seq_len_q * sum of prior requests' K). kcol is clamped to
+                        # [0, K-1] so the gmem read stays in-bounds for tile-padding
+                        # cols (kcol >= K when K is not a multiple of tile_n); those
+                        # padding cols are masked out via within_kv. History cols read
+                        # True automatically, so no separate history branch is needed.
+                        within_kv = cute.elem_less(kcol, common_params.K)
+                        kcol_in = (
+                            kcol
+                            if within_kv
+                            else cutlass.Int32(common_params.K - 1)
                         )
-                        else self.acc_dtype(-1.0e6)
-                    )
+                        cm_idx = (
+                            common_params.cmask_off[common_params.blk_coord[2]]
+                            + q_tok * common_params.K
+                            + kcol_in
+                        )
+                        cm_keep = cute.elem_less(
+                            cutlass.Int32(0),
+                            cutlass.Int32(common_params.cmask[cm_idx]),
+                        )
+                        tTR_rAcc[i] = (
+                            (
+                                tTR_rAcc[i]
+                                if cm_keep
+                                else self.acc_dtype(-1.0e6)
+                            )
+                            if within_kv
+                            else self.acc_dtype(-1.0e6)
+                        )
+                    else:
+                        if cutlass.const_expr(self.is_causal):
+                            if cutlass.const_expr(self.fold_q_chunk_size > 0):
+                                q_tok = (
+                                    common_params.blk_coord[1] * self.fold_q_chunk_size
+                                    + (
+                                        tTR_tS[i][0]
+                                        + common_params.blk_coord[0] * cta_m_rows
+                                    )
+                                    // self.num_heads
+                                )
+                            elif cutlass.const_expr(self.fold_sq):
+                                q_tok = (
+                                    tTR_tS[i][0]
+                                    + common_params.blk_coord[0] * cta_m_rows
+                                ) // self.num_heads
+                            else:
+                                q_tok = common_params.blk_coord[1]
+                            # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
+                            # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
+                            # Int32 __rsub__ quirks when self.seq_len_q==1.
+                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                        else:
+                            k_bound = common_params.K
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                                k_bound,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0
@@ -3574,7 +3729,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tile_sched_params = create_mla_static_tile_scheduler_params(
             is_persistent,
             cute.size(o_shape[3]),  # batch
-            cute.size(o_shape[2]),  # S_q or S_q/fold_sq_factor
+            cute.size(o_shape[2]),  # S_q or 1 for fold_sq
             cluster_shape_mnk,
             split_kv,
         )
@@ -3748,9 +3903,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             return False
         if is_var_split_kv and not is_var_seq:
             return False
-        if H <= 0 or H > mma_qk_tiler_mn[0]:
+        if H > mma_qk_tiler_mn[0]:
             return False
-        if S < 1:
+        # When H < M tile, fold S_q into H to fill the MMA M dimension
+        # H*S can be < M tile (padding with zeros via TMA OOB); it just can't exceed it
+        if H < mma_qk_tiler_mn[0] and H * S > mma_qk_tiler_mn[0]:
+            return False
+        if S <= 0:
             return False
         if K <= 0:
             return False
@@ -4029,7 +4188,7 @@ def run(
     ):
         block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
         # check if split_kv is valid otherwise do auto setting of split_kv
-        # Use seq_len_q_for_split (effective S_q after fold grouping).
+        # Use seq_len_q_for_split (effective S_q=1 when folding heads)
         if is_var_split_kv:
             block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
             for b in range(batch_size):
@@ -4086,12 +4245,12 @@ def run(
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mnk[0] * cluster_shape_mnk[1]
     )
-    # Fold only by a factor that exactly divides seq_len_q; otherwise leave
-    # the query sequence on the scheduler dimension.
-    fold_sq_factor = get_mla_decode_fold_sq_factor(
-        num_heads, seq_len_q, mma_qk_tiler_mn[0]
+    # When num_heads < M tile, fold seq_len_q into heads (effective S_q=1)
+    # H*S_q may be < M tile; TMA zero-fills OOB rows, epilogue guards skip padded output
+    fold_sq = (
+        num_heads < mma_qk_tiler_mn[0] and num_heads * seq_len_q <= mma_qk_tiler_mn[0]
     )
-    seq_len_q_for_split = seq_len_q // fold_sq_factor
+    seq_len_q_for_split = 1 if fold_sq else seq_len_q
     split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = (
         create_block_split_kvs(
             batch_size,
@@ -4156,9 +4315,9 @@ def run(
         is_lse=True,
         seq_len_q=seq_len_q,
     )
-    # Use effective dimensions for workspace when folding S_q groups into heads
-    num_heads_eff = num_heads * fold_sq_factor
-    seq_len_q_eff = seq_len_q // fold_sq_factor
+    # Use effective dimensions for workspace when folding S_q into heads
+    num_heads_eff = num_heads * seq_len_q if fold_sq else num_heads
+    seq_len_q_eff = 1 if fold_sq else seq_len_q
     workspace, workspace_torch = create_workspace(
         num_heads_eff, seq_len_q_eff, latent_dim, batch_size, split_kv, acc_dtype
     )
@@ -4174,7 +4333,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
-        fold_sq_factor=fold_sq_factor,
+        fold_sq=fold_sq,
         is_causal=is_causal,
         num_heads=num_heads,
         seq_len_q=seq_len_q,
@@ -4685,7 +4844,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    exec_time = run(
+    run(
         args.batch_size,
         args.seq_len_q,
         args.seq_len_k,
@@ -4713,7 +4872,5 @@ if __name__ == "__main__":
         args.use_cold_l2,
         is_causal=args.is_causal,
     )
-
-    print(f"Execution time (mla + reduction): {exec_time:.4f} microseconds")
 
     print("PASS")
