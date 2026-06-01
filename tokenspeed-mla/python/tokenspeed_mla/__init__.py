@@ -21,6 +21,7 @@
 """Speed-of-light TokenSpeed MLA kernels for Blackwell SM100 and SM103."""
 
 try:
+    from tokenspeed_mla.fmha_binary import has_binary_prefill
     from tokenspeed_mla.mla_decode import (
         tokenspeed_mla_decode,
     )
@@ -46,6 +47,7 @@ except ImportError as exc:
     mla_kv_pack_quantize_fp8 = _unavailable
     get_num_sm = _unavailable
     warmup_compile_prefill = _unavailable
+    has_binary_prefill = _unavailable
 
 __all__ = [
     "tokenspeed_mla_decode",
@@ -53,4 +55,5 @@ __all__ = [
     "mla_kv_pack_quantize_fp8",
     "get_num_sm",
     "warmup_compile_prefill",
+    "has_binary_prefill",
 ]

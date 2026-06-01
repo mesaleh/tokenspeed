@@ -94,6 +94,10 @@ def _check_chain_equals_causal():
     print("[oracle] chain==causal, ancestor walk, KV-mask expansion: PASS")
 
 
+def test_tree_mask_oracle_chain_equals_causal():
+    _check_chain_equals_causal()
+
+
 if __name__ == "__main__":
     _check_chain_equals_causal()
     print("[oracle] CPU desk-check passed. Kernel-vs-ref validation extends the in-op "

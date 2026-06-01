@@ -224,6 +224,14 @@ class CuteDSLMLABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
+        if getattr(spec_info, "custom_mask", None) is not None:
+            raise NotImplementedError(
+                "tokenspeed_mla runtime backend does not wire EAGLE tree "
+                "custom_mask into tokenspeed_mla_decode yet. Use an integrated "
+                "backend that passes custom_mask/cmask_off, or call "
+                "tokenspeed_mla_decode directly with those arguments."
+            )
+
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
