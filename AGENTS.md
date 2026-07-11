@@ -42,3 +42,11 @@ Inside the root tokenspeed-kernel/ directory:
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
+
+<!-- BEGIN MARLIN ISSUE TRACKING -->
+## Issue Tracking (Marlin-managed -- edit via the omniva-issue-management skill)
+- Tracker: gitlab
+- GitLab project: acls/security-analytics/tokenspeed
+- Commits, branches, and MRs MUST reference a GitLab issue in this repo (e.g. `#123`).
+- File bugs / feature requests with the omniva-issue-management skill.
+<!-- END MARLIN ISSUE TRACKING -->
