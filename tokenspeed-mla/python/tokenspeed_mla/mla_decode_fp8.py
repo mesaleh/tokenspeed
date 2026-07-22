@@ -2096,7 +2096,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_params.raw_pipeline.producer_commit(raw_producer_state)
             raw_producer_state.advance()
 
-            for iteration in cutlass.range_constexpr(32):
+            for iteration in cutlass.range(32, unroll=1):
                 word_linear = iteration * self.threads_per_warp + lane
                 row = word_linear // 16
                 dim_word = word_linear % 16
