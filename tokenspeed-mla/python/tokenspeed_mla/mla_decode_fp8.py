@@ -293,7 +293,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.correction_reg_num = 256
         self.other_reg_num = 40
         self.tq4_correction_reg_num = 184
-        self.tq4_conversion_reg_num = 72
+        # Multi-tile conversion can use the CTA's final 1K-register headroom.
+        # Keep the one-tile specialization at 72 for its fully unrolled loader.
+        self.tq4_conversion_reg_num = 80 if tq4_tiles_per_split > 1 else 72
         # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
@@ -2096,30 +2098,66 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_params.raw_pipeline.producer_commit(raw_producer_state)
             raw_producer_state.advance()
 
-            for iteration in cutlass.range(32, unroll=1):
-                word_linear = iteration * self.threads_per_warp + lane
-                row = word_linear // 16
-                dim_word = word_linear % 16
-                page = row // self.page_size
-                page_row = row % self.page_size
-                physical_page = page_table[(k_index * 2 + cta) * 2 + page]
-                values = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
-                for element in cutlass.range_constexpr(4):
-                    values[element] = cutlass.Float32(
-                        k_params.mKR[
-                            page_row, dim_word * 4 + element, physical_page
-                        ]
+            # These loops must remain in separate constexpr branches: CuTe DSL
+            # requires both iterator kinds to be visible at the loop syntax.
+            if cutlass.const_expr(self.tq4_tiles_per_split == 1):
+                for iteration in cutlass.range_constexpr(32):
+                    word_linear = iteration * self.threads_per_warp + lane
+                    row = word_linear // 16
+                    dim_word = word_linear % 16
+                    page = row // self.page_size
+                    page_row = row % self.page_size
+                    physical_page = page_table[(k_index * 2 + cta) * 2 + page]
+                    values = cute.make_rmem_tensor(
+                        cute.make_layout(4), cutlass.Float32
                     )
-                rope_i32[
-                    (
-                        (page_row, dim_word),
-                        page,
-                        0,
-                        output_producer_state.index,
+                    for element in cutlass.range_constexpr(4):
+                        values[element] = cutlass.Float32(
+                            k_params.mKR[
+                                page_row, dim_word * 4 + element, physical_page
+                            ]
+                        )
+                    rope_i32[
+                        (
+                            (page_row, dim_word),
+                            page,
+                            0,
+                            output_producer_state.index,
+                        )
+                    ] = cvt_f32x4_to_f8x4_pack_i32(
+                        values, cutlass.Float8E4M3FN
                     )
-                ] = cvt_f32x4_to_f8x4_pack_i32(
-                    values, cutlass.Float8E4M3FN
-                )
+            else:
+                for iteration in cutlass.range(32, unroll=1):
+                    rolled_word_linear = iteration * self.threads_per_warp + lane
+                    rolled_row = rolled_word_linear // 16
+                    rolled_dim_word = rolled_word_linear % 16
+                    rolled_page = rolled_row // self.page_size
+                    rolled_page_row = rolled_row % self.page_size
+                    rolled_physical_page = page_table[
+                        (k_index * 2 + cta) * 2 + rolled_page
+                    ]
+                    rolled_values = cute.make_rmem_tensor(
+                        cute.make_layout(4), cutlass.Float32
+                    )
+                    for element in cutlass.range_constexpr(4):
+                        rolled_values[element] = cutlass.Float32(
+                            k_params.mKR[
+                                rolled_page_row,
+                                rolled_dim_word * 4 + element,
+                                rolled_physical_page,
+                            ]
+                        )
+                    rope_i32[
+                        (
+                            (rolled_page_row, rolled_dim_word),
+                            rolled_page,
+                            0,
+                            output_producer_state.index,
+                        )
+                    ] = cvt_f32x4_to_f8x4_pack_i32(
+                        rolled_values, cutlass.Float8E4M3FN
+                    )
             cute.arch.fence_view_async_shared()
             common_params.load_k_pipeline.producer_commit(output_producer_state)
             output_producer_state.advance()
