@@ -67,7 +67,9 @@ def main() -> None:
     torch.manual_seed(20260722)
     device = torch.device("cuda")
     fp8 = torch.float8_e4m3fn
-    pages = math.ceil(args.context / PAGE)
+    # The native kernel loads complete 128-token tiles, so keep the synthetic
+    # block table padded exactly as a serving-time max-context table is.
+    pages = math.ceil(args.context / 128) * (128 // PAGE)
 
     query = (
         torch.randn(1, Q_LEN, HEADS, LATENT + ROPE, device=device) * 0.1
