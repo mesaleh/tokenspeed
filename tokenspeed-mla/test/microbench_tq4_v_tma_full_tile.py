@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Validate a complete production-sized TQ4 K landing/conversion stage.
+"""Validate a complete production-sized TQ4 V landing/conversion stage.
 
-One CTA issues eight natural-U4 TMA page-slice copies into a tile-major packed
-view in the upper half of TokenSpeed's existing K allocation. Four warps
-convert one complete 128-dimension TMA chunk per phase, synchronize, and
-overwrite only packed chunks whose values have already been captured. The
-result uses the exact production FP8 K-stage view without extra payload smem.
+Each CTA issues eight natural-U4 TMA page-slice copies for its discontiguous
+half of a 128x512 V tile. The packed view occupies the upper 16 KiB of the
+existing 32 KiB FP8 V stage. Four warps capture one complete page-pair and
+latent chunk per phase before overwriting the same backing through the exact
+production V-stage view.
 """
 
 from __future__ import annotations
@@ -43,37 +43,50 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from tokenspeed_mla.tq4_cutedsl import dequantize_tq4_word_to_fp8_shfl
 
 
-TILE_TOKENS = 64
-TILE_LATENT = 512
+TILE_TOKENS = 128
+CTA_LATENT = 256
+FULL_LATENT = 512
 PAGE_TOKENS = 32
 TMA_LATENT = 128
 THREADS = 128
 CONVERSION_PHASES = 4
 
 
-def make_k_layouts():
-    mma_tiler = (128, 128, 128)
+def make_v_layouts():
+    mma_tiler = (128, 256, 64)
     tiled_mma = sm100_utils.make_trivial_tiled_mma(
         cutlass.Float8E4M3FN,
         OperandMajorMode.K,
-        OperandMajorMode.K,
+        OperandMajorMode.MN,
         cutlass.Float32,
         tcgen05.CtaGroup.TWO,
         mma_tiler[:2],
     )
     staged = sm100_utils.make_smem_layout_b(
-        tiled_mma, mma_tiler, cutlass.Float8E4M3FN, 12
+        tiled_mma, mma_tiler, cutlass.Float8E4M3FN, 8
     )
-    staged = cute.logical_divide(staged, (None, None, None, 4))
+    staged = cute.logical_divide(
+        cute.logical_divide(staged, (None, None, None, 4)),
+        (None, None, None, (2, None)),
+    )
 
     for_tma = sm100_utils.make_smem_layout(
-        OperandMajorMode.K,
-        (mma_tiler[0] // tiled_mma.thr_id.shape, mma_tiler[2]),
+        OperandMajorMode.MN,
+        (mma_tiler[1] // tiled_mma.thr_id.shape, mma_tiler[2]),
         cutlass.Float8E4M3FN,
-        12,
+        8,
     )
-    for_tma = cute.tiled_divide(for_tma, (PAGE_TOKENS, mma_tiler[2]))
-    for_tma = cute.logical_divide(for_tma, (None, None, None, 4))
+    for_tma = cute.tiled_divide(
+        for_tma,
+        (
+            tiled_mma.op.shape_mnk[1] // tiled_mma.thr_id.shape,
+            PAGE_TOKENS,
+        ),
+    )
+    for_tma = cute.logical_divide(
+        cute.logical_divide(for_tma, (None, None, None, 4)),
+        (None, None, None, (2, None)),
+    )
     return staged, for_tma
 
 
@@ -92,6 +105,8 @@ def full_tile_kernel(
 ):
     tidx, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
+    tile = block // 2
+    cta = block % 2
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
@@ -104,7 +119,7 @@ def full_tile_kernel(
             PAGE_TOKENS,
             TMA_LATENT,
             TILE_TOKENS // PAGE_TOKENS,
-            TILE_LATENT // TMA_LATENT,
+            CTA_LATENT // TMA_LATENT,
         ),
         stride=(
             TMA_LATENT,
@@ -115,7 +130,7 @@ def full_tile_kernel(
     )
     packed_stage = cute.make_tensor(
         cute.recast_ptr(
-            storage.stage.data_ptr() + TILE_TOKENS * TILE_LATENT // 2,
+            storage.stage.data_ptr() + TILE_TOKENS * CTA_LATENT // 2,
             dtype=cutlass.Int4,
         ),
         packed_layout,
@@ -134,18 +149,21 @@ def full_tile_kernel(
             cute.arch.mbarrier_init(barrier_ptr, 1)
             cute.arch.mbarrier_expect_tx(
                 barrier_ptr,
-                TILE_TOKENS * TILE_LATENT * cutlass.Int4.width // 8,
+                TILE_TOKENS * CTA_LATENT * cutlass.Int4.width // 8,
             )
         cute.arch.mbarrier_init_fence()
-        for page in cutlass.range_constexpr(TILE_TOKENS // PAGE_TOKENS):
-            physical_page = page_table[block, page]
-            for chunk in cutlass.range_constexpr(TILE_LATENT // TMA_LATENT):
-                cute.copy(
-                    tma_atom,
-                    tma_global[None, 0, chunk, physical_page],
-                    tma_stage[None, page, chunk],
-                    tma_bar_ptr=barrier_ptr,
-                )
+        for token_stage in cutlass.range_constexpr(2):
+            for page in cutlass.range_constexpr(2):
+                physical_page = page_table[tile, token_stage * 2 + page]
+                packed_page = token_stage * 2 + page
+                for latent_stage in cutlass.range_constexpr(2):
+                    global_chunk = latent_stage * 2 + cta
+                    cute.copy(
+                        tma_atom,
+                        tma_global[None, 0, global_chunk, physical_page],
+                        tma_stage[None, packed_page, latent_stage],
+                        tma_bar_ptr=barrier_ptr,
+                    )
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(barrier_ptr)
         cute.arch.mbarrier_wait(barrier_ptr, 0)
@@ -159,70 +177,67 @@ def full_tile_kernel(
         cute.make_tensor(stage_tma_ptr, tma_layout.outer), cutlass.Int32
     )
     output_i32 = cute.recast_tensor(output, cutlass.Int32)
-    words_per_thread = TILE_TOKENS * TILE_LATENT // (
+    words_per_thread = TILE_TOKENS * CTA_LATENT // (
         THREADS * 8 * CONVERSION_PHASES
     )
     raw_words = cute.make_rmem_tensor(
         cute.make_layout(words_per_thread), cutlass.Int32
     )
     centroid_lane = cutlass.Float32(centroids[tidx % 16])
-    for phase in cutlass.range_constexpr(CONVERSION_PHASES):
+    for phase in cutlass.range(CONVERSION_PHASES, unroll=1):
+        token_stage = phase // 2
+        latent_stage = phase % 2
         for iteration in cutlass.range_constexpr(words_per_thread):
             linear_word = iteration * THREADS + tidx
-            phase_words = TILE_LATENT // (8 * CONVERSION_PHASES)
-            row = linear_word // phase_words
-            phase_word = linear_word % phase_words
-            packed_word = phase * (
-                TILE_LATENT // (8 * CONVERSION_PHASES)
-            ) + phase_word
-            page = row // PAGE_TOKENS
-            page_row = row % PAGE_TOKENS
-            chunk = packed_word // (TMA_LATENT // 8)
-            chunk_word = packed_word % (TMA_LATENT // 8)
+            token = linear_word // (TMA_LATENT // 8)
+            chunk_word = linear_word % (TMA_LATENT // 8)
+            page = token // PAGE_TOKENS
+            page_row = token % PAGE_TOKENS
+            packed_page = token_stage * 2 + page
             raw_words[iteration] = packed_i32[
-                page_row, chunk_word, page, chunk
+                page_row, chunk_word, packed_page, latent_stage
             ]
 
         cute.arch.sync_threads()
         for iteration in cutlass.range_constexpr(words_per_thread):
             linear_word = iteration * THREADS + tidx
-            phase_words = TILE_LATENT // (8 * CONVERSION_PHASES)
-            row = linear_word // phase_words
-            phase_word = linear_word % phase_words
-            packed_word = phase * (
-                TILE_LATENT // (8 * CONVERSION_PHASES)
-            ) + phase_word
-            page = row // PAGE_TOKENS
-            page_row = row % PAGE_TOKENS
-            physical_page = page_table[block, page]
+            token = linear_word // (TMA_LATENT // 8)
+            chunk_word = linear_word % (TMA_LATENT // 8)
+            page = token // PAGE_TOKENS
+            page_row = token % PAGE_TOKENS
+            physical_page = page_table[tile, token_stage * 2 + page]
             scale = cutlass.Float32(scales[physical_page, page_row])
             fp8_0, fp8_1 = dequantize_tq4_word_to_fp8_shfl(
                 raw_words[iteration], scale, centroid_lane
             )
-            latent_stage = packed_word // 16
-            word_col = packed_word % 16
-            dim_word = word_col * 2
+            dim_word = chunk_word * 2
             stage_tma_i32[
-                ((page_row, dim_word), page, 0, (latent_stage, 0))
+                ((dim_word, page_row), 0, page, ((latent_stage, token_stage), 0))
             ] = fp8_0
             stage_tma_i32[
-                ((page_row, dim_word + 1), page, 0, (latent_stage, 0))
+                (
+                    (dim_word + 1, page_row),
+                    0,
+                    page,
+                    ((latent_stage, token_stage), 0),
+                )
             ] = fp8_1
 
     if cutlass.const_expr(write_output):
         cute.arch.sync_threads()
         for iteration in cutlass.range_constexpr(
-            TILE_TOKENS * TILE_LATENT // (THREADS * 4)
+            TILE_TOKENS * CTA_LATENT // (THREADS * 4)
         ):
             linear_word = iteration * THREADS + tidx
-            row = linear_word // (TILE_LATENT // 4)
-            output_word = linear_word % (TILE_LATENT // 4)
+            token = linear_word // (CTA_LATENT // 4)
+            output_word = linear_word % (CTA_LATENT // 4)
             latent_stage = output_word // 32
             dim_word = output_word % 32
-            page = row // PAGE_TOKENS
-            page_row = row % PAGE_TOKENS
-            output_i32[block, row, output_word] = stage_tma_i32[
-                ((page_row, dim_word), page, 0, (latent_stage, 0))
+            token_stage = token // 64
+            page = (token % 64) // PAGE_TOKENS
+            page_row = token % PAGE_TOKENS
+            output_i32[block, token, output_word] = stage_tma_i32[
+                ((dim_word, page_row), 0, page, ((latent_stage, token_stage), 0))
             ]
 
 
@@ -252,7 +267,7 @@ def full_tile(
         tma_smem_layout,
         (PAGE_TOKENS, TMA_LATENT),
     )
-    staged_layout, tma_layout = make_k_layouts()
+    staged_layout, tma_layout = make_v_layouts()
 
     @cute.struct
     class SharedStorage:
@@ -294,29 +309,30 @@ def fake(dtype: type[cutlass.Numeric], shape: tuple, align: int):
 
 def main() -> None:
     pages = cute.sym_int()
-    blocks = cute.sym_int()
+    tiles = cute.sym_int()
+    ctas = cute.sym_int()
     write_output = os.environ.get("TQ4_PROBE_WRITE_OUTPUT", "1") == "1"
     compiled = cute.compile(
         full_tile,
-        fake(cutlass.Uint8, (pages, PAGE_TOKENS, TILE_LATENT // 2), 16),
+        fake(cutlass.Uint8, (pages, PAGE_TOKENS, FULL_LATENT // 2), 16),
         fake(cutlass.BFloat16, (pages, PAGE_TOKENS), 16),
         fake(cutlass.Float32, (16,), 16),
-        fake(cutlass.Int32, (blocks, TILE_TOKENS // PAGE_TOKENS), 16),
-        fake(cutlass.Float8E4M3FN, (blocks, TILE_TOKENS, TILE_LATENT), 16),
+        fake(cutlass.Int32, (tiles, TILE_TOKENS // PAGE_TOKENS), 16),
+        fake(cutlass.Float8E4M3FN, (ctas, TILE_TOKENS, CTA_LATENT), 16),
         write_output,
         options="--enable-tvm-ffi --opt-level 3",
     )
 
-    torch.manual_seed(31)
-    num_blocks = int(os.environ.get("TQ4_PROBE_BLOCKS", "64"))
+    torch.manual_seed(37)
+    num_tiles = int(os.environ.get("TQ4_PROBE_TILES", "32"))
     benchmark_iterations = int(os.environ.get("TQ4_PROBE_ITERS", "1000"))
-    if num_blocks <= 0 or benchmark_iterations <= 0:
-        raise ValueError("TQ4_PROBE_BLOCKS and TQ4_PROBE_ITERS must be positive")
-    num_pages = num_blocks * (TILE_TOKENS // PAGE_TOKENS)
+    if num_tiles <= 0 or benchmark_iterations <= 0:
+        raise ValueError("TQ4_PROBE_TILES and TQ4_PROBE_ITERS must be positive")
+    num_pages = num_tiles * (TILE_TOKENS // PAGE_TOKENS)
     packed = torch.randint(
         0,
         256,
-        (num_pages, PAGE_TOKENS, TILE_LATENT // 2),
+        (num_pages, PAGE_TOKENS, FULL_LATENT // 2),
         device="cuda",
         dtype=torch.uint8,
     )
@@ -328,9 +344,9 @@ def main() -> None:
     )
     page_table = torch.randperm(
         num_pages, device="cuda", dtype=torch.int32
-    ).reshape(num_blocks, TILE_TOKENS // PAGE_TOKENS)
+    ).reshape(num_tiles, TILE_TOKENS // PAGE_TOKENS)
     output = torch.empty(
-        (num_blocks, TILE_TOKENS, TILE_LATENT),
+        (num_tiles * 2, TILE_TOKENS, CTA_LATENT),
         device="cuda",
         dtype=torch.float8_e4m3fn,
     )
@@ -339,15 +355,20 @@ def main() -> None:
     torch.cuda.synchronize()
     if write_output:
         ordered_packed = packed[page_table.long()].reshape(
-            num_blocks, TILE_TOKENS, TILE_LATENT // 2
+            num_tiles, TILE_TOKENS, FULL_LATENT // 2
         )
-        ordered_scales = scales[page_table.long()].reshape(num_blocks, TILE_TOKENS)
+        ordered_scales = scales[page_table.long()].reshape(num_tiles, TILE_TOKENS)
         indices = torch.stack(
             (ordered_packed & 0xF, ordered_packed >> 4), dim=-1
-        ).reshape(num_blocks, TILE_TOKENS, TILE_LATENT)
-        expected = (
-            centroids[indices.long()] * ordered_scales[..., None].float()
-        ).to(torch.float8_e4m3fn)
+        ).reshape(num_tiles, TILE_TOKENS, FULL_LATENT)
+        dense = (centroids[indices.long()] * ordered_scales[..., None].float()).to(
+            torch.float8_e4m3fn
+        )
+        expected = torch.empty_like(output)
+        expected[0::2, :, :128] = dense[:, :, :128]
+        expected[0::2, :, 128:] = dense[:, :, 256:384]
+        expected[1::2, :, :128] = dense[:, :, 128:256]
+        expected[1::2, :, 128:] = dense[:, :, 384:512]
         torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
 
     for _ in range(20):
@@ -362,7 +383,7 @@ def main() -> None:
     end.synchronize()
     elapsed_us = start.elapsed_time(end) * 1000 / benchmark_iterations
     print(
-        f"PASS blocks={num_blocks} pages={num_pages} "
+        f"PASS tiles={num_tiles} ctas={num_tiles * 2} "
         f"write_output={write_output} output={tuple(output.shape)} "
         f"launch={elapsed_us:.3f} us"
     )
