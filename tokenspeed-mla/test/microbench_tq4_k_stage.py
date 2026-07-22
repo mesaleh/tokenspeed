@@ -40,6 +40,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from tokenspeed_mla.fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
+from tokenspeed_mla.tq4_cutedsl import dequantize_tq4_word_to_fp8
 
 
 TQ4_UNIFORM_MIN = -2.5 / math.sqrt(512)
@@ -125,38 +126,27 @@ def stage_kernel(
             raw = packed_i32[bidx, row, packed_word]
             scale = cutlass.Float32(scales[bidx, row])
 
-            values0 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
-            values1 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
-            values0[0] = (
-                codebook_value((raw >> 0) & 0xF, centroid_smem, uniform) * scale
-            )
-            values0[1] = (
-                codebook_value((raw >> 4) & 0xF, centroid_smem, uniform) * scale
-            )
-            values0[2] = (
-                codebook_value((raw >> 8) & 0xF, centroid_smem, uniform) * scale
-            )
-            values0[3] = (
-                codebook_value((raw >> 12) & 0xF, centroid_smem, uniform) * scale
-            )
-            values1[0] = (
-                codebook_value((raw >> 16) & 0xF, centroid_smem, uniform) * scale
-            )
-            values1[1] = (
-                codebook_value((raw >> 20) & 0xF, centroid_smem, uniform) * scale
-            )
-            values1[2] = (
-                codebook_value((raw >> 24) & 0xF, centroid_smem, uniform) * scale
-            )
-            values1[3] = (
-                codebook_value((raw >> 28) & 0xF, centroid_smem, uniform) * scale
-            )
-            packed_fp8_0 = cvt_f32x4_to_f8x4_pack_i32(
-                values0, cutlass.Float8E4M3FN
-            )
-            packed_fp8_1 = cvt_f32x4_to_f8x4_pack_i32(
-                values1, cutlass.Float8E4M3FN
-            )
+            if cutlass.const_expr(uniform):
+                values0 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
+                values1 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
+                values0[0] = codebook_value((raw >> 0) & 0xF, centroid_smem, True) * scale
+                values0[1] = codebook_value((raw >> 4) & 0xF, centroid_smem, True) * scale
+                values0[2] = codebook_value((raw >> 8) & 0xF, centroid_smem, True) * scale
+                values0[3] = codebook_value((raw >> 12) & 0xF, centroid_smem, True) * scale
+                values1[0] = codebook_value((raw >> 16) & 0xF, centroid_smem, True) * scale
+                values1[1] = codebook_value((raw >> 20) & 0xF, centroid_smem, True) * scale
+                values1[2] = codebook_value((raw >> 24) & 0xF, centroid_smem, True) * scale
+                values1[3] = codebook_value((raw >> 28) & 0xF, centroid_smem, True) * scale
+                packed_fp8_0 = cvt_f32x4_to_f8x4_pack_i32(
+                    values0, cutlass.Float8E4M3FN
+                )
+                packed_fp8_1 = cvt_f32x4_to_f8x4_pack_i32(
+                    values1, cutlass.Float8E4M3FN
+                )
+            else:
+                packed_fp8_0, packed_fp8_1 = dequantize_tq4_word_to_fp8(
+                    raw, scale, centroid_smem
+                )
 
             page_row = row % 32
             page = row // 32
