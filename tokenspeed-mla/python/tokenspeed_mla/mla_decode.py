@@ -39,6 +39,7 @@ from tokenspeed_mla.mla_decode_fp8 import (
 from tokenspeed_mla.mla_decode_fp16 import (
     BlackwellMultiHeadLatentAttentionForwardFP16,
 )
+from tokenspeed_mla.tq4_contract import validate_tq4_decode_inputs
 from tokenspeed_mla.utils import (
     get_max_active_clusters,
     get_num_sm,
@@ -170,6 +171,8 @@ def _get_compiled_mla_kernel(
     tree_mask_mode: bool = False,
     fold_q_chunk_size: int = 0,
     use_pdl: bool = False,
+    tq4_cache: bool = False,
+    tq4_tiles_per_split: int = 1,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -187,6 +190,8 @@ def _get_compiled_mla_kernel(
     cluster_shape_mnk = (2, 1, 1)
 
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    if tq4_cache and not is_fp8:
+        raise ValueError("native TQ4 decode requires an FP8 query")
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -219,6 +224,9 @@ def _get_compiled_mla_kernel(
             kernel_kwargs["fold_q_chunk_size"] = fold_q_chunk_size
         if tree_mask_mode:
             kernel_kwargs["tree_mask_mode"] = True
+        if tq4_cache:
+            kernel_kwargs["tq4_cache"] = True
+            kernel_kwargs["tq4_tiles_per_split"] = tq4_tiles_per_split
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -259,14 +267,18 @@ def _get_compiled_mla_kernel(
     # kv_batch is a separate sym_int from query batch: paged KV cache uses a flat
     # pool so kv_batch=num_pages at runtime, while query batch can be any value.
     c_latent_fake = cute.runtime.make_fake_tensor(
-        cutlass_dtype,
-        (sym_kv_batch, sym_seq_kv, sym_latent),
+        cutlass.Uint8 if tq4_cache else cutlass_dtype,
+        (
+            sym_kv_batch,
+            sym_seq_kv,
+            cute.sym_int(divisibility=16) if tq4_cache else sym_latent,
+        ),
         stride=(cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
     # c_rope: [kv_batch, seq_len_k, rope_dim] — non-contiguous slice
     c_rope_fake = cute.runtime.make_fake_tensor(
-        cutlass_dtype,
+        cutlass.BFloat16 if tq4_cache else cutlass_dtype,
         (sym_kv_batch, sym_seq_kv, sym_rope),
         stride=(cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
@@ -327,6 +339,21 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake = None
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    if tq4_cache:
+        tq4_scale_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (sym_kv_batch, sym_seq_kv),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        tq4_centroids_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (16,),
+            assumed_align=16,
+        )
+    else:
+        tq4_scale_fake = None
+        tq4_centroids_fake = None
 
     compiled_kernel = cute.compile(
         kernel_obj,
@@ -347,6 +374,8 @@ def _get_compiled_mla_kernel(
         Float32(1.0),  # output_scale placeholder
         stream_fake,
         use_pdl,
+        tq4_scale_fake,
+        tq4_centroids_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -370,6 +399,10 @@ def tokenspeed_mla_decode(
     custom_mask: Optional[torch.Tensor] = None,
     cmask_off: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    _tq4_scale: Optional[torch.Tensor] = None,
+    _tq4_centroids: Optional[torch.Tensor] = None,
+    _tq4_rope_cache: Optional[torch.Tensor] = None,
+    _tq4_split_kv: Optional[int] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -421,13 +454,26 @@ def tokenspeed_mla_decode(
     torch.Tensor
         Output tensor [B, q_len, H, kv_lora_rank].
     """
+    tq4_cache = any(
+        tensor is not None
+        for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
+    )
+    if tq4_cache and any(
+        tensor is None
+        for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
+    ):
+        raise ValueError("native TQ4 decode requires scale, centroids, and RoPE cache")
+
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
     ), f"tokenspeed_mla_decode only supports {supported_dtypes}, got {query.dtype}"
-    assert (
-        kv_cache.dtype == query.dtype
-    ), f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
+    if tq4_cache:
+        assert query.dtype == torch.float8_e4m3fn, "native TQ4 decode requires FP8 query"
+    else:
+        assert (
+            kv_cache.dtype == query.dtype
+        ), f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
 
@@ -437,6 +483,8 @@ def tokenspeed_mla_decode(
     if kv_cache.dim() == 4:
         kv_cache = kv_cache.squeeze(1)
     page_size = kv_cache.shape[1]
+    if tq4_cache and _tq4_rope_cache.dim() == 4:
+        _tq4_rope_cache = _tq4_rope_cache.squeeze(1)
 
     # Split query into latent and rope components — keep contiguous [B, q_len, H, D].
     # The kernel's __call__ reinterprets to [H, D, q_len, B] via zero-cost make_tensor.
@@ -445,8 +493,12 @@ def tokenspeed_mla_decode(
 
     # KV cache slices — keep contiguous [num_pages, page_size, D].
     # The kernel reinterprets to [page_size, D, num_pages] internally.
-    c_latent_k = kv_cache[:, :, :kv_lora_rank]
-    c_rope_k = kv_cache[:, :, kv_lora_rank:]
+    if tq4_cache:
+        c_latent_k = kv_cache
+        c_rope_k = _tq4_rope_cache
+    else:
+        c_latent_k = kv_cache[:, :, :kv_lora_rank]
+        c_rope_k = kv_cache[:, :, kv_lora_rank:]
 
     # Page table: [B, max_pages]: passed directly, kernel reinterprets.
     page_table_k = block_tables
@@ -525,6 +577,37 @@ def tokenspeed_mla_decode(
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
         B, q_len_eff, H_eff, kv_lora_rank, max_active_blocks
     )
+    tq4_tiles_per_split = 1
+    if tq4_cache:
+        tq4_tiles = (max_seq_len + 127) // 128
+        if tq4_tiles > 256:
+            raise ValueError("native TQ4 prototype currently supports at most 32K context")
+        required_page_columns = tq4_tiles * 4
+        if block_tables.shape[1] < required_page_columns:
+            raise ValueError(
+                "native TQ4 prototype requires a page-table column for every "
+                f"full 128-token tile page; need {required_page_columns}, got "
+                f"{block_tables.shape[1]}"
+            )
+        split_kv = (
+            min(split_kv, tq4_tiles)
+            if _tq4_split_kv is None
+            else _tq4_split_kv
+        )
+        if split_kv < 1 or split_kv > tq4_tiles:
+            raise ValueError(
+                f"native TQ4 split count must be in [1, {tq4_tiles}], got "
+                f"{split_kv}"
+            )
+        tq4_tiles_per_split = (tq4_tiles + split_kv - 1) // split_kv
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            H_eff,
+            q_len_eff,
+            kv_lora_rank,
+            B,
+            split_kv,
+            cutlass.Float32,
+        )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -595,6 +678,8 @@ def tokenspeed_mla_decode(
         tree_mask_mode=custom_mask is not None,
         fold_q_chunk_size=fold_q_chunk_size,
         use_pdl=enable_pdl,
+        tq4_cache=tq4_cache,
+        tq4_tiles_per_split=tq4_tiles_per_split,
     )
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
@@ -604,7 +689,7 @@ def tokenspeed_mla_decode(
     import tvm_ffi
 
     with tvm_ffi.use_torch_stream():
-        compiled_kernel(
+        args = (
             q_latent_k,
             q_rope_k,
             c_latent_k,
@@ -621,6 +706,10 @@ def tokenspeed_mla_decode(
             Float32(softmax_scale),
             Float32(output_scale),
         )
+        if tq4_cache:
+            compiled_kernel(*args, _tq4_scale, _tq4_centroids)
+        else:
+            compiled_kernel(*args)
 
     # If out was provided, kernel already wrote into it — return directly.
     if out is not None:
@@ -628,3 +717,65 @@ def tokenspeed_mla_decode(
 
     # o_k is [B, q_len, H, D] — return as-is to match trtllm-gen output shape.
     return o_k
+
+
+def tokenspeed_mla_decode_tq4(
+    query: torch.Tensor,
+    kv_nope_packed: torch.Tensor,
+    kv_nope_scale: torch.Tensor,
+    kv_rope: torch.Tensor,
+    centroids: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    output_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    is_var_seq: bool = True,
+    causal_mask: bool = True,
+    custom_mask: Optional[torch.Tensor] = None,
+    cmask_off: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+    split_kv_override: Optional[int] = None,
+) -> torch.Tensor:
+    """SM100 MLA decode from the canonical no-shadow TQ4 cache."""
+    _, packed, rope = validate_tq4_decode_inputs(
+        query,
+        kv_nope_packed,
+        kv_nope_scale,
+        kv_rope,
+        centroids,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        out,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    if centroids.dtype != torch.float32:
+        raise ValueError("native TQ4 decode requires persistent float32 centroids")
+    return tokenspeed_mla_decode(
+        query=query,
+        kv_cache=packed,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+        out=out,
+        is_var_seq=is_var_seq,
+        causal_mask=causal_mask,
+        custom_mask=custom_mask,
+        cmask_off=cmask_off,
+        enable_pdl=enable_pdl,
+        _tq4_scale=kv_nope_scale,
+        _tq4_centroids=centroids,
+        _tq4_rope_cache=rope,
+        _tq4_split_kv=split_kv_override,
+    )
