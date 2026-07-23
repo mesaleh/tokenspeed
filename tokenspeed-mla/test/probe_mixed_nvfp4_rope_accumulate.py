@@ -24,7 +24,10 @@ Kimi MLA scores combine a 512-wide latent product with a 64-wide RoPE product.
 The intended compressed path uses native block-scaled FP4 MMA for the rotated
 latent cache while retaining RoPE at higher precision. This probe establishes
 whether block-scaled FP4 and ordinary FP8 UMMA operations can target the same
-TMEM accumulator. It is a legality probe, not an attention benchmark.
+TMEM accumulator. The FP4 instruction uses its required M=256 geometry, while
+the FP8 operation and observable score view retain TokenSpeed's M=128 geometry
+over the compatible first half of that accumulator. It is a legality probe,
+not an attention benchmark.
 """
 
 import cutlass
@@ -42,7 +45,7 @@ CLUSTER_SHAPE_MNK = (2, 1, 1)
 # A native FP4 mainloop tile spans 256 latent coordinates. Kimi's 512-wide
 # latent therefore uses two pipeline iterations with this same scale layout.
 NVFP4_TILER_MNK = (256, 128, 256)
-ROPE_TILER_MNK = (256, 128, 128)
+ROPE_TILER_MNK = (128, 128, 128)
 SF_VEC_SIZE = 16
 
 
@@ -126,16 +129,17 @@ def mixed_accumulate_kernel(
         swizzle=rope_b_layout.inner,
     )
 
-    # Zero FP4 latent operands and use unit scale factors. RoPE operands are
-    # one, so a successful mixed accumulation produces 128 in every score.
+    # E2M1 code 0x2 represents +1. Pack two +1 values per byte and use unit
+    # scale factors. The native latent product is 256 and the FP8 RoPE product
+    # is 128, so a successful mixed accumulation produces 384 in every score.
     nvfp4_a_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, s_nvfp4_a)
     nvfp4_b_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, s_nvfp4_b)
     nvfp4_a_ptr = cute.recast_ptr(s_nvfp4_a.iterator, dtype=cutlass.Uint8)
     nvfp4_b_ptr = cute.recast_ptr(s_nvfp4_b.iterator, dtype=cutlass.Uint8)
     for byte_idx in cutlass.range(tidx, nvfp4_a_bytes, THREADS):
-        (nvfp4_a_ptr + byte_idx).store(cutlass.Uint8(0))
+        (nvfp4_a_ptr + byte_idx).store(cutlass.Uint8(0x22))
     for byte_idx in cutlass.range(tidx, nvfp4_b_bytes, THREADS):
-        (nvfp4_b_ptr + byte_idx).store(cutlass.Uint8(0))
+        (nvfp4_b_ptr + byte_idx).store(cutlass.Uint8(0x22))
 
     sfa_ptr = cute.recast_ptr(s_sfa.iterator, dtype=cutlass.Float8E4M3FN)
     sfb_ptr = cute.recast_ptr(s_sfb.iterator, dtype=cutlass.Float8E4M3FN)
@@ -175,6 +179,9 @@ def mixed_accumulate_kernel(
     acc_shape = nvfp4_mma.partition_shape_C(NVFP4_TILER_MNK[:2])
     acc_fake = nvfp4_mma.make_fragment_C(acc_shape)
     acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
+    rope_acc_shape = rope_mma.partition_shape_C(ROPE_TILER_MNK[:2])
+    rope_acc_fake = rope_mma.make_fragment_C(rope_acc_shape)
+    rope_acc = cute.make_tensor(tmem_ptr, rope_acc_fake.layout)
     rope_a = rope_mma.make_fragment_A(s_rope_a)
     rope_b = rope_mma.make_fragment_B(s_rope_b)
 
@@ -243,10 +250,10 @@ def mixed_accumulate_kernel(
         for k_block in cutlass.range(rope_k_blocks, unroll_full=True):
             cute.gemm(
                 rope_mma,
-                acc,
+                rope_acc,
                 rope_a[None, None, k_block, 0],
                 rope_b[None, None, k_block, 0],
-                acc,
+                rope_acc,
             )
         mma_producer.commit()
 
@@ -254,7 +261,7 @@ def mixed_accumulate_kernel(
     mma_full.release()
     cute.arch.sync_threads()
 
-    acc_tile = acc[(None, None), 0, 0]
+    acc_tile = rope_acc[(None, None), 0, 0]
     tmem_load_atom = cute.make_copy_atom(
         tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), cutlass.Float32
     )
@@ -262,7 +269,7 @@ def mixed_accumulate_kernel(
     thr_load = tmem_load.get_slice(tidx)
     output_matrix = cute.make_tensor(
         output[cta_rank, None, None].iterator,
-        cute.make_layout((128, 128), stride=(128, 1)),
+        cute.make_layout((64, 128), stride=(128, 1)),
     )
     t_tmem = thr_load.partition_S(acc_tile)
     t_gmem = thr_load.partition_D(output_matrix)
@@ -366,7 +373,7 @@ def main() -> None:
         mixed_accumulate_probe,
         make_fake_compact_tensor(
             cutlass.Float32,
-            (2, 128, 128),
+            (2, 64, 128),
             stride_order=(2, 1, 0),
             assumed_align=16,
         ),
@@ -378,13 +385,13 @@ def main() -> None:
         ),
         options="--enable-tvm-ffi --opt-level 3",
     )
-    output = torch.empty((2, 128, 128), device="cuda", dtype=torch.float32)
+    output = torch.empty((2, 64, 128), device="cuda", dtype=torch.float32)
     metadata = torch.empty(4, device="cuda", dtype=torch.int32)
     compiled(output, metadata)
     torch.cuda.synchronize()
     torch.testing.assert_close(
         output,
-        torch.full_like(output, 128.0),
+        torch.full_like(output, 384.0),
         rtol=0,
         atol=0,
     )
