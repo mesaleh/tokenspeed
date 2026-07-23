@@ -22,12 +22,12 @@
 
 Kimi MLA scores combine a 512-wide latent product with a 64-wide RoPE product.
 The intended compressed path uses native mixed FP8-by-E2M1 MMA for the rotated
-latent cache while retaining RoPE at higher precision. The mixed operation uses
-eight padded N columns to absorb its final-column boundary quirk, then exposes
-the first 128 columns through TokenSpeed's ordinary FP8 score view. The latent
-and RoPE products remain separate until the consumer applies TurboQuant's BF16
-per-token scale to the latent score and adds RoPE in registers. It is a legality
-probe, not an attention benchmark.
+latent cache while retaining RoPE at higher precision. The native mixed
+instruction has a deterministic final-column boundary defect, so the consumer
+recomputes only that packed token's latent dot. The latent and RoPE products
+remain separate until the consumer applies TurboQuant's BF16 per-token scale to
+the latent score and adds RoPE in registers. It is a legality probe, not an
+attention benchmark.
 """
 
 import cutlass
@@ -42,9 +42,9 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 THREADS = 128
 CLUSTER_SHAPE_MNK = (1, 1, 1)
 # The native mixed instruction advances K by 32; the probe covers Kimi's full
-# 512-wide latent dimension. Eight padded N columns absorb the mixed-F4
-# boundary quirk while the production-compatible score view remains M128xN128.
-E2M1_TILER_MNK = (128, 136, 512)
+# 512-wide latent dimension. The final-column correction keeps the native and
+# production score views at M128xN128.
+E2M1_TILER_MNK = (128, 128, 512)
 ROPE_TILER_MNK = (128, 128, 128)
 
 
@@ -80,6 +80,9 @@ def mixed_accumulate_kernel(
     output: cute.Tensor,
     metadata: cute.Tensor,
     token_scale: cute.Tensor,
+    packed_boundary: cute.Tensor,
+    codebook: cute.Tensor,
+    query_input: cute.Tensor,
     e2m1_mma: cute.TiledMma,
     rope_mma: cute.TiledMma,
     e2m1_a_layout: cute.ComposedLayout,
@@ -157,9 +160,9 @@ def mixed_accumulate_kernel(
         barrier_for_retrieve=tmem_barrier,
         is_two_cta=False,
     )
-    # The allocator requires a power-of-two column count, so the 384-column
-    # latent-plus-RoPE working set rounds to the full 512-column allocation.
-    tmem.allocate(512)
+    # Boundary correction keeps the latent and RoPE regions at 128 columns
+    # each, satisfying the allocator's power-of-two requirement exactly.
+    tmem.allocate(total_cols)
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
 
@@ -229,8 +232,23 @@ def mixed_accumulate_kernel(
     cute.copy(latent_load, t_latent, latent_registers)
     cute.copy(rope_load, t_rope, rope_registers)
     cute.arch.fence_view_async_tmem_load()
+    packed_ptr = cute.recast_ptr(packed_boundary.iterator, dtype=cutlass.Uint8)
+    codebook_bf16 = cute.make_tensor(
+        cute.recast_ptr(codebook.iterator, dtype=cutlass.BFloat16),
+        codebook.layout,
+    )
     for element in cutlass.range_constexpr(cute.size(latent_registers)):
+        query = t_coordinates[element][0]
         token = t_coordinates[element][1]
+        if token == 127:
+            correction = cutlass.Float32(0.0)
+            for latent in cutlass.range(512):
+                packed = cutlass.Int32((packed_ptr + latent // 2).load())
+                code = (packed >> ((latent % 2) * 4)) & 0xF
+                correction += cutlass.Float32(codebook_bf16[code]) * cutlass.Float32(
+                    query_input[query, latent]
+                )
+            latent_registers[element] = correction
         latent_registers[element] = (
             latent_registers[element] * cutlass.Float32(token_scale[token])
             + rope_registers[element]
@@ -253,7 +271,12 @@ def mixed_accumulate_kernel(
 
 @cute.jit
 def mixed_accumulate_probe(
-    output: cute.Tensor, metadata: cute.Tensor, token_scale: cute.Tensor
+    output: cute.Tensor,
+    metadata: cute.Tensor,
+    token_scale: cute.Tensor,
+    packed_boundary: cute.Tensor,
+    codebook: cute.Tensor,
+    query_input: cute.Tensor,
 ):
     e2m1_mma, rope_mma = make_tiled_mmas()
     e2m1_a_layout = sm100_utils.make_smem_layout_a(
@@ -284,6 +307,9 @@ def mixed_accumulate_probe(
         output,
         metadata,
         token_scale,
+        packed_boundary,
+        codebook,
+        query_input,
         e2m1_mma,
         rope_mma,
         e2m1_a_layout,
@@ -323,6 +349,24 @@ def main() -> None:
             stride_order=(0,),
             assumed_align=16,
         ),
+        make_fake_compact_tensor(
+            cutlass.Uint8,
+            (256,),
+            stride_order=(0,),
+            assumed_align=16,
+        ),
+        make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (16,),
+            stride_order=(0,),
+            assumed_align=16,
+        ),
+        make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (128, 512),
+            stride_order=(1, 0),
+            assumed_align=16,
+        ),
         options="--enable-tvm-ffi --opt-level 3",
     )
     output = torch.empty((1, 128, 128), device="cuda", dtype=torch.float32)
@@ -332,9 +376,32 @@ def main() -> None:
         torch.tensor(1.0, device="cuda"),
         torch.tensor(2.0, device="cuda"),
     ).to(torch.bfloat16)
-    compiled(output, metadata, token_scale)
+    packed_boundary = torch.full((256,), 0x22, device="cuda", dtype=torch.uint8)
+    codebook = torch.zeros(16, device="cuda", dtype=torch.bfloat16)
+    codebook[2] = 1.0
+    query_input = (
+        torch.where(
+            torch.arange(512, device="cuda") % 2 == 0,
+            torch.tensor(1.0, device="cuda"),
+            torch.tensor(2.0, device="cuda"),
+        )[None, :]
+        .expand(128, 512)
+        .contiguous()
+        .to(torch.bfloat16)
+    )
+    compiled(
+        output,
+        metadata,
+        token_scale,
+        packed_boundary,
+        codebook,
+        query_input,
+    )
     torch.cuda.synchronize()
-    expected = (512.0 * token_scale.float()[None, None, :] + 128.0).expand_as(output)
+    expected = (
+        (512.0 * token_scale.float()[None, None, :] + 128.0).expand_as(output).clone()
+    )
+    expected[:, :, 127] = 768.0 * token_scale[127].float() + 128.0
     mismatch = output != expected
     if mismatch.any():
         bad = mismatch.nonzero()
@@ -354,7 +421,7 @@ def main() -> None:
     )
     acc_cols, rope_cols, total_cols, b_bytes = metadata.cpu().tolist()
     print(
-        "PASS mixed_e2m1_scaled_latent_fp8_rope_accumulate=True cta_group=1 "
+        "PASS mixed_e2m1_qk_boundary_correction=True cta_group=1 "
         f"latent_cols={acc_cols} rope_cols={rope_cols} "
         f"total_cols={total_cols} b_bytes={b_bytes}"
     )
