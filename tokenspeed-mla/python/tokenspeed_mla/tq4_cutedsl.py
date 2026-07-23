@@ -20,10 +20,56 @@
 
 """CuTe DSL register conversion primitives for canonical TurboQuant-4."""
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Pointer
+from cutlass.cutlass_dsl import dsl_user_op
 
 from .fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
+
+
+@dsl_user_op
+def copy_bulk_smem_to_dsmem(
+    destination: Pointer,
+    source: Pointer,
+    byte_count: cutlass.Int32,
+    completion_barrier: Pointer,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Copy one aligned SMEM segment to a remote CTA and signal its barrier."""
+    i32_type = ir.IntegerType.get_signless(32)
+    destination_address = llvm.ptrtoint(
+        i32_type, destination.llvm_ptr, loc=loc, ip=ip
+    )
+    source_address = llvm.ptrtoint(i32_type, source.llvm_ptr, loc=loc, ip=ip)
+    barrier_address = llvm.ptrtoint(
+        i32_type, completion_barrier.llvm_ptr, loc=loc, ip=ip
+    )
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            destination_address,
+            source_address,
+            cutlass.Int32(byte_count).ir_value(loc=loc, ip=ip),
+            barrier_address,
+        ],
+        asm_string=(
+            "cp.async.bulk.shared::cluster.shared::cta."
+            "mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];"
+        ),
+        constraints="r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit

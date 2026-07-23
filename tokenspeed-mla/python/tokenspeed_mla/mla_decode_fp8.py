@@ -76,7 +76,10 @@ try:
         create_mla_static_tile_scheduler_params,
     )
     from .fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
-    from .tq4_cutedsl import dequantize_tq4_word_to_fp8_shfl
+    from .tq4_cutedsl import (
+        copy_bulk_smem_to_dsmem,
+        dequantize_tq4_word_to_fp8_shfl,
+    )
 except ImportError:
     from mla_helpers import (
         LOG2_E,
@@ -88,7 +91,10 @@ except ImportError:
         create_mla_static_tile_scheduler_params,
     )
     from fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
-    from tq4_cutedsl import dequantize_tq4_word_to_fp8_shfl
+    from tq4_cutedsl import (
+        copy_bulk_smem_to_dsmem,
+        dequantize_tq4_word_to_fp8_shfl,
+    )
 
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -850,8 +856,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tq4_raw_k_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_k_stage * 2
             ]
-            tq4_raw_v_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_v_stage * 2
+            tq4_s2s_v_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.load_v_stage
             ]
             mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
             p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
@@ -1183,29 +1189,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 if tidx >= self.tq4_conversion_warp_ids[0] * 32
                 else tidx
             )
+            s2s_v_mbar_ptr = storage.tq4_s2s_v_mbar_ptr.data_ptr()
             raw_k_pipeline = self.make_and_init_tq4_raw_pipeline(
                 storage.tq4_raw_k_mbar_ptr.data_ptr(),
                 self.load_k_stage,
-                conversion_tidx,
-            )
-            raw_v_pipeline = self.make_and_init_tq4_raw_pipeline(
-                storage.tq4_raw_v_mbar_ptr.data_ptr(),
-                self.load_v_stage,
                 conversion_tidx,
             )
             load_k_pipeline = self.make_and_init_tq4_output_pipeline(
                 storage.load_k_mbar_ptr.data_ptr(),
                 cta_layout_vmnk,
                 self.load_k_stage,
+                include_load_warp=True,
             )
             load_v_pipeline = self.make_and_init_tq4_output_pipeline(
                 storage.load_v_mbar_ptr.data_ptr(),
                 cta_layout_vmnk,
                 self.load_v_stage,
+                include_load_warp=False,
             )
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    for stage in cutlass.range_constexpr(self.load_v_stage):
+                        cute.arch.mbarrier_init(
+                            s2s_v_mbar_ptr + stage, 1
+                        )
+                    cute.arch.mbarrier_init_fence()
         else:
             raw_k_pipeline = None
-            raw_v_pipeline = None
             load_k_pipeline = self.make_and_init_load_qkv_pipeline(
                 storage.load_k_mbar_ptr.data_ptr(),
                 cta_layout_vmnk,
@@ -1279,20 +1289,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
                 packed_k_layout,
             )
-            packed_v_layout = cute.make_layout(
-                (self.page_size, 128, 4, 2, self.load_v_stage),
-                stride=(128, 1, 4096, 16384, 65536),
-            )
-            packed_v_stage = cute.make_tensor(
-                cute.recast_ptr(
-                    storage.smem_vc.data_ptr() + 128 * 256 // 2,
-                    dtype=cutlass.Int4,
-                ),
-                packed_v_layout,
-            )
         else:
             packed_k_stage = None
-            packed_v_stage = None
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
@@ -1400,12 +1398,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
             )
-            load_v_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_v_stage
-            )
-            raw_v_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.load_v_stage
-            )
+            if cutlass.const_expr(not self.tq4_cache):
+                load_v_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.load_v_stage
+                )
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1438,34 +1434,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tma_q_params,
                         load_q_producer_state,
                     )
-                    # Then load V
-                    tma_v_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
-                        load_v_pipeline=load_v_pipeline,
-                        mPT=mPT,
-                    )
-                    if cutlass.const_expr(self.tq4_cache):
-                        tq4_v_params = SimpleNamespace(
-                            tma_atom=tma_atom_tq4,
-                            tma_tensor=mTQ4,
-                            raw_pipeline=raw_v_pipeline,
-                            packed_stage=packed_v_stage,
+                    if cutlass.const_expr(not self.tq4_cache):
+                        tma_v_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            local_split_kv=local_split_kv,
+                            load_v_pipeline=load_v_pipeline,
+                            mPT=mPT,
                         )
-                        for tile_offset in cutlass.range_constexpr(
-                            self.tq4_tiles_per_split
-                        ):
-                            if tile_offset < k_tile_count:
-                                raw_v_producer_state, load_v_producer_state = (
-                                    self.load_tq4_v_tma(
-                                        tma_v_common_params,
-                                        tq4_v_params,
-                                        k_index + tile_offset,
-                                        raw_v_producer_state,
-                                        load_v_producer_state,
-                                    )
-                                )
-                    else:
                         tma_pv_params = SimpleNamespace(
                             tiled_mma_pv=tiled_mma_pv,
                             tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
@@ -1482,9 +1457,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             load_q_pipeline.producer_tail(load_q_producer_state)
-            load_v_pipeline.producer_tail(load_v_producer_state)
-            if cutlass.const_expr(self.tq4_cache):
-                raw_v_pipeline.producer_tail(raw_v_producer_state)
+            if cutlass.const_expr(not self.tq4_cache):
+                load_v_pipeline.producer_tail(load_v_producer_state)
 
         if cutlass.const_expr(self.tq4_cache):
             if (
@@ -1494,9 +1468,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 _setmaxregister_decrease(self.tq4_conversion_reg_num)
                 raw_k_consumer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.load_k_stage
-                )
-                raw_v_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.load_v_stage
                 )
                 load_k_tq4_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.load_k_stage
@@ -1518,15 +1489,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             blk_coord=blk_coord,
                             mPT=mPT,
                             raw_k_pipeline=raw_k_pipeline,
-                            raw_v_pipeline=raw_v_pipeline,
                             load_k_pipeline=load_k_pipeline,
                             load_v_pipeline=load_v_pipeline,
                             mTQScale=mTQScale,
                             mTQCentroids=mTQCentroids,
                             packed_k_stage=packed_k_stage,
-                            packed_v_stage=packed_v_stage,
                             sKC=sKC_for_tma,
                             sVC=sVC_for_tma,
+                            s2s_v_mbar_ptr=s2s_v_mbar_ptr,
                         )
                         for tile_offset in cutlass.range_constexpr(
                             self.tq4_tiles_per_split
@@ -1534,14 +1504,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             if tile_offset < k_tile_count:
                                 (
                                     raw_k_consumer_state,
-                                    raw_v_consumer_state,
                                     load_k_tq4_producer_state,
                                     load_v_tq4_producer_state,
                                 ) = self.convert_tq4_tile(
                                     tq4_common_params,
                                     k_index + tile_offset,
                                     raw_k_consumer_state,
-                                    raw_v_consumer_state,
                                     load_k_tq4_producer_state,
                                     load_v_tq4_producer_state,
                                 )
@@ -2183,106 +2151,52 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         return raw_producer_state, output_producer_state
 
     @cute.jit
-    def load_tq4_v_tma(
-        self,
-        common_params: SimpleNamespace,
-        v_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        raw_producer_state: pipeline.PipelineState,
-        output_producer_state: pipeline.PipelineState,
-    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """TMA the CTA-specific packed V chunks into the incumbent stage."""
-        page_table = common_params.mPT[None, common_params.blk_coord[2]]
-        tiled_global = cute.flat_divide(
-            v_params.tma_tensor, (self.page_size, 128)
-        )
-        tma_stage, tma_global = cpasync.tma_partition(
-            v_params.tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(v_params.packed_stage, 0, 2),
-            cute.group_modes(tiled_global, 0, 2),
-        )
-        cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
-
-        for _ in cutlass.range_constexpr(1):
-            common_params.load_v_pipeline.producer_acquire(output_producer_state)
-            v_params.raw_pipeline.producer_acquire(raw_producer_state)
-            tma_bar_ptr = v_params.raw_pipeline.producer_get_barrier(
-                raw_producer_state
-            )
-            for token_stage in cutlass.range_constexpr(2):
-                for page in cutlass.range_constexpr(2):
-                    packed_page = token_stage * 2 + page
-                    physical_page = page_table[k_index * 4 + packed_page]
-                    for latent_stage in cutlass.range_constexpr(2):
-                        global_chunk = latent_stage * 2 + cta
-                        cute.copy(
-                            v_params.tma_atom,
-                            tma_global[
-                                None, 0, global_chunk, physical_page
-                            ],
-                            tma_stage[
-                                None,
-                                packed_page,
-                                latent_stage,
-                                raw_producer_state.index,
-                            ],
-                            tma_bar_ptr=tma_bar_ptr,
-                        )
-            v_params.raw_pipeline.producer_commit(raw_producer_state)
-            raw_producer_state.advance()
-            common_params.load_v_pipeline.producer_commit(output_producer_state)
-            output_producer_state.advance()
-            k_index += 1
-        return raw_producer_state, output_producer_state
-
-    @cute.jit
     def convert_tq4_tile(
         self,
         common_params: SimpleNamespace,
         k_index: cutlass.Int32,
         raw_k_consumer_state: pipeline.PipelineState,
-        raw_v_consumer_state: pipeline.PipelineState,
         output_k_producer_state: pipeline.PipelineState,
         output_v_producer_state: pipeline.PipelineState,
     ) -> tuple[
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
-        pipeline.PipelineState,
     ]:
-        """Convert one packed K/V tile in place."""
+        """Convert one packed latent tile into both cluster K and V operands."""
         for _ in cutlass.range_constexpr(1):
-            raw_k_consumer_state, output_k_producer_state = self.convert_tq4_k(
+            (
+                raw_k_consumer_state,
+                output_k_producer_state,
+                output_v_producer_state,
+            ) = self.convert_tq4_kv(
                 common_params,
                 k_index,
                 raw_k_consumer_state,
                 output_k_producer_state,
-            )
-            raw_v_consumer_state, output_v_producer_state = self.convert_tq4_v(
-                common_params,
-                k_index,
-                raw_v_consumer_state,
                 output_v_producer_state,
             )
             k_index += 1
         return (
             raw_k_consumer_state,
-            raw_v_consumer_state,
             output_k_producer_state,
             output_v_producer_state,
         )
 
     @cute.jit
-    def convert_tq4_k(
+    def convert_tq4_kv(
         self,
         common_params: SimpleNamespace,
         k_index: cutlass.Int32,
         raw_consumer_state: pipeline.PipelineState,
-        output_producer_state: pipeline.PipelineState,
-    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Convert one 64x512 packed K tile in four overwrite-safe phases."""
+        output_k_producer_state: pipeline.PipelineState,
+        output_v_producer_state: pipeline.PipelineState,
+    ) -> tuple[
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+    ]:
+        """Convert one 64x512 tile once and scatter it to cluster K and V."""
         tidx, _, _ = cute.arch.thread_idx()
         local_tidx = tidx - self.tq4_conversion_warp_ids[0] * 32
         cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
@@ -2293,7 +2207,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # The fixed TQ4 ABI (page32, latent512) selects FP8 SW128
         # S<3,4,3>.  Recasting the composed tensor to Int32 permutes rows;
         # vectorize only after mapping the logical FP8 byte address ourselves.
-        output_raw_i32 = cute.make_tensor(
+        output_k_raw_i32 = cute.make_tensor(
             cute.recast_ptr(
                 common_params.sKC.iterator,
                 swizzle_=None,
@@ -2301,11 +2215,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ),
             cute.make_layout(cute.cosize(common_params.sKC.layout) // 4),
         )
+        output_v_ptr = cute.recast_ptr(
+            common_params.sVC.iterator,
+            swizzle_=None,
+            dtype=cutlass.Int32,
+        )
         raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
         centroid_lane = cutlass.Float32(
             common_params.mTQCentroids[local_tidx % 16]
         )
-        common_params.load_k_pipeline.producer_acquire(output_producer_state)
+        common_params.load_k_pipeline.producer_acquire(output_k_producer_state)
+        common_params.load_v_pipeline.producer_acquire(output_v_producer_state)
         common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
 
         for phase in cutlass.range_constexpr(4):
@@ -2341,105 +2261,92 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     + chunk_word * 8
                     + page * 4096
                     + phase * 8192
-                    + output_producer_state.index * 32768
+                    + output_k_producer_state.index * 32768
                 )
                 physical_byte = logical_byte ^ (
                     (logical_byte & 0x380) >> 3
                 )
-                output_raw_i32[physical_byte // 4] = fp8_0
-                output_raw_i32[physical_byte // 4 + 1] = fp8_1
+                output_k_raw_i32[physical_byte // 4] = fp8_0
+                output_k_raw_i32[physical_byte // 4 + 1] = fp8_1
 
+                # Each CTA directly stores the V phases it owns. The peer-owned
+                # phases remain contiguous in K SMEM and are copied below as
+                # two 8 KiB segments instead of thousands of DSMEM stores.
+                if cta == cutlass.Int32(phase % 2):
+                    v_logical_byte = (
+                        page_row * 128
+                        + chunk_word * 8
+                        + page * 4096
+                        + (phase // 2) * 8192
+                        + cta * 16384
+                        + output_v_producer_state.index * 32768
+                    )
+                    v_physical_byte = v_logical_byte ^ (
+                        (v_logical_byte & 0x380) >> 3
+                    )
+                    (output_v_ptr + v_physical_byte // 4).store(fp8_0)
+                    (output_v_ptr + v_physical_byte // 4 + 1).store(fp8_1)
+
+        # All four conversion warps must finish the source segments before an
+        # elected thread publishes them through the async proxy.
+        self.tq4_conversion_sync_bar.arrive_and_wait()
+        if local_tidx < 32:
+            with cute.arch.elect_one():
+                peer_cta = cutlass.Int32(1) - cta
+                source_phase = cutlass.Int32(1) - cta
+                source_base = (
+                    source_phase * 8192
+                    + output_k_producer_state.index * 32768
+                )
+                destination_base = (
+                    cta * 16384 + output_v_producer_state.index * 32768
+                )
+                local_mbar_ptr = (
+                    common_params.s2s_v_mbar_ptr
+                    + output_v_producer_state.index
+                )
+                remote_mbar_ptr = cute.arch.map_dsmem_ptr(
+                    local_mbar_ptr, peer_cta
+                )
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    local_mbar_ptr,
+                    2 * 8192,
+                    peer_cta_rank_in_cluster=peer_cta,
+                )
+                cute.arch.fence_proxy(kind="async.shared", space="cta")
+                copy_bulk_smem_to_dsmem(
+                    cute.arch.map_dsmem_ptr(
+                        output_v_ptr + destination_base // 4, peer_cta
+                    ),
+                    output_k_raw_i32.iterator + source_base // 4,
+                    cutlass.Int32(8192),
+                    remote_mbar_ptr,
+                )
+                copy_bulk_smem_to_dsmem(
+                    cute.arch.map_dsmem_ptr(
+                        output_v_ptr + (destination_base + 8192) // 4,
+                        peer_cta,
+                    ),
+                    output_k_raw_i32.iterator + (source_base + 16384) // 4,
+                    cutlass.Int32(8192),
+                    remote_mbar_ptr,
+                )
+                cute.arch.mbarrier_wait(
+                    local_mbar_ptr, output_v_producer_state.phase ^ 1
+                )
+        self.tq4_conversion_sync_bar.arrive_and_wait()
         cute.arch.fence_view_async_shared()
         common_params.raw_k_pipeline.consumer_release(raw_consumer_state)
         raw_consumer_state.advance()
-        common_params.load_k_pipeline.producer_commit(output_producer_state)
-        output_producer_state.advance()
-        return raw_consumer_state, output_producer_state
-
-    @cute.jit
-    def convert_tq4_v(
-        self,
-        common_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        raw_consumer_state: pipeline.PipelineState,
-        output_producer_state: pipeline.PipelineState,
-    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Convert one CTA's 128x256 V tile in four safe phases."""
-        tidx, _, _ = cute.arch.thread_idx()
-        local_tidx = tidx - self.tq4_conversion_warp_ids[0] * 32
-        page_table = common_params.mPT[None, common_params.blk_coord[2]]
-        packed_i32 = cute.recast_tensor(
-            common_params.packed_v_stage, cutlass.Int32
+        common_params.load_k_pipeline.producer_commit(output_k_producer_state)
+        common_params.load_v_pipeline.producer_commit(output_v_producer_state)
+        output_k_producer_state.advance()
+        output_v_producer_state.advance()
+        return (
+            raw_consumer_state,
+            output_k_producer_state,
+            output_v_producer_state,
         )
-        # V uses the same FP8 SW128 S<3,4,3> atom as latent K, but its
-        # logical matrix is transposed.  Keep the packed stores on a raw view
-        # after applying the V-specific logical strides and the same XOR.
-        output_raw_i32 = cute.make_tensor(
-            cute.recast_ptr(
-                common_params.sVC.iterator,
-                swizzle_=None,
-                dtype=cutlass.Int32,
-            ),
-            cute.make_layout(cute.cosize(common_params.sVC.layout) // 4),
-        )
-        raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
-        centroid_lane = cutlass.Float32(
-            common_params.mTQCentroids[local_tidx % 16]
-        )
-        common_params.load_v_pipeline.producer_acquire(output_producer_state)
-        common_params.raw_v_pipeline.consumer_wait(raw_consumer_state)
-
-        for phase in cutlass.range(4, unroll=1):
-            token_stage = phase // 2
-            latent_stage = phase % 2
-            for iteration in cutlass.range_constexpr(8):
-                linear_word = iteration * 128 + local_tidx
-                token = linear_word // 16
-                chunk_word = linear_word % 16
-                page = token // self.page_size
-                page_row = token % self.page_size
-                packed_page = token_stage * 2 + page
-                raw_words[iteration] = packed_i32[
-                    page_row,
-                    chunk_word,
-                    packed_page,
-                    latent_stage,
-                    raw_consumer_state.index,
-                ]
-            self.tq4_conversion_sync_bar.arrive_and_wait()
-            for iteration in cutlass.range_constexpr(8):
-                linear_word = iteration * 128 + local_tidx
-                token = linear_word // 16
-                chunk_word = linear_word % 16
-                page = token // self.page_size
-                page_row = token % self.page_size
-                physical_page = page_table[k_index * 4 + token_stage * 2 + page]
-                scale = cutlass.Float32(
-                    common_params.mTQScale[page_row, physical_page]
-                )
-                fp8_0, fp8_1 = dequantize_tq4_word_to_fp8_shfl(
-                    raw_words[iteration], scale, centroid_lane
-                )
-                logical_byte = (
-                    chunk_word * 8
-                    + page_row * 128
-                    + page * 4096
-                    + latent_stage * 8192
-                    + token_stage * 16384
-                    + output_producer_state.index * 32768
-                )
-                physical_byte = logical_byte ^ (
-                    (logical_byte & 0x380) >> 3
-                )
-                output_raw_i32[physical_byte // 4] = fp8_0
-                output_raw_i32[physical_byte // 4 + 1] = fp8_1
-
-        cute.arch.fence_view_async_shared()
-        common_params.raw_v_pipeline.consumer_release(raw_consumer_state)
-        raw_consumer_state.advance()
-        common_params.load_v_pipeline.producer_commit(output_producer_state)
-        output_producer_state.advance()
-        return raw_consumer_state, output_producer_state
 
     @cute.jit
     def load_tma_k(
@@ -4201,12 +4108,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
 
     def make_and_init_tq4_output_pipeline(
-        self, output_mbar_ptr, cta_layout_vmnk, load_stages
+        self,
+        output_mbar_ptr,
+        cta_layout_vmnk,
+        load_stages,
+        include_load_warp: cutlass.Constexpr,
     ) -> pipeline.PipelineAsyncUmma:
-        """Join the load warp and converter before UMMA consumes FP8."""
+        """Join the active TQ4 producers before UMMA consumes FP8."""
         producer_threads = (
             self.threads_per_warp
-            * (1 + len(self.tq4_conversion_warp_ids))
+            * (int(include_load_warp) + len(self.tq4_conversion_warp_ids))
             * self.cluster_shape_mnk[0]
         )
         return pipeline.PipelineAsyncUmma.create(
