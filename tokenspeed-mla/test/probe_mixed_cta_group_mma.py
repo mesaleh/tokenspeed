@@ -23,9 +23,10 @@
 This is a hardware/software legality probe, not an attention benchmark. It
 isolates the mixed CTA-group transition needed by the packed-V transpose path:
 the leading CTA issues a two-CTA ``128x128x128`` QK operation, then each cluster
-member issues its own one-CTA ``128x64x128`` ``V * P^T`` operation under the
-same two-CTA TMEM allocation. Separate UMMA barriers prove both operations have
-completed before tensor memory is released.
+member issues its own one-CTA ``128x64x128`` ``V * P^T`` operation with V as a
+TMEM A operand under the same two-CTA allocation. Separate UMMA barriers prove
+both operations have completed before tensor memory is released. The footprint
+guard also reserves two 32-column V operand stages.
 """
 
 import cutlass
@@ -43,6 +44,7 @@ QK_TILER_MNK = (128, 128, 128)
 VP_TILER_MNK = (128, 64, 128)
 CORRECTION_VALUES = 4
 CORRECTION_STAGES = 2
+V_OPERAND_STAGES = 2
 
 
 @cute.struct
@@ -69,6 +71,7 @@ def make_tiled_mmas():
         cutlass.Float32,
         tcgen05.CtaGroup.ONE,
         VP_TILER_MNK[:2],
+        tcgen05.OperandSource.TMEM,
     )
     return qk, vp
 
@@ -80,7 +83,6 @@ def mixed_group_kernel(
     vp_tiled_mma: cute.TiledMma,
     qk_a_layout: cute.ComposedLayout,
     qk_b_layout: cute.ComposedLayout,
-    vp_a_layout: cute.ComposedLayout,
     vp_b_layout: cute.ComposedLayout,
     cta_layout_vmnk: cute.Layout,
     qk_cols: cutlass.Constexpr,
@@ -88,6 +90,8 @@ def mixed_group_kernel(
     score_cols: cutlass.Constexpr,
     output_cols: cutlass.Constexpr,
     correction_cols: cutlass.Constexpr,
+    v_operand_cols: cutlass.Constexpr,
+    v_operand_offset: cutlass.Constexpr,
     total_cols: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -108,12 +112,6 @@ def mixed_group_kernel(
         qk_b_layout.outer,
         byte_alignment=128,
         swizzle=qk_b_layout.inner,
-    )
-    s_v = smem.allocate_tensor(
-        cutlass.Float8E4M3FN,
-        vp_a_layout.outer,
-        byte_alignment=128,
-        swizzle=vp_a_layout.inner,
     )
     s_p = smem.allocate_tensor(
         cutlass.Float8E4M3FN,
@@ -158,11 +156,19 @@ def mixed_group_kernel(
     qk_acc_fake = qk_tiled_mma.make_fragment_C(qk_shape)
     qk_acc = cute.make_tensor(tmem_ptr, qk_acc_fake.layout)
 
-    vp_a = vp_tiled_mma.make_fragment_A(s_v)
+    vp_thr_mma = vp_tiled_mma.get_slice(0)
+    vp_a_shape = vp_tiled_mma.partition_shape_A(
+        (VP_TILER_MNK[0], VP_TILER_MNK[2], V_OPERAND_STAGES)
+    )
+    vp_a_fake = vp_thr_mma.make_fragment_A(vp_a_shape)
+    vp_a = cute.make_tensor(
+        cute.recast_ptr(tmem_ptr + v_operand_offset, dtype=cutlass.Float8E4M3FN),
+        vp_a_fake.layout,
+    )
     vp_b = vp_tiled_mma.make_fragment_B(s_p)
     vp_shape = vp_tiled_mma.partition_shape_C(VP_TILER_MNK[:2])
     vp_acc_fake = vp_tiled_mma.make_fragment_C(vp_shape)
-    vp_acc = cute.make_tensor(tmem_ptr, vp_acc_fake.layout)
+    vp_acc = cute.make_tensor(tmem_ptr + score_cols, vp_acc_fake.layout)
 
     cute.arch.sync_threads()
     if warp_idx == 0 and is_leader_cta:
@@ -209,7 +215,9 @@ def mixed_group_kernel(
             output[4] = score_cols
             output[5] = output_cols
             output[6] = correction_cols
-            output[7] = total_cols
+            output[7] = v_operand_cols
+            output[8] = v_operand_offset
+            output[9] = total_cols
 
     if warp_idx == 0:
         if is_leader_cta:
@@ -233,20 +241,23 @@ def mixed_group_probe(output: cute.Tensor):
     score_cols = qk_cols * 2
     output_cols = vp_cols * 4
     correction_cols = CORRECTION_VALUES * CORRECTION_STAGES
-    total_cols = score_cols + output_cols + correction_cols
+    vp_a_shape = vp_tiled_mma.partition_shape_A(
+        (VP_TILER_MNK[0], VP_TILER_MNK[2], V_OPERAND_STAGES)
+    )
+    vp_a_fake = vp_tiled_mma.get_slice(0).make_fragment_A(vp_a_shape)
+    v_operand_cols = tcgen05.find_tmem_tensor_col_offset(vp_a_fake)
+    v_operand_offset = score_cols + output_cols + correction_cols
+    total_cols = v_operand_offset + v_operand_cols
     if cutlass.const_expr(total_cols >= 512):
         raise ValueError(
             f"TMEM overlap: score={score_cols}, output={output_cols}, "
-            f"correction={correction_cols}, limit=512"
+            f"correction={correction_cols}, v_operand={v_operand_cols}, limit=512"
         )
     qk_a_layout = sm100_utils.make_smem_layout_a(
         qk_tiled_mma, QK_TILER_MNK, cutlass.Float8E4M3FN, 1
     )
     qk_b_layout = sm100_utils.make_smem_layout_b(
         qk_tiled_mma, QK_TILER_MNK, cutlass.Float8E4M3FN, 1
-    )
-    vp_a_layout = sm100_utils.make_smem_layout_a(
-        vp_tiled_mma, VP_TILER_MNK, cutlass.Float8E4M3FN, 1
     )
     vp_b_layout = sm100_utils.make_smem_layout_b(
         vp_tiled_mma, VP_TILER_MNK, cutlass.Float8E4M3FN, 1
@@ -260,7 +271,6 @@ def mixed_group_probe(output: cute.Tensor):
         vp_tiled_mma,
         qk_a_layout,
         qk_b_layout,
-        vp_a_layout,
         vp_b_layout,
         cta_layout_vmnk,
         qk_cols,
@@ -268,6 +278,8 @@ def mixed_group_probe(output: cute.Tensor):
         score_cols,
         output_cols,
         correction_cols,
+        v_operand_cols,
+        v_operand_offset,
         total_cols,
     ).launch(
         grid=CLUSTER_SHAPE_MNK,
@@ -289,26 +301,34 @@ def fake(dtype: type[cutlass.Numeric], shape: tuple[int, ...], align: int):
 def main() -> None:
     compiled = cute.compile(
         mixed_group_probe,
-        fake(cutlass.Int32, (8,), 4),
+        fake(cutlass.Int32, (10,), 4),
         options="--enable-tvm-ffi --opt-level 3",
     )
-    output = torch.zeros(8, device="cuda", dtype=torch.int32)
+    output = torch.zeros(10, device="cuda", dtype=torch.int32)
     compiled(output)
     torch.cuda.synchronize()
     result = output.cpu()
     torch.testing.assert_close(result[:2], torch.ones(2, dtype=torch.int32))
-    qk_cols, vp_cols, score_cols, output_cols, correction_cols, total_cols = result[
-        2:
-    ].tolist()
+    (
+        qk_cols,
+        vp_cols,
+        score_cols,
+        output_cols,
+        correction_cols,
+        v_operand_cols,
+        v_operand_offset,
+        total_cols,
+    ) = result[2:].tolist()
     if total_cols >= 512:
         raise AssertionError(
             f"TMEM overlap: score={score_cols}, output={output_cols}, "
-            f"correction={correction_cols}, limit=512"
+            f"correction={correction_cols}, v_operand={v_operand_cols}, limit=512"
         )
     print(
         f"PASS qk_group=2 vp_group=1 qk_cols={qk_cols} "
         f"vp_cols={vp_cols} score_cols={score_cols} output_cols={output_cols} "
-        f"correction_cols={correction_cols} total_cols={total_cols}"
+        f"correction_cols={correction_cols} v_operand_cols={v_operand_cols} "
+        f"v_operand_offset={v_operand_offset} total_cols={total_cols}"
     )
 
 
