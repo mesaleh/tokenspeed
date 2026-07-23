@@ -60,32 +60,34 @@ def dequantize_tq4_word_to_fp8_shfl(
     scale: cutlass.Float32,
     centroid_lane: cutlass.Float32,
 ):
-    """Convert one word using lanes 0-15 as a register codebook."""
+    """Convert one word using each scale-uniform half warp as a codebook."""
     values0 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
     values1 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
-    values0[0] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 0) & 0xF) * scale
+    scaled_centroid_lane = centroid_lane * scale
+    # PTX shfl.idx: segment mask 0x10 and clamp 0x0F isolate both half warps.
+    values0[0] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 0) & 0xF, mask_and_clamp=0x100F
     )
-    values0[1] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 4) & 0xF) * scale
+    values0[1] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 4) & 0xF, mask_and_clamp=0x100F
     )
-    values0[2] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 8) & 0xF) * scale
+    values0[2] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 8) & 0xF, mask_and_clamp=0x100F
     )
-    values0[3] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 12) & 0xF) * scale
+    values0[3] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 12) & 0xF, mask_and_clamp=0x100F
     )
-    values1[0] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 16) & 0xF) * scale
+    values1[0] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 16) & 0xF, mask_and_clamp=0x100F
     )
-    values1[1] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 20) & 0xF) * scale
+    values1[1] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 20) & 0xF, mask_and_clamp=0x100F
     )
-    values1[2] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 24) & 0xF) * scale
+    values1[2] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 24) & 0xF, mask_and_clamp=0x100F
     )
-    values1[3] = (
-        cute.arch.shuffle_sync(centroid_lane, (packed_word >> 28) & 0xF) * scale
+    values1[3] = cute.arch.shuffle_sync(
+        scaled_centroid_lane, (packed_word >> 28) & 0xF, mask_and_clamp=0x100F
     )
     return (
         cvt_f32x4_to_f8x4_pack_i32(values0, cutlass.Float8E4M3FN),
