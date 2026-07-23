@@ -122,8 +122,8 @@ def validate_tq4_decode_inputs(
         f"got {num_heads}",
     )
     _require(
-        query_length in (1, 5),
-        f"initial TQ4 MLA kernel supports q_len 1 or 5, got {query_length}",
+        1 <= query_length <= 5,
+        f"TQ4 MLA kernel supports q_len in [1, 5], got {query_length}",
     )
 
     packed = _normalize_paged_tensor(kv_nope_packed, "kv_nope_packed")

@@ -59,7 +59,7 @@ def main() -> None:
     parser.add_argument("--profile-split", type=int, default=None)
     parser.add_argument("--atol", type=float, default=0.002)
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
-    parser.add_argument("--q-len", type=int, choices=(1, 5), default=5)
+    parser.add_argument("--q-len", type=int, choices=range(1, 6), default=5)
     args = parser.parse_args()
     if args.context <= args.q_len:
         raise ValueError("--context must exceed --q-len")

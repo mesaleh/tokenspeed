@@ -47,7 +47,7 @@ def test_reference_dequant_applies_one_scale_per_token():
     assert values[0, 1, :2].tolist() == [-3.0, -2.5]
 
 
-@pytest.mark.parametrize("q_len", [1, 5])
+@pytest.mark.parametrize("q_len", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("heads", [8, 16])
 def test_validate_accepts_kimi_decode_and_verify_shapes(q_len: int, heads: int):
     inputs = _valid_inputs(q_len, heads)
@@ -86,9 +86,9 @@ def test_validate_rejects_contract_drift(name, replacement, message):
         validate_tq4_decode_inputs(**inputs, require_cuda=False)
 
 
-@pytest.mark.parametrize("q_len", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [6, 8])
 def test_validate_rejects_unimplemented_query_lengths(q_len: int):
-    with pytest.raises(ValueError, match="supports q_len 1 or 5"):
+    with pytest.raises(ValueError, match=r"supports q_len in \[1, 5\]"):
         validate_tq4_decode_inputs(**_valid_inputs(q_len), require_cuda=False)
 
 
