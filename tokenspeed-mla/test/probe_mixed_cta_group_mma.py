@@ -182,13 +182,28 @@ def mixed_group_kernel(
     vp_acc_fake = vp_tiled_mma.make_fragment_C(vp_shape)
     vp_acc = cute.make_tensor(tmem_ptr + score_cols, vp_acc_fake.layout)
 
-    # Write the host-provided [I_64, 0] through the B descriptor's logical
-    # coordinates. The composed SMEM tensor applies the physical swizzle.
-    for iteration in cutlass.range_constexpr(64):
-        linear = iteration * THREADS_PER_CTA + tidx
-        n = linear // 128
-        k = linear % 128
-        s_p[(n, k % 32), 0, k // 32, 0] = p_input[n, k]
+    # Map a host-provided [I_64, 0] from the local QK C-thread partition into
+    # the transposed VP B descriptor. This mirrors softmax's C-to-B ownership;
+    # the composed SMEM tensor applies the physical swizzle.
+    qk_local_shape = (
+        QK_TILER_MNK[0] // CLUSTER_SHAPE_MNK[0],
+        QK_TILER_MNK[1],
+    )
+    c_p = cute.make_identity_tensor(qk_local_shape)
+    score_acc = qk_acc[(None, None), 0, 0]
+    score_load_atom = cute.make_copy_atom(
+        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), cutlass.Float32
+    )
+    score_load = tcgen05.make_tmem_copy(score_load_atom, score_acc)
+    score_thr = score_load.get_slice(tidx)
+    t_c_p = score_thr.partition_D(c_p)
+    t_g_p = score_thr.partition_D(p_input)
+    r_p = cute.make_fragment_like(t_g_p, cutlass.Float8E4M3FN)
+    cute.autovec_copy(t_g_p, r_p)
+    for element in cutlass.range_constexpr(cute.size(r_p)):
+        query = t_c_p[element][0]
+        token = t_c_p[element][1]
+        s_p[(query, token % 32), 0, token // 32, 0] = r_p[element]
 
     # Transpose canonical token-major packed words into a bounded byte-index
     # stage. It contains integer codebook metadata, not a decoded FP8 shadow;
@@ -282,7 +297,12 @@ def mixed_group_kernel(
     )
     tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, t_acc)
     thr_load = tmem_load.get_slice(tidx)
-    g_output = matrix_output[cta_rank, None, None]
+    # The VP accumulator is latent-major. Present a transposed logical view of
+    # the physical query-major output so the copy proves the real epilogue map.
+    g_output = cute.make_tensor(
+        matrix_output[cta_rank, None, None].iterator,
+        cute.make_layout((128, 64), stride=(1, 128)),
+    )
     t_tmem = thr_load.partition_S(t_acc)
     t_gmem = thr_load.partition_D(g_output)
     r_acc = cute.make_fragment_like(t_gmem, cutlass.Float32)
@@ -403,7 +423,7 @@ def main() -> None:
         fake(cutlass.Uint8, (128, 64), 16),
         fake(cutlass.Uint8, (16,), 16),
         fake(cutlass.Float8E4M3FN, (64, 128), 16),
-        fake(cutlass.Float32, (2, 128, 64), 16),
+        fake(cutlass.Float32, (2, 64, 128), 16),
         options="--enable-tvm-ffi --opt-level 3",
     )
     output = torch.zeros(10, device="cuda", dtype=torch.int32)
@@ -434,7 +454,7 @@ def main() -> None:
         device="cuda",
         dtype=torch.float32,
     ).to(torch.float8_e4m3fn)
-    matrix_output = torch.zeros((2, 128, 64), device="cuda", dtype=torch.float32)
+    matrix_output = torch.zeros((2, 64, 128), device="cuda", dtype=torch.float32)
     p_input = torch.eye(64, 128, device="cuda", dtype=torch.float32).to(
         torch.float8_e4m3fn
     )
@@ -463,7 +483,7 @@ def main() -> None:
             f"TMEM overlap: score={score_cols}, output={output_cols}, "
             f"correction={correction_cols}, v_operand={v_operand_cols}, limit=512"
         )
-    expected = codebook_values[codes[:64].long()].T.float()
+    expected = codebook_values[codes[:64].long()].float()
     if not torch.equal(matrix_output[0], expected):
         print("output[0,:8,:8]=", matrix_output[0, :8, :8].cpu())
         print("expected[:8,:8]=", expected[:8, :8].cpu())
@@ -494,13 +514,13 @@ def main() -> None:
         latent_high = observe(latent_ids // 16)
         token_low = observe(token_ids % 16)
         token_high = observe(token_ids // 16)
-        print("observed latent low [:16,0]=", latent_low[:16, 0].cpu())
-        print("observed latent high [:32,0]=", latent_high[:32, 0].cpu())
-        print("observed token low [0,:32]=", token_low[0, :32].cpu())
-        print("observed token high [0,:128]=", token_high[0, :128].cpu())
+        print("observed latent low [0,:16]=", latent_low[0, :16].cpu())
+        print("observed latent high [0,:32]=", latent_high[0, :32].cpu())
+        print("observed token low [:32,0]=", token_low[:32, 0].cpu())
+        print("observed token high [:64,0]=", token_high[:64, 0].cpu())
         print(
-            "token mapping row invariant=",
-            torch.equal(token_high, token_high[0:1].expand_as(token_high)),
+            "token mapping column invariant=",
+            torch.equal(token_high, token_high[:, 0:1].expand_as(token_high)),
         )
     torch.testing.assert_close(matrix_output[0], expected, rtol=0, atol=0)
     torch.testing.assert_close(matrix_output[1], expected, rtol=0, atol=0)
