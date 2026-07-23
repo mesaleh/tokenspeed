@@ -77,9 +77,11 @@ def main() -> None:
     packed = torch.randint(
         0, 256, (pages, PAGE, LATENT // 2), device=device, dtype=torch.uint8
     )
+    # Production TQ norms put dequant scales around the low twenties.  Tiny
+    # scales can hide operand-layout corruption behind an absolute tolerance.
     scales = (
-        torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 0.08
-        + 0.02
+        torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 8.0
+        + 16.0
     )
     rope = (
         torch.randn(pages, PAGE, ROPE, device=device, dtype=torch.bfloat16) * 0.1

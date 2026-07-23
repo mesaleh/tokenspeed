@@ -2073,7 +2073,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.group_modes(k_params.packed_stage, 0, 2),
             cute.group_modes(tiled_global, 0, 2),
         )
-        rope_i32 = cute.recast_tensor(k_params.sKC_rope, cutlass.Int32)
+        # Recasting the composed tensor changes the address unit before its
+        # swizzle is applied.  Use a raw view and apply the FP8 SW64
+        # S<2,4,3> byte-address XOR explicitly instead.
+        rope_raw_i32 = cute.make_tensor(
+            cute.recast_ptr(
+                k_params.sKC_rope.iterator,
+                swizzle_=None,
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout(cute.cosize(k_params.sKC_rope.layout) // 4),
+        )
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % self.threads_per_warp
         cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
@@ -2117,13 +2127,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 page_row, dim_word * 4 + element, physical_page
                             ]
                         )
-                    rope_i32[
-                        (
-                            (page_row, dim_word),
-                            page,
-                            0,
-                            output_producer_state.index,
-                        )
+                    logical_byte = (
+                        page_row * 64
+                        + dim_word * 4
+                        + page * 2048
+                        + output_producer_state.index * 4096
+                    )
+                    physical_byte = logical_byte ^ (
+                        (logical_byte & 0x180) >> 3
+                    )
+                    rope_raw_i32[
+                        physical_byte // 4
                     ] = cvt_f32x4_to_f8x4_pack_i32(
                         values, cutlass.Float8E4M3FN
                     )
@@ -2148,13 +2162,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 rolled_physical_page,
                             ]
                         )
-                    rope_i32[
-                        (
-                            (rolled_page_row, rolled_dim_word),
-                            rolled_page,
-                            0,
-                            output_producer_state.index,
-                        )
+                    rolled_logical_byte = (
+                        rolled_page_row * 64
+                        + rolled_dim_word * 4
+                        + rolled_page * 2048
+                        + output_producer_state.index * 4096
+                    )
+                    rolled_physical_byte = rolled_logical_byte ^ (
+                        (rolled_logical_byte & 0x180) >> 3
+                    )
+                    rope_raw_i32[
+                        rolled_physical_byte // 4
                     ] = cvt_f32x4_to_f8x4_pack_i32(
                         rolled_values, cutlass.Float8E4M3FN
                     )
@@ -2272,7 +2290,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         packed_i32 = cute.recast_tensor(
             common_params.packed_k_stage, cutlass.Int32
         )
-        output_i32 = cute.recast_tensor(common_params.sKC, cutlass.Int32)
+        # The fixed TQ4 ABI (page32, latent512) selects FP8 SW128
+        # S<3,4,3>.  Recasting the composed tensor to Int32 permutes rows;
+        # vectorize only after mapping the logical FP8 byte address ourselves.
+        output_raw_i32 = cute.make_tensor(
+            cute.recast_ptr(
+                common_params.sKC.iterator,
+                swizzle_=None,
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout(cute.cosize(common_params.sKC.layout) // 4),
+        )
         raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
         centroid_lane = cutlass.Float32(
             common_params.mTQCentroids[local_tidx % 16]
@@ -2308,23 +2336,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 fp8_0, fp8_1 = dequantize_tq4_word_to_fp8_shfl(
                     raw_words[iteration], scale, centroid_lane
                 )
-                dim_word = chunk_word * 2
-                output_i32[
-                    (
-                        (page_row, dim_word),
-                        page,
-                        0,
-                        (phase, output_producer_state.index),
-                    )
-                ] = fp8_0
-                output_i32[
-                    (
-                        (page_row, dim_word + 1),
-                        page,
-                        0,
-                        (phase, output_producer_state.index),
-                    )
-                ] = fp8_1
+                logical_byte = (
+                    page_row * 128
+                    + chunk_word * 8
+                    + page * 4096
+                    + phase * 8192
+                    + output_producer_state.index * 32768
+                )
+                physical_byte = logical_byte ^ (
+                    (logical_byte & 0x380) >> 3
+                )
+                output_raw_i32[physical_byte // 4] = fp8_0
+                output_raw_i32[physical_byte // 4 + 1] = fp8_1
 
         cute.arch.fence_view_async_shared()
         common_params.raw_k_pipeline.consumer_release(raw_consumer_state)
@@ -2348,7 +2371,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         packed_i32 = cute.recast_tensor(
             common_params.packed_v_stage, cutlass.Int32
         )
-        output_i32 = cute.recast_tensor(common_params.sVC, cutlass.Int32)
+        # V uses the same FP8 SW128 S<3,4,3> atom as latent K, but its
+        # logical matrix is transposed.  Keep the packed stores on a raw view
+        # after applying the V-specific logical strides and the same XOR.
+        output_raw_i32 = cute.make_tensor(
+            cute.recast_ptr(
+                common_params.sVC.iterator,
+                swizzle_=None,
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout(cute.cosize(common_params.sVC.layout) // 4),
+        )
         raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
         centroid_lane = cutlass.Float32(
             common_params.mTQCentroids[local_tidx % 16]
@@ -2387,29 +2420,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 fp8_0, fp8_1 = dequantize_tq4_word_to_fp8_shfl(
                     raw_words[iteration], scale, centroid_lane
                 )
-                dim_word = chunk_word * 2
-                output_i32[
-                    (
-                        (dim_word, page_row),
-                        0,
-                        page,
-                        (
-                            (latent_stage, token_stage),
-                            output_producer_state.index,
-                        ),
-                    )
-                ] = fp8_0
-                output_i32[
-                    (
-                        (dim_word + 1, page_row),
-                        0,
-                        page,
-                        (
-                            (latent_stage, token_stage),
-                            output_producer_state.index,
-                        ),
-                    )
-                ] = fp8_1
+                logical_byte = (
+                    chunk_word * 8
+                    + page_row * 128
+                    + page * 4096
+                    + latent_stage * 8192
+                    + token_stage * 16384
+                    + output_producer_state.index * 32768
+                )
+                physical_byte = logical_byte ^ (
+                    (logical_byte & 0x380) >> 3
+                )
+                output_raw_i32[physical_byte // 4] = fp8_0
+                output_raw_i32[physical_byte // 4 + 1] = fp8_1
 
         cute.arch.fence_view_async_shared()
         common_params.raw_v_pipeline.consumer_release(raw_consumer_state)
