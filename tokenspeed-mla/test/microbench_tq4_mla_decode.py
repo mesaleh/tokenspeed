@@ -35,9 +35,7 @@ from tokenspeed_mla.tq4_contract import dequantize_tq4_reference
 
 LATENT = 512
 ROPE = 64
-HEADS = 16
 PAGE = 32
-Q_LEN = 5
 
 
 def bench(fn) -> dict[str, float]:
@@ -60,9 +58,11 @@ def main() -> None:
     parser.add_argument("--splits", default=None)
     parser.add_argument("--profile-split", type=int, default=None)
     parser.add_argument("--atol", type=float, default=0.002)
+    parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
+    parser.add_argument("--q-len", type=int, choices=(1, 5), default=5)
     args = parser.parse_args()
-    if args.context <= Q_LEN:
-        raise ValueError("--context must exceed q_len=5")
+    if args.context <= args.q_len:
+        raise ValueError("--context must exceed --q-len")
 
     torch.manual_seed(20260722)
     device = torch.device("cuda")
@@ -72,7 +72,7 @@ def main() -> None:
     pages = math.ceil(args.context / 128) * (128 // PAGE)
 
     query = (
-        torch.randn(1, Q_LEN, HEADS, LATENT + ROPE, device=device) * 0.1
+        torch.randn(1, args.q_len, args.heads, LATENT + ROPE, device=device) * 0.1
     ).to(fp8)
     packed = torch.randint(
         0, 256, (pages, PAGE, LATENT // 2), device=device, dtype=torch.uint8
@@ -98,7 +98,7 @@ def main() -> None:
     seq_lens = torch.tensor([args.context], device=device, dtype=torch.int32)
     workspace = torch.empty(64 << 20, device=device, dtype=torch.int8)
     out_dense = torch.empty(
-        1, Q_LEN, HEADS, LATENT, device=device, dtype=torch.bfloat16
+        1, args.q_len, args.heads, LATENT, device=device, dtype=torch.bfloat16
     )
     out_tq4 = torch.empty_like(out_dense)
     scale = 1.0 / math.sqrt(LATENT + ROPE)
@@ -191,8 +191,8 @@ def main() -> None:
     result = {
         "status": "PASS",
         "context": args.context,
-        "q_len": Q_LEN,
-        "heads": HEADS,
+        "q_len": args.q_len,
+        "heads": args.heads,
         "dense": dense_timing,
         "tq4": tq4_timings,
         "max_abs_diff": max_abs_diff,

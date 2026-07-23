@@ -117,8 +117,9 @@ def validate_tq4_decode_inputs(
         "query dimensions must be positive",
     )
     _require(
-        num_heads == 16,
-        f"initial TQ4 MLA kernel requires 16 TP-local query heads, got {num_heads}",
+        num_heads in (8, 16),
+        "initial TQ4 MLA kernel requires 8 or 16 TP-local query heads, "
+        f"got {num_heads}",
     )
     _require(
         query_length in (1, 5),

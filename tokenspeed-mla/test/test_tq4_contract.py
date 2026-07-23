@@ -11,8 +11,8 @@ from tokenspeed_mla.tq4_contract import (
 )
 
 
-def _valid_inputs(q_len: int = 5):
-    pages, page_size, batch, heads = 3, 32, 1, 16
+def _valid_inputs(q_len: int = 5, heads: int = 16):
+    pages, page_size, batch = 3, 32, 1
     return {
         "query": torch.empty(batch, q_len, heads, 576, dtype=torch.float8_e4m3fn),
         "kv_nope_packed": torch.empty(pages, page_size, 256, dtype=torch.uint8),
@@ -48,11 +48,12 @@ def test_reference_dequant_applies_one_scale_per_token():
 
 
 @pytest.mark.parametrize("q_len", [1, 5])
-def test_validate_accepts_kimi_decode_and_verify_shapes(q_len: int):
-    inputs = _valid_inputs(q_len)
+@pytest.mark.parametrize("heads", [8, 16])
+def test_validate_accepts_kimi_decode_and_verify_shapes(q_len: int, heads: int):
+    inputs = _valid_inputs(q_len, heads)
     shape, packed, rope = validate_tq4_decode_inputs(**inputs, require_cuda=False)
     assert shape.query_length == q_len
-    assert shape.num_heads == 16
+    assert shape.num_heads == heads
     assert shape.page_size == 32
     assert packed.shape == (3, 32, 256)
     assert rope.shape == (3, 32, 64)
@@ -104,7 +105,7 @@ def test_validate_rejects_non_kimi_head_geometry():
     inputs = _valid_inputs()
     inputs["query"] = torch.empty(1, 5, 32, 576, dtype=torch.float8_e4m3fn)
     inputs["out"] = torch.empty(1, 5, 32, 512, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="requires 16 TP-local query heads"):
+    with pytest.raises(ValueError, match="requires 8 or 16 TP-local query heads"):
         validate_tq4_decode_inputs(**inputs, require_cuda=False)
 
 
