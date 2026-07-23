@@ -139,3 +139,83 @@ def dequantize_tq4_word_to_fp8_shfl(
         cvt_f32x4_to_f8x4_pack_i32(values0, cutlass.Float8E4M3FN),
         cvt_f32x4_to_f8x4_pack_i32(values1, cutlass.Float8E4M3FN),
     )
+
+
+@dsl_user_op
+def lookup_tq4x4_from_fp8_codebook_prmt(
+    lut0: cutlass.Int32,
+    lut1: cutlass.Int32,
+    lut2: cutlass.Int32,
+    lut3: cutlass.Int32,
+    lut_indices: cutlass.Int32,
+    table_select: cutlass.Int32,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
+    """Map four TQ4 indices through a 16-byte register LUT."""
+    i32_type = ir.IntegerType.get_signless(32)
+    return llvm.inline_asm(
+        i32_type,
+        [
+            cutlass.Int32(lut0).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(lut1).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(lut2).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(lut3).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(lut_indices).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(table_select).ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n\t"
+            ".reg .b32 lower, upper;\n\t"
+            "prmt.b32 lower, $1, $2, $5;\n\t"
+            "prmt.b32 upper, $3, $4, $5;\n\t"
+            "prmt.b32 $0, lower, upper, $6;\n\t"
+            "}"
+        ),
+        "=r,r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def lookup_tq4_word_from_fp8_codebook_prmt(
+    packed_word: cutlass.Int32,
+    codebook_word_lane: cutlass.Int32,
+):
+    """Expand eight TQ4 indices with four broadcasts and six byte permutes."""
+    lut0 = cute.arch.shuffle_sync(
+        codebook_word_lane, 0, mask_and_clamp=0x100F
+    )
+    lut1 = cute.arch.shuffle_sync(
+        codebook_word_lane, 1, mask_and_clamp=0x100F
+    )
+    lut2 = cute.arch.shuffle_sync(
+        codebook_word_lane, 2, mask_and_clamp=0x100F
+    )
+    lut3 = cute.arch.shuffle_sync(
+        codebook_word_lane, 3, mask_and_clamp=0x100F
+    )
+    lut_indices = packed_word & 0x77777777
+    table_select = ((packed_word & 0x88888888) >> 1) | 0x32103210
+    return (
+        cutlass.Int32(
+            lookup_tq4x4_from_fp8_codebook_prmt(
+                lut0, lut1, lut2, lut3, lut_indices, table_select
+            )
+        ),
+        cutlass.Int32(
+            lookup_tq4x4_from_fp8_codebook_prmt(
+                lut0,
+                lut1,
+                lut2,
+                lut3,
+                lut_indices >> 16,
+                table_select >> 16,
+            )
+        ),
+    )

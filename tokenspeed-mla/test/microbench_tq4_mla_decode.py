@@ -60,6 +60,7 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=0.002)
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
     parser.add_argument("--q-len", type=int, choices=range(1, 6), default=5)
+    parser.add_argument("--codebook", action="store_true")
     args = parser.parse_args()
     if args.context <= args.q_len:
         raise ValueError("--context must exceed --q-len")
@@ -89,6 +90,9 @@ def main() -> None:
     centroids = torch.linspace(
         -0.12, 0.11, 16, device=device, dtype=torch.float32
     )
+    codebook = (
+        scales.float()[..., None] * centroids[None, None, :]
+    ).to(fp8).view(torch.uint8).contiguous()
 
     dense_latent = dequantize_tq4_reference(
         packed, scales, centroids, dtype=torch.float32
@@ -101,6 +105,7 @@ def main() -> None:
         1, args.q_len, args.heads, LATENT, device=device, dtype=torch.bfloat16
     )
     out_tq4 = torch.empty_like(out_dense)
+    out_tq4_reference = torch.empty_like(out_dense)
     scale = 1.0 / math.sqrt(LATENT + ROPE)
 
     def run_dense():
@@ -145,9 +150,40 @@ def main() -> None:
             causal_mask=True,
             enable_pdl=True,
             split_kv_override=split_kv,
+            kv_nope_codebook=codebook if args.codebook else None,
         )
 
+    def run_tq4_reference(split_kv: int):
+        return tokenspeed_mla_decode_tq4(
+            query=query,
+            kv_nope_packed=packed,
+            kv_nope_scale=scales,
+            kv_rope=rope,
+            centroids=centroids,
+            workspace_buffer=workspace,
+            kv_lora_rank=LATENT,
+            qk_rope_head_dim=ROPE,
+            block_tables=page_table,
+            seq_lens=seq_lens,
+            max_seq_len=args.context,
+            softmax_scale=scale,
+            out=out_tq4_reference,
+            causal_mask=True,
+            enable_pdl=True,
+            split_kv_override=split_kv,
+        )
+
+    def check_codebook_identity(split_kv: int):
+        if args.codebook:
+            run_tq4_reference(split_kv)
+            run_tq4(split_kv)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                out_tq4, out_tq4_reference, rtol=0, atol=0
+            )
+
     if args.profile_split is not None:
+        check_codebook_identity(args.profile_split)
         run_dense()
         run_tq4(args.profile_split)
         torch.cuda.synchronize()
@@ -173,6 +209,7 @@ def main() -> None:
         )
         return
 
+    check_codebook_identity(splits[0])
     run_dense()
     run_tq4(splits[0])
     torch.cuda.synchronize()

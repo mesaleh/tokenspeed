@@ -173,6 +173,7 @@ def _get_compiled_mla_kernel(
     use_pdl: bool = False,
     tq4_cache: bool = False,
     tq4_tiles_per_split: int = 1,
+    tq4_codebook: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -351,9 +352,20 @@ def _get_compiled_mla_kernel(
             (16,),
             assumed_align=16,
         )
+        tq4_codebook_fake = (
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8,
+                (sym_kv_batch, sym_seq_kv, 16),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
+            )
+            if tq4_codebook
+            else None
+        )
     else:
         tq4_scale_fake = None
         tq4_centroids_fake = None
+        tq4_codebook_fake = None
 
     compiled_kernel = cute.compile(
         kernel_obj,
@@ -376,6 +388,7 @@ def _get_compiled_mla_kernel(
         use_pdl,
         tq4_scale_fake,
         tq4_centroids_fake,
+        tq4_codebook_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -403,6 +416,7 @@ def tokenspeed_mla_decode(
     _tq4_centroids: Optional[torch.Tensor] = None,
     _tq4_rope_cache: Optional[torch.Tensor] = None,
     _tq4_split_kv: Optional[int] = None,
+    _tq4_codebook: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -680,6 +694,7 @@ def tokenspeed_mla_decode(
         use_pdl=enable_pdl,
         tq4_cache=tq4_cache,
         tq4_tiles_per_split=tq4_tiles_per_split,
+        tq4_codebook=_tq4_codebook is not None,
     )
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
@@ -707,7 +722,9 @@ def tokenspeed_mla_decode(
             Float32(output_scale),
         )
         if tq4_cache:
-            compiled_kernel(*args, _tq4_scale, _tq4_centroids)
+            compiled_kernel(
+                *args, _tq4_scale, _tq4_centroids, _tq4_codebook
+            )
         else:
             compiled_kernel(*args)
 
@@ -740,6 +757,7 @@ def tokenspeed_mla_decode_tq4(
     cmask_off: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     split_kv_override: Optional[int] = None,
+    kv_nope_codebook: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SM100 MLA decode from the canonical no-shadow TQ4 cache."""
     _, packed, rope = validate_tq4_decode_inputs(
@@ -757,6 +775,20 @@ def tokenspeed_mla_decode_tq4(
     )
     if centroids.dtype != torch.float32:
         raise ValueError("native TQ4 decode requires persistent float32 centroids")
+    if kv_nope_codebook is not None:
+        if kv_nope_codebook.dtype != torch.uint8:
+            raise ValueError("native TQ4 FP8 codebook must contain raw uint8 bytes")
+        if kv_nope_codebook.shape != (*kv_nope_scale.shape, 16):
+            raise ValueError(
+                "native TQ4 FP8 codebook must have shape "
+                f"{(*kv_nope_scale.shape, 16)}, got {tuple(kv_nope_codebook.shape)}"
+            )
+        if not kv_nope_codebook.is_contiguous():
+            raise ValueError("native TQ4 FP8 codebook must be contiguous")
+        if kv_nope_codebook.data_ptr() % 16:
+            raise ValueError("native TQ4 FP8 codebook must be 16-byte aligned")
+        if kv_nope_codebook.device != kv_nope_packed.device:
+            raise ValueError("native TQ4 FP8 codebook must share the cache device")
     return tokenspeed_mla_decode(
         query=query,
         kv_cache=packed,
@@ -778,4 +810,5 @@ def tokenspeed_mla_decode_tq4(
         _tq4_centroids=centroids,
         _tq4_rope_cache=rope,
         _tq4_split_kv=split_kv_override,
+        _tq4_codebook=kv_nope_codebook,
     )
