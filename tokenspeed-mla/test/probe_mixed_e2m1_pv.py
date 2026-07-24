@@ -18,30 +18,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Probe a narrow reversed E2M1-V by FP8-P MMA tile on SM100.
+"""Probe a padded block-scaled E2M1-V by FP8-P MMA tile on SM100.
 
 The no-shadow TurboQuant PV path folds each token's BF16 cache scale into P,
 casts the scaled probabilities to FP8, and multiplies a bounded transpose of
-the packed E2M1 V tile by a 16-query FP8 operand. The mixed instruction's lower
-K=16 lane group is exact while its upper group aliases and shifts the lower
-group, so this probe zeroes the upper group and issues eight logical K=16 tiles.
-Four N=16 tiles cover Kimi's 64 heads. The final latent row is corrected from
-canonical packed bytes. This is a legality probe, not an attention benchmark.
+the canonical packed E2M1 V tile by a 16-query FP8 operand. A padded K64 shared
+carrier gives the mixed descriptor distinct addresses for both logical K16
+groups while one block-scaled K32 instruction consumes all 32 useful lanes.
+Unit UE8M0 scale factors isolate the data path. Four N=16 tiles cover Kimi's
+64 heads. This is a legality probe, not an attention benchmark.
 """
+
+import math
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 THREADS = 128
-LOGICAL_K = 16
+LOGICAL_K = 32
+SF_DTYPE = cutlass.Float8E8M0FNU
+SF_VEC_SIZE = 32
 CLUSTER_SHAPE_MNK = (1, 1, 1)
-E2M1_PV_TILER_MNK = (128, 16, 32)
+E2M1_PV_TILER_MNK = (128, 16, 64)
 OUTPUT_VIEW_TILER_MNK = (128, 16, 32)
 
 
@@ -52,12 +57,13 @@ class SharedStorage:
 
 
 def make_tiled_mmas():
-    e2m1_pv = sm100_utils.make_trivial_tiled_mma(
+    e2m1_pv = sm100_utils.make_blockscaled_trivial_tiled_mma(
         cutlass.Float4E2M1FN,
         cutlass.Float8E4M3FN,
         OperandMajorMode.K,
         OperandMajorMode.K,
-        cutlass.Float32,
+        SF_DTYPE,
+        SF_VEC_SIZE,
         tcgen05.CtaGroup.ONE,
         E2M1_PV_TILER_MNK[:2],
     )
@@ -77,16 +83,19 @@ def mixed_pv_kernel(
     output: cute.Tensor,
     metadata: cute.Tensor,
     packed_v: cute.Tensor,
-    codebook: cute.Tensor,
     p_input: cute.Tensor,
-    p_reference: cute.Tensor,
     latent_base: cutlass.Int32,
     token_base: cutlass.Int32,
     e2m1_pv_mma: cute.TiledMma,
     output_view_mma: cute.TiledMma,
     e2m1_a_layout: cute.ComposedLayout,
     p_b_layout: cute.ComposedLayout,
+    sfa_layout: cute.Layout,
+    sfb_layout: cute.Layout,
     acc_cols: cutlass.Constexpr,
+    sfa_cols: cutlass.Constexpr,
+    sfb_cols: cutlass.Constexpr,
+    total_cols: cutlass.Constexpr,
     cta_layout_vmnk: cute.Layout,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -106,9 +115,17 @@ def mixed_pv_kernel(
         byte_alignment=1024,
         swizzle=p_b_layout.inner,
     )
+    s_sfa = smem.allocate_tensor(
+        SF_DTYPE, sfa_layout, byte_alignment=128
+    )
+    s_sfb = smem.allocate_tensor(
+        SF_DTYPE, sfb_layout, byte_alignment=128
+    )
 
-    # Transpose canonical [token, latent_pair] bytes into the E2M1 A operand's
-    # [latent, token_pair] byte order without allocating a decoded tensor.
+    # Transpose canonical [token, latent_pair] bytes into a padded K-major A
+    # operand. The mixed descriptor advances 16 bytes at logical K16, so the
+    # upper token group starts at storage K32 and each latent row spans 32
+    # bytes. S<1,4,3> permutes element offsets but preserves nibble pairs.
     e2m1_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, s_e2m1_v)
     v_raw = cute.make_tensor(
         cute.recast_ptr(
@@ -116,12 +133,11 @@ def mixed_pv_kernel(
         ),
         cute.make_layout(e2m1_bytes),
     )
-    for destination_byte in cutlass.range(tidx, 128 * 16, THREADS):
+    for destination_byte in cutlass.range(tidx, 128 * 32, THREADS):
         v_raw[destination_byte] = cutlass.Uint8(0)
     for active_byte in cutlass.range(tidx, 128 * (LOGICAL_K // 2), THREADS):
         latent = active_byte // (LOGICAL_K // 2)
         token_pair = active_byte % (LOGICAL_K // 2)
-        destination_byte = latent * 16 + token_pair
         token0 = token_base + token_pair * 2
         token1 = token0 + 1
         source_latent = latent_base + latent
@@ -129,21 +145,35 @@ def mixed_pv_kernel(
         shift = (source_latent % 2) * 4
         code0 = (cutlass.Int32(packed_v[token0, source_byte]) >> shift) & 0xF
         code1 = (cutlass.Int32(packed_v[token1, source_byte]) >> shift) & 0xF
-        physical_byte = destination_byte
+        storage_k = token_pair * 2
+        if token_pair >= 8:
+            storage_k += 16
+        logical_byte = latent * 32 + storage_k // 2
+        physical_byte = logical_byte ^ ((logical_byte & 0x80) >> 3)
         v_raw[physical_byte] = cutlass.Uint8(code0 | (code1 << 4))
     p_raw = cute.make_tensor(
         cute.recast_ptr(s_p.iterator, swizzle_=None, dtype=cutlass.Float8E4M3FN),
         cute.make_layout(cute.cosize(p_b_layout.outer)),
     )
-    for logical_element in cutlass.range(tidx, 16 * 32, THREADS):
-        physical_element = logical_element ^ ((logical_element & 0x80) >> 3)
+    for logical_element in cutlass.range(tidx, 16 * 64, THREADS):
+        physical_element = logical_element ^ (
+            (logical_element & 0x180) >> 3
+        )
         p_raw[physical_element] = cutlass.Float8E4M3FN(0.0)
     for active_element in cutlass.range(tidx, 16 * LOGICAL_K, THREADS):
         query = active_element // LOGICAL_K
         token = active_element % LOGICAL_K
-        logical_element = query * 32 + token
-        physical_element = logical_element ^ ((logical_element & 0x80) >> 3)
+        logical_element = query * 64 + token
+        physical_element = logical_element ^ (
+            (logical_element & 0x180) >> 3
+        )
         p_raw[physical_element] = p_input[query, token]
+    sfa_ptr = cute.recast_ptr(s_sfa.iterator, dtype=SF_DTYPE)
+    sfb_ptr = cute.recast_ptr(s_sfb.iterator, dtype=SF_DTYPE)
+    for element in cutlass.range(tidx, cute.cosize(sfa_layout), THREADS):
+        (sfa_ptr + element).store(SF_DTYPE(1.0))
+    for element in cutlass.range(tidx, cute.cosize(sfb_layout), THREADS):
+        (sfb_ptr + element).store(SF_DTYPE(1.0))
     cute.arch.sync_threads()
 
     mma_producer, mma_consumer = pipeline.PipelineUmmaAsync.create(
@@ -159,7 +189,7 @@ def mixed_pv_kernel(
         barrier_for_retrieve=tmem_barrier,
         is_two_cta=False,
     )
-    tmem.allocate(acc_cols)
+    tmem.allocate(total_cols)
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
 
@@ -171,20 +201,67 @@ def mixed_pv_kernel(
     view_shape = output_view_mma.partition_shape_C(OUTPUT_VIEW_TILER_MNK[:2])
     view_fake = output_view_mma.make_fragment_C(view_shape)
     output_view = cute.make_tensor(tmem_ptr, view_fake.layout)
+    sfa_tmem_ptr = cute.recast_ptr(
+        tmem_ptr + acc_cols, dtype=SF_DTYPE
+    )
+    t_sfa_layout = blockscaled_utils.make_tmem_layout_sfa(
+        e2m1_pv_mma,
+        E2M1_PV_TILER_MNK,
+        SF_VEC_SIZE,
+        cute.slice_(sfa_layout, (None, None, None, 0)),
+    )
+    t_sfa = cute.make_tensor(sfa_tmem_ptr, t_sfa_layout)
+    sfb_tmem_ptr = cute.recast_ptr(
+        tmem_ptr + acc_cols + sfa_cols, dtype=SF_DTYPE
+    )
+    t_sfb_layout = blockscaled_utils.make_tmem_layout_sfb(
+        e2m1_pv_mma,
+        E2M1_PV_TILER_MNK,
+        SF_VEC_SIZE,
+        cute.slice_(sfb_layout, (None, None, None, 0)),
+    )
+    t_sfb = cute.make_tensor(sfb_tmem_ptr, t_sfb_layout)
 
     if warp_idx == 0:
+        scale_copy_atom = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+            SF_DTYPE,
+        )
+        sfa_copy = tcgen05.make_s2t_copy(
+            scale_copy_atom, cute.filter_zeros(t_sfa)
+        )
+        sfa_thr = sfa_copy.get_slice(0)
+        sfa_source = tcgen05.get_s2t_smem_desc_tensor(
+            sfa_copy, sfa_thr.partition_S(cute.filter_zeros(s_sfa))
+        )
+        cute.copy(
+            sfa_copy,
+            sfa_source[None, None, None, None, 0],
+            sfa_thr.partition_D(cute.filter_zeros(t_sfa)),
+        )
+        sfb_copy = tcgen05.make_s2t_copy(
+            scale_copy_atom, cute.filter_zeros(t_sfb)
+        )
+        sfb_thr = sfb_copy.get_slice(0)
+        sfb_source = tcgen05.get_s2t_smem_desc_tensor(
+            sfb_copy, sfb_thr.partition_S(cute.filter_zeros(s_sfb))
+        )
+        cute.copy(
+            sfb_copy,
+            sfb_source[None, None, None, None, 0],
+            sfb_thr.partition_D(cute.filter_zeros(t_sfb)),
+        )
         mma_producer.acquire_and_advance()
         e2m1_pv_mma.set(tcgen05.Field.ACCUMULATE, False)
-        k_blocks = cute.size(e2m1_v, mode=[2])
-        for k_block in cutlass.range(k_blocks, unroll_full=True):
-            cute.gemm(
-                e2m1_pv_mma,
-                acc,
-                e2m1_v[None, None, k_block, 0],
-                p[None, None, k_block, 0],
-                acc,
-            )
-            e2m1_pv_mma.set(tcgen05.Field.ACCUMULATE, True)
+        e2m1_pv_mma.set(tcgen05.Field.SFA, t_sfa[None, None, 0].iterator)
+        e2m1_pv_mma.set(tcgen05.Field.SFB, t_sfb[None, None, 0].iterator)
+        cute.gemm(
+            e2m1_pv_mma,
+            acc,
+            e2m1_v[None, None, 0, 0],
+            p[None, None, 0, 0],
+            acc,
+        )
         mma_producer.commit()
 
     mma_full = mma_consumer.wait_and_advance()
@@ -203,32 +280,18 @@ def mixed_pv_kernel(
     )
     t_tmem = thr_load.partition_S(output_tile)
     t_gmem = thr_load.partition_D(output_matrix)
-    coordinates = cute.make_identity_tensor((128, 16))
-    t_coordinates = thr_load.partition_D(coordinates)
     registers = cute.make_fragment_like(t_gmem, cutlass.Float32)
     cute.copy(tmem_load, t_tmem, registers)
     cute.arch.fence_view_async_tmem_load()
-    for element in cutlass.range_constexpr(cute.size(registers)):
-        latent = t_coordinates[element][0]
-        query = t_coordinates[element][1]
-        if latent == 127:
-            correction = cutlass.Float32(0.0)
-            for token in cutlass.range(LOGICAL_K):
-                global_token = token_base + token
-                source_latent = latent_base + 127
-                packed = cutlass.Int32(packed_v[global_token, source_latent // 2])
-                code = (packed >> ((source_latent % 2) * 4)) & 0xF
-                correction += cutlass.Float32(codebook[code]) * cutlass.Float32(
-                    p_reference[query, token]
-                )
-            registers[element] = correction
     cute.autovec_copy(registers, t_gmem)
     cute.arch.sync_threads()
 
     if tidx == 0:
         metadata[0] = acc_cols
-        metadata[1] = e2m1_bytes
-        metadata[2] = cute.cosize(e2m1_a_layout.outer)
+        metadata[1] = sfa_cols
+        metadata[2] = sfb_cols
+        metadata[3] = total_cols
+        metadata[4] = e2m1_bytes
 
     if warp_idx == 0:
         mma_producer.tail()
@@ -242,9 +305,7 @@ def mixed_pv_probe(
     output: cute.Tensor,
     metadata: cute.Tensor,
     packed_v: cute.Tensor,
-    codebook: cute.Tensor,
     p_input: cute.Tensor,
-    p_reference: cute.Tensor,
     latent_base: cutlass.Int32,
     token_base: cutlass.Int32,
 ):
@@ -255,14 +316,51 @@ def mixed_pv_probe(
     p_b_layout = sm100_utils.make_smem_layout_b(
         e2m1_pv_mma, E2M1_PV_TILER_MNK, cutlass.Float8E4M3FN, 1
     )
+    sfa_layout = blockscaled_utils.make_smem_layout_sfa(
+        e2m1_pv_mma, E2M1_PV_TILER_MNK, SF_VEC_SIZE, 1
+    )
+    sfb_layout = blockscaled_utils.make_smem_layout_sfb(
+        e2m1_pv_mma, E2M1_PV_TILER_MNK, SF_VEC_SIZE, 1
+    )
     print(f"E2M1_PV_A_LAYOUT={e2m1_a_layout}")
     print(f"E2M1_PV_P_LAYOUT={p_b_layout}")
     acc_fake = e2m1_pv_mma.make_fragment_C(
         e2m1_pv_mma.partition_shape_C(E2M1_PV_TILER_MNK[:2])
     )
     acc_cols = utils.get_num_tmem_alloc_cols(acc_fake)
-    if cutlass.const_expr(acc_cols > 512):
-        raise ValueError(f"TMEM overflow: acc={acc_cols}")
+    sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+        e2m1_pv_mma,
+        E2M1_PV_TILER_MNK,
+        SF_VEC_SIZE,
+        cute.slice_(sfa_layout, (None, None, None, 0)),
+    )
+    sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+        e2m1_pv_mma,
+        E2M1_PV_TILER_MNK,
+        SF_VEC_SIZE,
+        cute.slice_(sfb_layout, (None, None, None, 0)),
+    )
+    sfa_cols = tcgen05.find_tmem_tensor_col_offset(
+        cute.make_tensor(
+            cute.make_ptr(SF_DTYPE, 0), sfa_tmem_layout
+        )
+    )
+    sfb_cols = tcgen05.find_tmem_tensor_col_offset(
+        cute.make_tensor(
+            cute.make_ptr(SF_DTYPE, 0), sfb_tmem_layout
+        )
+    )
+    raw_cols = acc_cols + sfa_cols + sfb_cols
+    total_cols = max(32, 1 << math.ceil(math.log2(raw_cols)))
+    print(
+        f"TMEM_COLS acc={acc_cols} sfa={sfa_cols} sfb={sfb_cols} "
+        f"raw={raw_cols} allocation={total_cols}"
+    )
+    if cutlass.const_expr(total_cols > 512):
+        raise ValueError(
+            f"TMEM overflow: acc={acc_cols}, sfa={sfa_cols}, "
+            f"sfb={sfb_cols}, raw={raw_cols}, allocation={total_cols}"
+        )
     cta_layout_vmnk = cute.tiled_divide(
         cute.make_layout(CLUSTER_SHAPE_MNK), (e2m1_pv_mma.thr_id.shape,)
     )
@@ -270,16 +368,19 @@ def mixed_pv_probe(
         output,
         metadata,
         packed_v,
-        codebook,
         p_input,
-        p_reference,
         latent_base,
         token_base,
         e2m1_pv_mma,
         output_view_mma,
         e2m1_a_layout,
         p_b_layout,
+        sfa_layout,
+        sfb_layout,
         acc_cols,
+        sfa_cols,
+        sfb_cols,
+        total_cols,
         cta_layout_vmnk,
     ).launch(
         grid=CLUSTER_SHAPE_MNK,
@@ -300,7 +401,7 @@ def main() -> None:
         ),
         make_fake_compact_tensor(
             cutlass.Int32,
-            (3,),
+            (5,),
             stride_order=(0,),
             assumed_align=4,
         ),
@@ -311,19 +412,7 @@ def main() -> None:
             assumed_align=16,
         ),
         make_fake_compact_tensor(
-            cutlass.BFloat16,
-            (16,),
-            stride_order=(0,),
-            assumed_align=16,
-        ),
-        make_fake_compact_tensor(
             cutlass.Float8E4M3FN,
-            (16, 32),
-            stride_order=(1, 0),
-            assumed_align=16,
-        ),
-        make_fake_compact_tensor(
-            cutlass.BFloat16,
             (16, 32),
             stride_order=(1, 0),
             assumed_align=16,
@@ -335,7 +424,7 @@ def main() -> None:
     output = torch.full(
         (128, 16), float("nan"), device="cuda", dtype=torch.float32
     )
-    metadata = torch.empty(3, device="cuda", dtype=torch.int32)
+    metadata = torch.empty(5, device="cuda", dtype=torch.int32)
     generator = torch.Generator(device="cuda").manual_seed(20260723)
     codes = torch.randint(
         0, 16, (128, 512), generator=generator, device="cuda", dtype=torch.uint8
@@ -381,15 +470,12 @@ def main() -> None:
                 p_block[:, :LOGICAL_K] = p_input[
                     :, token_base : token_base + LOGICAL_K
                 ]
-                p_reference = p_block.float().to(torch.bfloat16)
                 output.fill_(float("nan"))
                 compiled(
                     output,
                     metadata,
                     packed_v,
-                    codebook,
                     p_block,
-                    p_reference,
                     cutlass.Int32(latent_base),
                     cutlass.Int32(token_base),
                 )
@@ -420,7 +506,7 @@ def main() -> None:
             torch.testing.assert_close(accumulated, expected_slice, rtol=0, atol=0)
 
     selector = torch.arange(16, device="cuda")
-    for selector_base in range(0, 128, LOGICAL_K):
+    for selector_base in range(0, 128, 16):
         p_selector = torch.zeros(
             (16, 128), device="cuda", dtype=torch.bfloat16
         )
@@ -429,7 +515,7 @@ def main() -> None:
         run_and_check(
             f"selector-{selector_base}",
             p_selector,
-            decoded_v[selector_base : selector_base + LOGICAL_K],
+            decoded_v[selector_base : selector_base + 16],
             latent_bases=(0,),
         )
 
@@ -444,11 +530,14 @@ def main() -> None:
     )[token_ids.remainder(3)]
     p_dense = (p_values[p_indices] * token_scales).to(torch.float8_e4m3fn)
     run_and_check("dense", p_dense, p_dense.float() @ decoded_v)
-    acc_cols, a_bytes, a_cosize = metadata.cpu().tolist()
+    acc_cols, sfa_cols, sfb_cols, total_cols, e2m1_bytes = (
+        metadata.cpu().tolist()
+    )
     print(
-        "PASS mixed_e2m1_v_fp8_p_n16=True latent_slices=4 "
-        "selector=True dense=True boundary_correction=True cta_group=1 "
-        f"acc_cols={acc_cols} a_bytes={a_bytes} a_cosize={a_cosize}"
+        "PASS blockscaled_e2m1_v_fp8_p_n16=True latent_slices=4 "
+        "selector=True dense=True full_k32=True padded_k64=True cta_group=1 "
+        f"acc_cols={acc_cols} sfa_cols={sfa_cols} sfb_cols={sfb_cols} "
+        f"total_cols={total_cols} e2m1_bytes={e2m1_bytes}"
     )
 
 
