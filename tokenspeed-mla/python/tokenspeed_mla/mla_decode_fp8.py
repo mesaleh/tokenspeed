@@ -1511,10 +1511,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             mKR=mKR,
                             sKC_rope=sKC_rope_for_tma,
                         )
-                        for tile_offset in cutlass.range_constexpr(
-                            self.tq4_tiles_per_split
-                        ):
-                            if tile_offset < k_tile_count:
+                        if cutlass.const_expr(self.tq4_tiles_per_split <= 4):
+                            for tile_offset in cutlass.range_constexpr(
+                                self.tq4_tiles_per_split
+                            ):
+                                if tile_offset < k_tile_count:
+                                    raw_k_producer_state, load_k_producer_state = (
+                                        self.load_tq4_k_tma(
+                                            tma_common_params,
+                                            tq4_k_params,
+                                            k_index + tile_offset,
+                                            raw_k_producer_state,
+                                            load_k_producer_state,
+                                        )
+                                    )
+                        else:
+                            # Long configured contexts can assign dozens of
+                            # packed tiles to one split. Iterate only the
+                            # runtime-active tiles so a short request on a
+                            # 256K server neither fully unrolls nor executes
+                            # the configured-context upper bound.
+                            for tile_offset in cutlass.range(k_tile_count, unroll=1):
                                 raw_k_producer_state, load_k_producer_state = (
                                     self.load_tq4_k_tma(
                                         tma_common_params,
@@ -1702,10 +1719,43 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             convert_k=True,
                             convert_v=False,
                         )
-                        for tile_offset in cutlass.range_constexpr(
-                            self.tq4_tiles_per_split
-                        ):
-                            if tile_offset < k_tile_count:
+                        if cutlass.const_expr(self.tq4_tiles_per_split <= 4):
+                            for tile_offset in cutlass.range_constexpr(
+                                self.tq4_tiles_per_split
+                            ):
+                                if tile_offset < k_tile_count:
+                                    if tile_offset + 1 < k_tile_count:
+                                        (
+                                            raw_k_consumer_state,
+                                            load_k_tq4_producer_state,
+                                            load_v_tq4_producer_state,
+                                        ) = self.convert_tq4_kv(
+                                            tq4_common_params,
+                                            k_index + tile_offset + 1,
+                                            raw_k_consumer_state,
+                                            load_k_tq4_producer_state,
+                                            load_v_tq4_producer_state,
+                                            convert_k=True,
+                                            convert_v=False,
+                                        )
+                                    (
+                                        raw_k_consumer_state,
+                                        load_k_tq4_producer_state,
+                                        load_v_tq4_producer_state,
+                                    ) = self.convert_tq4_kv(
+                                        tq4_common_params,
+                                        k_index + tile_offset,
+                                        raw_k_consumer_state,
+                                        load_k_tq4_producer_state,
+                                        load_v_tq4_producer_state,
+                                        convert_k=False,
+                                        convert_v=True,
+                                    )
+                        else:
+                            # Match the load warp's runtime-bounded loop for
+                            # long configured contexts. Pipeline advancement
+                            # and K(N+1)/V(N) ordering are unchanged.
+                            for tile_offset in cutlass.range(k_tile_count, unroll=1):
                                 if tile_offset + 1 < k_tile_count:
                                     (
                                         raw_k_consumer_state,

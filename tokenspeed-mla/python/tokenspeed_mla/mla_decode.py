@@ -599,8 +599,10 @@ def tokenspeed_mla_decode(
     tq4_tiles_per_split = 1
     if tq4_cache:
         tq4_tiles = (max_seq_len + 127) // 128
-        if tq4_tiles > 256:
-            raise ValueError("native TQ4 prototype currently supports at most 32K context")
+        if tq4_tiles > 2048:
+            raise ValueError(
+                "native TQ4 decode currently supports at most 262144 tokens"
+            )
         required_page_columns = tq4_tiles * 4
         if block_tables.shape[1] < required_page_columns:
             raise ValueError(

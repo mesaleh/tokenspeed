@@ -55,6 +55,12 @@ def bench(fn) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", type=int, default=10221)
+    parser.add_argument(
+        "--max-context",
+        type=int,
+        default=None,
+        help="Configured kernel context; defaults to the active sequence length.",
+    )
     parser.add_argument("--splits", default=None)
     parser.add_argument("--profile-split", type=int, default=None)
     parser.add_argument("--atol", type=float, default=0.002)
@@ -74,13 +80,16 @@ def main() -> None:
         raise ValueError("--codebook and --no-codebook are mutually exclusive")
     if args.context <= args.q_len:
         raise ValueError("--context must exceed --q-len")
+    max_context = args.context if args.max_context is None else args.max_context
+    if max_context < args.context:
+        raise ValueError("--max-context must be >= --context")
 
     torch.manual_seed(20260722)
     device = torch.device("cuda")
     fp8 = torch.float8_e4m3fn
     # The native kernel loads complete 128-token tiles, so keep the synthetic
     # block table padded exactly as a serving-time max-context table is.
-    pages = math.ceil(args.context / 128) * (128 // PAGE)
+    pages = math.ceil(max_context / 128) * (128 // PAGE)
 
     query = (
         torch.randn(1, args.q_len, args.heads, LATENT + ROPE, device=device) * 0.1
@@ -164,7 +173,7 @@ def main() -> None:
             qk_rope_head_dim=ROPE,
             block_tables=page_table,
             seq_lens=seq_lens,
-            max_seq_len=args.context,
+            max_seq_len=max_context,
             softmax_scale=scale,
             out=out_dense,
             causal_mask=True,
@@ -191,7 +200,7 @@ def main() -> None:
             qk_rope_head_dim=ROPE,
             block_tables=page_table,
             seq_lens=seq_lens,
-            max_seq_len=args.context,
+            max_seq_len=max_context,
             softmax_scale=scale,
             out=out_tq4,
             causal_mask=True,
@@ -213,7 +222,7 @@ def main() -> None:
             qk_rope_head_dim=ROPE,
             block_tables=page_table,
             seq_lens=seq_lens,
-            max_seq_len=args.context,
+            max_seq_len=max_context,
             softmax_scale=scale,
             out=out_tq4_reference,
             causal_mask=True,
@@ -249,6 +258,7 @@ def main() -> None:
                 {
                     "status": "PASS",
                     "context": args.context,
+                    "max_context": max_context,
                     "split": args.profile_split,
                     "max_abs_diff": difference,
                 },
@@ -276,6 +286,7 @@ def main() -> None:
     result = {
         "status": "PASS",
         "context": args.context,
+        "max_context": max_context,
         "q_len": args.q_len,
         "heads": args.heads,
         "dense": dense_timing,
