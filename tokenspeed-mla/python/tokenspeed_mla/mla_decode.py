@@ -174,6 +174,7 @@ def _get_compiled_mla_kernel(
     tq4_cache: bool = False,
     tq4_tiles_per_split: int = 1,
     tq4_codebook: bool = False,
+    return_lse: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -313,6 +314,16 @@ def _get_compiled_mla_kernel(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
+    lse_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_batch, sym_seq_q, sym_heads),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+        if return_lse
+        else None
+    )
     if is_workspace_size_zero:
         workspace_fake = None
     else:
@@ -377,7 +388,7 @@ def _get_compiled_mla_kernel(
         custom_mask_fake,
         cmask_off_fake,
         o_fake,
-        None,  # lse (disabled)
+        lse_fake,
         workspace_fake,
         Int32(1),  # split_kv placeholder
         cache_seqs_fake,
@@ -417,7 +428,9 @@ def tokenspeed_mla_decode(
     _tq4_rope_cache: Optional[torch.Tensor] = None,
     _tq4_split_kv: Optional[int] = None,
     _tq4_codebook: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
     Parameters
@@ -450,6 +463,11 @@ def tokenspeed_mla_decode(
         Scale factor applied to the output.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor [B, q_len, H, kv_lora_rank].
+    return_lse : bool
+        Return the base-2 attention log-sum-exp alongside the output.
+    lse_out : Optional[torch.Tensor]
+        Pre-allocated FP32 LSE tensor [B, q_len, H]. Used only when
+        ``return_lse=True`` and useful for CUDA-graph-stable callers.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -467,6 +485,8 @@ def tokenspeed_mla_decode(
     -------
     torch.Tensor
         Output tensor [B, q_len, H, kv_lora_rank].
+        When ``return_lse=True``, returns ``(output, lse)`` where ``lse`` is
+        FP32 base-2 log-sum-exp with shape [B, q_len, H].
     """
     tq4_cache = any(
         tensor is not None
@@ -648,6 +668,32 @@ def tokenspeed_mla_decode(
         o_k = torch.empty(
             (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
         )
+    if lse_out is not None and not return_lse:
+        raise ValueError("lse_out requires return_lse=True")
+    if lse_out is not None:
+        expected_lse_shape = (B, q_len, H)
+        if lse_out.shape != expected_lse_shape:
+            raise ValueError(
+                f"lse_out must have shape {expected_lse_shape}, got "
+                f"{tuple(lse_out.shape)}"
+            )
+        if lse_out.dtype != torch.float32:
+            raise ValueError(f"lse_out must be FP32, got {lse_out.dtype}")
+        if lse_out.device != query.device:
+            raise ValueError(
+                f"lse_out must be on {query.device}, got {lse_out.device}"
+            )
+        if not lse_out.is_contiguous():
+            raise ValueError("lse_out must be contiguous")
+    lse_k = (
+        lse_out
+        if lse_out is not None
+        else (
+            torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
+            if return_lse
+            else None
+        )
+    )
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
@@ -697,6 +743,7 @@ def tokenspeed_mla_decode(
         tq4_cache=tq4_cache,
         tq4_tiles_per_split=tq4_tiles_per_split,
         tq4_codebook=_tq4_codebook is not None,
+        return_lse=return_lse,
     )
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
@@ -715,7 +762,7 @@ def tokenspeed_mla_decode(
             cmask_k,
             cmask_off_k,
             o_k,
-            None,  # lse (disabled)
+            lse_k,
             workspace_bytes,
             Int32(split_kv),
             cache_seqs,
@@ -730,12 +777,8 @@ def tokenspeed_mla_decode(
         else:
             compiled_kernel(*args)
 
-    # If out was provided, kernel already wrote into it — return directly.
-    if out is not None:
-        return out
-
-    # o_k is [B, q_len, H, D] — return as-is to match trtllm-gen output shape.
-    return o_k
+    # o_k is [B, q_len, H, D] and lse_k is [B, q_len, H].
+    return (o_k, lse_k) if return_lse else o_k
 
 
 def tokenspeed_mla_decode_tq4(
@@ -761,7 +804,9 @@ def tokenspeed_mla_decode_tq4(
     split_kv_override: Optional[int] = None,
     kv_nope_codebook: Optional[torch.Tensor] = None,
     native_e2m1: bool = False,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """SM100 MLA decode from the canonical no-shadow TQ4 cache."""
     if native_e2m1:
         raise ValueError(
@@ -819,4 +864,55 @@ def tokenspeed_mla_decode_tq4(
         _tq4_rope_cache=rope,
         _tq4_split_kv=split_kv_override,
         _tq4_codebook=kv_nope_codebook,
+        return_lse=return_lse,
+        lse_out=lse_out,
     )
+
+
+def merge_attention_outputs_base2(
+    output_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    output_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two independently normalized attention segments.
+
+    TokenSpeed decode kernels expose LSE in base 2, so the merge uses
+    ``logaddexp`` after converting only the logarithms to natural-log space.
+    The outputs remain in their original dtype while weights are evaluated in
+    FP32.
+    """
+
+    if output_a.shape != output_b.shape:
+        raise ValueError(
+            f"attention output shapes must match, got {output_a.shape} and "
+            f"{output_b.shape}"
+        )
+    if output_a.dtype != output_b.dtype:
+        raise ValueError(
+            f"attention output dtypes must match, got {output_a.dtype} and "
+            f"{output_b.dtype}"
+        )
+    if output_a.device != output_b.device:
+        raise ValueError(
+            f"attention outputs must share a device, got {output_a.device} and "
+            f"{output_b.device}"
+        )
+    if lse_a.shape != output_a.shape[:-1] or lse_b.shape != output_b.shape[:-1]:
+        raise ValueError(
+            "attention LSE shapes must equal output.shape[:-1], got "
+            f"{lse_a.shape}, {lse_b.shape}, and {output_a.shape}"
+        )
+    if lse_a.dtype != torch.float32 or lse_b.dtype != torch.float32:
+        raise ValueError(
+            f"attention LSE tensors must be FP32, got {lse_a.dtype} and {lse_b.dtype}"
+        )
+    if lse_a.device != output_a.device or lse_b.device != output_b.device:
+        raise ValueError("attention outputs and LSE tensors must share a device")
+
+    ln2 = 0.6931471805599453
+    merged_lse = torch.logaddexp(lse_a * ln2, lse_b * ln2) / ln2
+    weight_a = torch.exp2(lse_a - merged_lse).unsqueeze(-1)
+    weight_b = torch.exp2(lse_b - merged_lse).unsqueeze(-1)
+    merged = output_a.float() * weight_a + output_b.float() * weight_b
+    return merged.to(output_a.dtype), merged_lse
