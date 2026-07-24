@@ -61,7 +61,17 @@ def main() -> None:
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
     parser.add_argument("--q-len", type=int, choices=range(1, 6), default=5)
     parser.add_argument("--codebook", action="store_true")
+    parser.add_argument("--no-codebook", action="store_true")
+    parser.add_argument("--native-e2m1", action="store_true")
+    parser.add_argument("--e2m1-data", action="store_true")
+    parser.add_argument(
+        "--scale-mode",
+        choices=("legacy", "unit", "realistic"),
+        default="legacy",
+    )
     args = parser.parse_args()
+    if args.codebook and args.no_codebook:
+        raise ValueError("--codebook and --no-codebook are mutually exclusive")
     if args.context <= args.q_len:
         raise ValueError("--context must exceed --q-len")
 
@@ -78,21 +88,58 @@ def main() -> None:
     packed = torch.randint(
         0, 256, (pages, PAGE, LATENT // 2), device=device, dtype=torch.uint8
     )
-    # Production TQ norms put dequant scales around the low twenties.  Tiny
-    # scales can hide operand-layout corruption behind an absolute tolerance.
-    scales = (
-        torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 8.0
-        + 16.0
-    )
+    # Unit scale catches operand-layout corruption exactly. Realistic native
+    # E2M1 norm corrections are small; the legacy range remains useful for
+    # exercising arbitrary Lloyd centroids.
+    if args.scale_mode == "unit":
+        scales = torch.ones(
+            pages, PAGE, device=device, dtype=torch.bfloat16
+        )
+    elif args.scale_mode == "realistic":
+        scales = (
+            torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 0.15
+            + 0.05
+        )
+    else:
+        scales = (
+            torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 8.0
+            + 16.0
+        )
     rope = (
         torch.randn(pages, PAGE, ROPE, device=device, dtype=torch.bfloat16) * 0.1
     )
-    centroids = torch.linspace(
-        -0.12, 0.11, 16, device=device, dtype=torch.float32
-    )
+    e2m1_data = args.native_e2m1 or args.e2m1_data
+    if e2m1_data:
+        centroids = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        centroids = torch.linspace(
+            -0.12, 0.11, 16, device=device, dtype=torch.float32
+        )
     codebook = (
         scales.float()[..., None] * centroids[None, None, :]
     ).to(fp8).view(torch.uint8).contiguous()
+    use_codebook = not args.no_codebook and (args.codebook or e2m1_data)
 
     dense_latent = dequantize_tq4_reference(
         packed, scales, centroids, dtype=torch.float32
@@ -150,7 +197,8 @@ def main() -> None:
             causal_mask=True,
             enable_pdl=True,
             split_kv_override=split_kv,
-            kv_nope_codebook=codebook if args.codebook else None,
+            kv_nope_codebook=codebook if use_codebook else None,
+            native_e2m1=args.native_e2m1,
         )
 
     def run_tq4_reference(split_kv: int):
@@ -174,7 +222,7 @@ def main() -> None:
         )
 
     def check_codebook_identity(split_kv: int):
-        if args.codebook:
+        if args.codebook and not args.native_e2m1:
             run_tq4_reference(split_kv)
             run_tq4(split_kv)
             torch.cuda.synchronize()
@@ -234,6 +282,9 @@ def main() -> None:
         "tq4": tq4_timings,
         "max_abs_diff": max_abs_diff,
         "atol": args.atol,
+        "native_e2m1": args.native_e2m1,
+        "e2m1_data": e2m1_data,
+        "scale_mode": args.scale_mode,
     }
     print(json.dumps(result, sort_keys=True))
 

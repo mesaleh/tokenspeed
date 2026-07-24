@@ -174,6 +174,7 @@ def _get_compiled_mla_kernel(
     tq4_cache: bool = False,
     tq4_tiles_per_split: int = 1,
     tq4_codebook: bool = False,
+    tq4_native_e2m1: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -228,6 +229,7 @@ def _get_compiled_mla_kernel(
         if tq4_cache:
             kernel_kwargs["tq4_cache"] = True
             kernel_kwargs["tq4_tiles_per_split"] = tq4_tiles_per_split
+            kernel_kwargs["tq4_native_e2m1"] = tq4_native_e2m1
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -417,6 +419,7 @@ def tokenspeed_mla_decode(
     _tq4_rope_cache: Optional[torch.Tensor] = None,
     _tq4_split_kv: Optional[int] = None,
     _tq4_codebook: Optional[torch.Tensor] = None,
+    _tq4_native_e2m1: bool = False,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -477,6 +480,8 @@ def tokenspeed_mla_decode(
         for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
     ):
         raise ValueError("native TQ4 decode requires scale, centroids, and RoPE cache")
+    if _tq4_native_e2m1 and not tq4_cache:
+        raise ValueError("native E2M1 PV requires a TQ4 cache")
 
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
@@ -695,6 +700,7 @@ def tokenspeed_mla_decode(
         tq4_cache=tq4_cache,
         tq4_tiles_per_split=tq4_tiles_per_split,
         tq4_codebook=_tq4_codebook is not None,
+        tq4_native_e2m1=_tq4_native_e2m1,
     )
 
     # TVM FFI env stream must be set to PyTorch's current stream so the kernel
@@ -758,6 +764,7 @@ def tokenspeed_mla_decode_tq4(
     enable_pdl: bool = False,
     split_kv_override: Optional[int] = None,
     kv_nope_codebook: Optional[torch.Tensor] = None,
+    native_e2m1: bool = False,
 ) -> torch.Tensor:
     """SM100 MLA decode from the canonical no-shadow TQ4 cache."""
     _, packed, rope = validate_tq4_decode_inputs(
@@ -811,4 +818,5 @@ def tokenspeed_mla_decode_tq4(
         _tq4_rope_cache=rope,
         _tq4_split_kv=split_kv_override,
         _tq4_codebook=kv_nope_codebook,
+        _tq4_native_e2m1=native_e2m1,
     )
