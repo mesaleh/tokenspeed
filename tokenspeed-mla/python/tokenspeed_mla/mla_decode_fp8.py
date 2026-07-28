@@ -2358,8 +2358,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 physical_byte = logical_byte ^ (
                     (logical_byte & 0x380) >> 3
                 )
-                output_k_raw_i32[physical_byte // 4] = fp8_0
-                output_k_raw_i32[physical_byte // 4 + 1] = fp8_1
+                # Diagnostic native-QK hybrid lower bound: retain only the K
+                # phases that back the peer V bulk copies below. The other K
+                # phases would be consumed directly as E2M1 by native QK in a
+                # real hybrid and intentionally remain invalid in this timing
+                # specialization.
+                if cta != cutlass.Int32(phase % 2):
+                    output_k_raw_i32[physical_byte // 4] = fp8_0
+                    output_k_raw_i32[physical_byte // 4 + 1] = fp8_1
 
                 # Each CTA directly stores the V phases it owns. The peer-owned
                 # phases remain contiguous in K SMEM and are copied below as

@@ -71,6 +71,11 @@ def main() -> None:
     parser.add_argument("--native-e2m1", action="store_true")
     parser.add_argument("--e2m1-data", action="store_true")
     parser.add_argument(
+        "--skip-correctness",
+        action="store_true",
+        help="Time an intentionally incomplete diagnostic specialization.",
+    )
+    parser.add_argument(
         "--scale-mode",
         choices=("legacy", "unit", "realistic"),
         default="legacy",
@@ -252,11 +257,12 @@ def main() -> None:
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
         difference = float((out_tq4.float() - out_dense.float()).abs().max())
-        torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
+        if not args.skip_correctness:
+            torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
         print(
             json.dumps(
                 {
-                    "status": "PASS",
+                    "status": "DIAGNOSTIC" if args.skip_correctness else "PASS",
                     "context": args.context,
                     "max_context": max_context,
                     "split": args.profile_split,
@@ -278,24 +284,26 @@ def main() -> None:
         run_tq4(split_kv)
         torch.cuda.synchronize()
         difference = float((out_tq4.float() - out_dense.float()).abs().max())
-        torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
-        max_abs_diff = max(max_abs_diff, difference)
+        if not args.skip_correctness:
+            torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
+            max_abs_diff = max(max_abs_diff, difference)
         tq4_timings[str(split_kv)] = bench(
             lambda split_kv=split_kv: run_tq4(split_kv)
         )
     result = {
-        "status": "PASS",
+        "status": "DIAGNOSTIC" if args.skip_correctness else "PASS",
         "context": args.context,
         "max_context": max_context,
         "q_len": args.q_len,
         "heads": args.heads,
         "dense": dense_timing,
         "tq4": tq4_timings,
-        "max_abs_diff": max_abs_diff,
+        "max_abs_diff": None if args.skip_correctness else max_abs_diff,
         "atol": args.atol,
         "native_e2m1": args.native_e2m1,
         "e2m1_data": e2m1_data,
         "scale_mode": args.scale_mode,
+        "correctness_skipped": args.skip_correctness,
     }
     print(json.dumps(result, sort_keys=True))
 
