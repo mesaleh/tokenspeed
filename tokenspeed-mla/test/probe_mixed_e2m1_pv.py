@@ -25,11 +25,12 @@ casts the scaled probabilities to FP8, and multiplies a bounded transpose of
 the canonical packed E2M1 V tile by a 64-query FP8 operand. A padded K64 shared
 carrier gives the mixed descriptor distinct addresses for both logical K16
 groups while one block-scaled K32 instruction consumes all 32 useful lanes.
-Unit UE8M0 scale factors isolate the data path. One CTA fuses four 32-token
-bands and four 128-latent slices into the full 128-token by 512-latent page.
-The default 80-page grid models an exact 10,240-token context. Its per-page
-output tensor is measurement scaffolding, not an admissible integration
-workspace; production must reuse TokenSpeed's split-reduction state.
+Unit UE8M0 scale factors isolate the data path. A two-CTA cluster fuses four
+32-token bands and two 256-latent slices into the full 128-token by 512-latent
+page. The default 80-page grid models an exact 10,240-token context. Its
+per-page output tensor is measurement scaffolding, not an admissible
+integration workspace; production must reuse TokenSpeed's split-reduction
+state.
 """
 
 import math
@@ -50,15 +51,17 @@ PAGE_TOKENS = 128
 NUM_PAGES = int(os.environ.get("TQ_PV_NUM_PAGES", "80"))
 LATENT_DIM = 512
 QUERY_HEADS = 64
+CTA_QUERY_HEADS = QUERY_HEADS // 2
 LOGICAL_K = 32
 TOKEN_BANDS = PAGE_TOKENS // LOGICAL_K
-LATENT_SLICE = 128
+LATENT_SLICE = 256
+CTA_LATENT_SLICE = LATENT_SLICE // 2
 LATENT_SLICES = LATENT_DIM // LATENT_SLICE
 A_STAGES = TOKEN_BANDS * LATENT_SLICES
 P_STAGES = TOKEN_BANDS
 SF_DTYPE = cutlass.Float8E8M0FNU
 SF_VEC_SIZE = 32
-CLUSTER_SHAPE_MNK = (1, 1, 1)
+CLUSTER_SHAPE_MNK = (2, 1, 1)
 E2M1_PV_TILER_MNK = (LATENT_SLICE, QUERY_HEADS, 64)
 OUTPUT_VIEW_TILER_MNK = (LATENT_SLICE, QUERY_HEADS, 32)
 
@@ -66,6 +69,7 @@ OUTPUT_VIEW_TILER_MNK = (LATENT_SLICE, QUERY_HEADS, 32)
 @cute.struct
 class SharedStorage:
     mma_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    tmem_dealloc_mbar: cutlass.Int64
     tmem_holding_buf: cutlass.Int32
 
 
@@ -77,7 +81,7 @@ def make_tiled_mmas():
         OperandMajorMode.K,
         SF_DTYPE,
         SF_VEC_SIZE,
-        tcgen05.CtaGroup.ONE,
+        tcgen05.CtaGroup.TWO,
         E2M1_PV_TILER_MNK[:2],
     )
     output_view = sm100_utils.make_trivial_tiled_mma(
@@ -85,8 +89,8 @@ def make_tiled_mmas():
         OperandMajorMode.K,
         OperandMajorMode.K,
         cutlass.Float32,
-        tcgen05.CtaGroup.ONE,
-        OUTPUT_VIEW_TILER_MNK[:2],
+        tcgen05.CtaGroup.TWO,
+        (128, QUERY_HEADS),
     )
     return e2m1_pv, output_view
 
@@ -110,8 +114,11 @@ def mixed_pv_kernel(
     cta_layout_vmnk: cute.Layout,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    page, _, _ = cute.arch.block_idx()
+    block, _, _ = cute.arch.block_idx()
+    page = block // 2
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    is_leader_cta = cta_rank == 0
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
@@ -147,17 +154,19 @@ def mixed_pv_kernel(
     )
     for destination_byte in cutlass.range(tidx, e2m1_bytes, THREADS):
         v_raw[destination_byte] = cutlass.Uint8(0)
-    active_a_bytes = A_STAGES * LATENT_SLICE * (LOGICAL_K // 2)
+    active_a_bytes = A_STAGES * CTA_LATENT_SLICE * (LOGICAL_K // 2)
     for active_byte in cutlass.range(tidx, active_a_bytes, THREADS):
-        tile = active_byte // (LATENT_SLICE * (LOGICAL_K // 2))
-        tile_byte = active_byte % (LATENT_SLICE * (LOGICAL_K // 2))
+        tile = active_byte // (CTA_LATENT_SLICE * (LOGICAL_K // 2))
+        tile_byte = active_byte % (CTA_LATENT_SLICE * (LOGICAL_K // 2))
         latent = tile_byte // (LOGICAL_K // 2)
         token_pair = tile_byte % (LOGICAL_K // 2)
         latent_slice = tile // TOKEN_BANDS
         token_band = tile % TOKEN_BANDS
         token0 = token_band * LOGICAL_K + token_pair * 2
         token1 = token0 + 1
-        source_latent = latent_slice * LATENT_SLICE + latent
+        source_latent = (
+            latent_slice * LATENT_SLICE + cta_rank * CTA_LATENT_SLICE + latent
+        )
         source_byte = source_latent // 2
         shift = (source_latent % 2) * 4
         code0 = (
@@ -171,7 +180,7 @@ def mixed_pv_kernel(
             storage_k += 16
         logical_byte = latent * 32 + storage_k // 2
         physical_byte = (
-            tile * LATENT_SLICE * 32
+            tile * CTA_LATENT_SLICE * 32
             + (logical_byte ^ ((logical_byte & 0x80) >> 3))
         )
         v_raw[physical_byte] = cutlass.Uint8(code0 | (code1 << 4))
@@ -179,7 +188,7 @@ def mixed_pv_kernel(
         cute.recast_ptr(s_p.iterator, swizzle_=None, dtype=cutlass.Float8E4M3FN),
         cute.make_layout(cute.cosize(p_b_layout.outer)),
     )
-    p_stage_elements = QUERY_HEADS * 64
+    p_stage_elements = CTA_QUERY_HEADS * 64
     for logical_element in cutlass.range(
         tidx, P_STAGES * p_stage_elements, THREADS
     ):
@@ -189,18 +198,20 @@ def mixed_pv_kernel(
             stage_element ^ ((stage_element & 0x180) >> 3)
         )
         p_raw[physical_element] = cutlass.Float8E4M3FN(0.0)
-    active_p_elements = P_STAGES * QUERY_HEADS * LOGICAL_K
+    active_p_elements = P_STAGES * CTA_QUERY_HEADS * LOGICAL_K
     for active_element in cutlass.range(tidx, active_p_elements, THREADS):
-        stage = active_element // (QUERY_HEADS * LOGICAL_K)
-        stage_element = active_element % (QUERY_HEADS * LOGICAL_K)
-        query = stage_element // LOGICAL_K
+        stage = active_element // (CTA_QUERY_HEADS * LOGICAL_K)
+        stage_element = active_element % (CTA_QUERY_HEADS * LOGICAL_K)
+        local_query = stage_element // LOGICAL_K
         token = stage_element % LOGICAL_K
-        logical_element = query * 64 + token
+        logical_element = local_query * 64 + token
         physical_element = stage * p_stage_elements + (
             logical_element ^ ((logical_element & 0x180) >> 3)
         )
         p_raw[physical_element] = p_input[
-            page, query, stage * LOGICAL_K + token
+            page,
+            cta_rank * CTA_QUERY_HEADS + local_query,
+            stage * LOGICAL_K + token,
         ]
     sfa_ptr = cute.recast_ptr(s_sfa.iterator, dtype=SF_DTYPE)
     sfb_ptr = cute.recast_ptr(s_sfb.iterator, dtype=SF_DTYPE)
@@ -213,7 +224,9 @@ def mixed_pv_kernel(
     mma_producer, mma_consumer = pipeline.PipelineUmmaAsync.create(
         num_stages=1,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, THREADS),
+        consumer_group=pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, THREADS * 2
+        ),
         barrier_storage=storage.mma_mbar.data_ptr(),
         cta_layout_vmnk=cta_layout_vmnk,
     ).make_participants()
@@ -221,7 +234,8 @@ def mixed_pv_kernel(
     tmem = utils.TmemAllocator(
         storage.tmem_holding_buf.ptr,
         barrier_for_retrieve=tmem_barrier,
-        is_two_cta=False,
+        is_two_cta=True,
+        two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
     )
     tmem.allocate(total_cols)
     tmem.wait_for_alloc()
@@ -256,9 +270,9 @@ def mixed_pv_kernel(
     )
     t_sfb = cute.make_tensor(sfb_tmem_ptr, t_sfb_layout)
 
-    if warp_idx == 0:
+    if warp_idx == 0 and is_leader_cta:
         scale_copy_atom = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.TWO),
             SF_DTYPE,
         )
         sfa_copy = tcgen05.make_s2t_copy(
@@ -285,7 +299,7 @@ def mixed_pv_kernel(
             sfb_source[None, None, None, None, 0],
             sfb_thr.partition_D(cute.filter_zeros(t_sfb)),
         )
-    output_tile = output_view[(None, None), 0, 0]
+    output_tile = acc[(None, None), 0, 0]
     tmem_load_atom = cute.make_copy_atom(
         tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), cutlass.Float32
     )
@@ -294,7 +308,7 @@ def mixed_pv_kernel(
     t_tmem = thr_load.partition_S(output_tile)
 
     for latent_slice in cutlass.range_constexpr(LATENT_SLICES):
-        if warp_idx == 0:
+        if warp_idx == 0 and is_leader_cta:
             mma_producer.acquire_and_advance()
             for token_band in cutlass.range_constexpr(TOKEN_BANDS):
                 e2m1_pv_mma.set(
@@ -323,9 +337,10 @@ def mixed_pv_kernel(
         output_matrix = cute.make_tensor(
             output.iterator
             + page * LATENT_DIM * QUERY_HEADS
-            + latent_slice * LATENT_SLICE * QUERY_HEADS,
+            + latent_slice * LATENT_SLICE * QUERY_HEADS
+            + cta_rank * CTA_LATENT_SLICE * QUERY_HEADS,
             cute.make_layout(
-                (LATENT_SLICE, QUERY_HEADS), stride=(QUERY_HEADS, 1)
+                (CTA_LATENT_SLICE, QUERY_HEADS), stride=(QUERY_HEADS, 1)
             ),
         )
         t_gmem = thr_load.partition_D(output_matrix)
@@ -335,14 +350,14 @@ def mixed_pv_kernel(
         cute.autovec_copy(registers, t_gmem)
         cute.arch.sync_threads()
 
-    if tidx == 0 and page == 0:
+    if tidx == 0 and page == 0 and is_leader_cta:
         metadata[0] = acc_cols
         metadata[1] = sfa_cols
         metadata[2] = sfb_cols
         metadata[3] = total_cols
         metadata[4] = e2m1_bytes
 
-    if warp_idx == 0:
+    if warp_idx == 0 and is_leader_cta:
         mma_producer.tail()
     tmem.relinquish_alloc_permit()
     cute.arch.sync_threads()
@@ -434,7 +449,7 @@ def mixed_pv_probe(
         total_cols,
         cta_layout_vmnk,
     ).launch(
-        grid=(NUM_PAGES, 1, 1),
+        grid=(NUM_PAGES * 2, 1, 1),
         block=(THREADS, 1, 1),
         cluster=CLUSTER_SHAPE_MNK,
         min_blocks_per_mp=1,
@@ -595,9 +610,9 @@ def main() -> None:
     )
     print(
         f"PASS blockscaled_e2m1_v_fp8_p_n64_pages={NUM_PAGES} "
-        "latent_slices=4 "
+        f"latent_slices={LATENT_SLICES} "
         "token_bands=4 selector=True dense=True full_k32=True "
-        "padded_k64=True cta_group=1 "
+        "padded_k64=True cta_group=2 "
         f"acc_cols={acc_cols} sfa_cols={sfa_cols} sfb_cols={sfb_cols} "
         f"total_cols={total_cols} e2m1_bytes={e2m1_bytes} "
         f"microseconds={timings}"
