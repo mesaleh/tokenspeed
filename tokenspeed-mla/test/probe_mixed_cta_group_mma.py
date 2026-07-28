@@ -30,6 +30,9 @@ same two-CTA TMEM allocation. Separate UMMA barriers guard deallocation, and
 the footprint check reserves two 32-column V operand stages.
 """
 
+import json
+import os
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -46,6 +49,11 @@ VP_TILER_MNK = (128, 64, 128)
 CORRECTION_VALUES = 4
 CORRECTION_STAGES = 2
 V_OPERAND_STAGES = 2
+LATENT_DIM = 512
+LATENT_SLICES = LATENT_DIM // VP_TILER_MNK[0]
+CTA_LATENT_STAGES = LATENT_SLICES // CLUSTER_SHAPE_MNK[0]
+NUM_CLUSTERS = int(os.environ.get("TQ_TMEM_CLUSTERS", "1"))
+OBSERVE_FULL_OUTPUT = NUM_CLUSTERS == 1
 
 
 @cute.struct
@@ -103,6 +111,7 @@ def mixed_group_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    cluster_idx = cute.arch.make_warp_uniform(cute.arch.block_idx()[0] // 2)
     is_leader_cta = cta_rank == 0
 
     smem = utils.SmemAllocator()
@@ -205,21 +214,10 @@ def mixed_group_kernel(
         token = t_c_p[element][1]
         s_p[(query, token % 32), 0, token // 32, 0] = r_p[element]
 
-    # Transpose canonical token-major packed words into a bounded byte-index
-    # stage. It contains integer codebook metadata, not a decoded FP8 shadow;
-    # decoded values exist only in registers and TMEM.
+    # Integer indices occupy bounded SMEM. Decoded FP8 values move from
+    # registers directly to TMEM; the two cluster CTAs own disjoint pairs of
+    # 128-wide latent slices and never create a decoded SMEM/DSMEM tile.
     packed_i32_ptr = cute.recast_ptr(packed_v.iterator, dtype=cutlass.Int32)
-    for iteration in cutlass.range_constexpr(16):
-        linear_word = iteration * THREADS_PER_CTA + tidx
-        token = linear_word // 16
-        latent_word = linear_word % 16
-        raw_word = (packed_i32_ptr + linear_word).load()
-        for nibble in cutlass.range_constexpr(8):
-            latent = latent_word * 8 + nibble
-            code = cutlass.Int8((raw_word >> (nibble * 4)) & 0xF)
-            s_v_index[(latent, token % 32), 0, token // 32, 0] = code
-    cute.arch.sync_threads()
-
     mma_k_bits = VP_TILER_MNK[2] * cutlass.Float8E4M3FN.width
     tmem_store_atom = cute.make_copy_atom(
         tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)),
@@ -236,22 +234,10 @@ def mixed_group_kernel(
     index_load = cute.make_tiled_copy_S(index_load_atom, tmem_store)
     thr_index_load = index_load.get_slice(tidx)
     t_s_v_index = thr_index_load.partition_S(s_v_index)
-    r_codes = cute.make_rmem_tensor(
-        t_s_v_index[None, None, None, None, 0].shape, cutlass.Int8
-    )
-    cute.copy(
-        thr_index_load,
-        t_s_v_index[None, None, None, None, 0],
-        r_codes,
-    )
     codebook_fp8 = cute.make_tensor(
         cute.recast_ptr(codebook.iterator, dtype=cutlass.Float8E4M3FN),
         codebook.layout,
     )
-    for element in cutlass.range_constexpr(cute.size(r_codes)):
-        r_v[element] = codebook_fp8[cutlass.Int32(r_codes[element])]
-    cute.copy(thr_store, r_v, t_v[None, None, None, None, 0])
-    cute.arch.fence_view_async_tmem_store()
 
     if warp_idx == 0 and is_leader_cta:
         qk_producer.acquire_and_advance()
@@ -271,45 +257,94 @@ def mixed_group_kernel(
     qk_full.release()
     cute.arch.sync_threads()
 
-    if warp_idx == 0:
-        vp_producer.acquire_and_advance()
-        vp_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        for k_block in cutlass.range_constexpr(vp_a.shape[2]):
-            cute.gemm(
-                vp_tiled_mma,
-                vp_acc,
-                vp_a[None, None, k_block, 0],
-                vp_b[None, None, k_block, 0],
-                vp_acc,
+    for cta_stage in cutlass.range_constexpr(CTA_LATENT_STAGES):
+        latent_slice = cta_rank + cta_stage * CLUSTER_SHAPE_MNK[0]
+        for iteration in cutlass.range_constexpr(16):
+            linear_word = iteration * THREADS_PER_CTA + tidx
+            token = linear_word // 16
+            latent_word = linear_word % 16
+            raw_word = (
+                packed_i32_ptr
+                + token * (LATENT_DIM // 8)
+                + latent_slice * 16
+                + latent_word
+            ).load()
+            for nibble in cutlass.range_constexpr(8):
+                latent = latent_word * 8 + nibble
+                code = cutlass.Int8((raw_word >> (nibble * 4)) & 0xF)
+                s_v_index[
+                    (latent, token % 32), 0, token // 32, cta_stage
+                ] = code
+        cute.arch.sync_threads()
+
+        r_codes = cute.make_rmem_tensor(
+            t_s_v_index[None, None, None, None, cta_stage].shape,
+            cutlass.Int8,
+        )
+        cute.copy(
+            thr_index_load,
+            t_s_v_index[None, None, None, None, cta_stage],
+            r_codes,
+        )
+        for element in cutlass.range_constexpr(cute.size(r_codes)):
+            r_v[element] = codebook_fp8[cutlass.Int32(r_codes[element])]
+        cute.copy(thr_store, r_v, t_v[None, None, None, None, cta_stage])
+        cute.arch.fence_view_async_tmem_store()
+
+        vp_acc_slice = cute.make_tensor(
+            tmem_ptr + score_cols + latent_slice * vp_cols,
+            vp_acc_fake.layout,
+        )
+        if warp_idx == 0:
+            vp_producer.acquire_and_advance()
+            vp_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for k_block in cutlass.range_constexpr(vp_a.shape[2]):
+                cute.gemm(
+                    vp_tiled_mma,
+                    vp_acc_slice,
+                    vp_a[None, None, k_block, cta_stage],
+                    vp_b[None, None, k_block, 0],
+                    vp_acc_slice,
+                )
+                vp_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            vp_producer.commit()
+
+        vp_full = vp_consumer.wait_and_advance()
+        vp_full.release()
+        cute.arch.sync_threads()
+
+        # Load the FP32 accumulator through its logical MxN partition so the
+        # host validates every slice and the real epilogue mapping.
+        t_acc = vp_acc_slice[(None, None), 0, 0]
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            cutlass.Float32,
+        )
+        tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, t_acc)
+        thr_load = tmem_load.get_slice(tidx)
+        t_tmem = thr_load.partition_S(t_acc)
+        if cutlass.const_expr(OBSERVE_FULL_OUTPUT):
+            g_output = cute.make_tensor(
+                matrix_output[0, cta_rank, None, None].iterator
+                + latent_slice * VP_TILER_MNK[0],
+                cute.make_layout((128, 64), stride=(1, LATENT_DIM)),
             )
-            vp_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-        vp_producer.commit()
-
-    vp_full = vp_consumer.wait_and_advance()
-    vp_full.release()
-    cute.arch.sync_threads()
-
-    # Load the FP32 accumulator through its logical MxN partition so the host
-    # can validate every element of the register-to-TMEM mapping.
-    t_acc = vp_acc[(None, None), 0, 0]
-    tmem_load_atom = cute.make_copy_atom(
-        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), cutlass.Float32
-    )
-    tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, t_acc)
-    thr_load = tmem_load.get_slice(tidx)
-    # The VP accumulator is latent-major. Present a transposed logical view of
-    # the physical query-major output so the copy proves the real epilogue map.
-    g_output = cute.make_tensor(
-        matrix_output[cta_rank, None, None].iterator,
-        cute.make_layout((128, 64), stride=(1, 128)),
-    )
-    t_tmem = thr_load.partition_S(t_acc)
-    t_gmem = thr_load.partition_D(g_output)
-    r_acc = cute.make_fragment_like(t_gmem, cutlass.Float32)
-    cute.copy(tmem_load, t_tmem, r_acc)
-    cute.arch.fence_view_async_tmem_load()
-    cute.autovec_copy(r_acc, t_gmem)
-    cute.arch.sync_threads()
+        else:
+            # The dummy destination supplies the same logical thread
+            # partition for the TMEM load; only one register is published.
+            g_output = cute.make_tensor(
+                matrix_output.iterator,
+                cute.make_layout((128, 64), stride=(1, 128)),
+            )
+        t_gmem = thr_load.partition_D(g_output)
+        r_acc = cute.make_fragment_like(t_gmem, cutlass.Float32)
+        cute.copy(tmem_load, t_tmem, r_acc)
+        cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(OBSERVE_FULL_OUTPUT):
+            cute.autovec_copy(r_acc, t_gmem)
+        elif tidx == 0:
+            matrix_output[cluster_idx, cta_rank, latent_slice] = r_acc[0]
+        cute.arch.sync_threads()
 
     if tidx == 0:
         output[cta_rank] = 1
@@ -370,7 +405,7 @@ def mixed_group_probe(
         qk_tiled_mma, QK_TILER_MNK, cutlass.Float8E4M3FN, 1
     )
     v_index_layout = sm100_utils.make_smem_layout_a(
-        vp_tiled_mma, VP_TILER_MNK, cutlass.Int8, 1
+        vp_tiled_mma, VP_TILER_MNK, cutlass.Int8, CTA_LATENT_STAGES
     )
     vp_b_layout = sm100_utils.make_smem_layout_b(
         vp_tiled_mma, VP_TILER_MNK, cutlass.Float8E4M3FN, 1
@@ -400,7 +435,7 @@ def mixed_group_probe(
         v_operand_offset,
         total_cols,
     ).launch(
-        grid=CLUSTER_SHAPE_MNK,
+        grid=(NUM_CLUSTERS * CLUSTER_SHAPE_MNK[0], 1, 1),
         block=(THREADS_PER_CTA, 1, 1),
         cluster=CLUSTER_SHAPE_MNK,
         min_blocks_per_mp=1,
@@ -420,16 +455,29 @@ def main() -> None:
     compiled = cute.compile(
         mixed_group_probe,
         fake(cutlass.Int32, (10,), 4),
-        fake(cutlass.Uint8, (128, 64), 16),
+        fake(cutlass.Uint8, (128, LATENT_DIM // 2), 16),
         fake(cutlass.Uint8, (16,), 16),
         fake(cutlass.Float8E4M3FN, (64, 128), 16),
-        fake(cutlass.Float32, (2, 64, 128), 16),
+        fake(
+            cutlass.Float32,
+            (
+                (1, 2, 64, LATENT_DIM)
+                if OBSERVE_FULL_OUTPUT
+                else (NUM_CLUSTERS, 2, LATENT_SLICES)
+            ),
+            16,
+        ),
         options="--enable-tvm-ffi --opt-level 3",
     )
     output = torch.zeros(10, device="cuda", dtype=torch.int32)
     generator = torch.Generator(device="cuda").manual_seed(20260723)
     codes = torch.randint(
-        0, 16, (128, 128), device="cuda", dtype=torch.uint8, generator=generator
+        0,
+        16,
+        (128, LATENT_DIM),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
     packed_v = codes[:, 0::2] | (codes[:, 1::2] << 4)
     codebook_values = torch.tensor(
@@ -454,7 +502,13 @@ def main() -> None:
         device="cuda",
         dtype=torch.float32,
     ).to(torch.float8_e4m3fn)
-    matrix_output = torch.zeros((2, 64, 128), device="cuda", dtype=torch.float32)
+    matrix_output = torch.zeros(
+        (1, 2, 64, LATENT_DIM)
+        if OBSERVE_FULL_OUTPUT
+        else (NUM_CLUSTERS, 2, LATENT_SLICES),
+        device="cuda",
+        dtype=torch.float32,
+    )
     p_input = torch.eye(64, 128, device="cuda", dtype=torch.float32).to(
         torch.float8_e4m3fn
     )
@@ -483,52 +537,64 @@ def main() -> None:
             f"TMEM overlap: score={score_cols}, output={output_cols}, "
             f"correction={correction_cols}, v_operand={v_operand_cols}, limit=512"
         )
-    expected = codebook_values[codes[:64].long()].float()
-    if not torch.equal(matrix_output[0], expected):
-        print("output[0,:8,:8]=", matrix_output[0, :8, :8].cpu())
-        print("expected[:8,:8]=", expected[:8, :8].cpu())
-        print("output unique=", torch.unique(matrix_output[0]).cpu())
-        token_ids = torch.arange(128, device="cuda", dtype=torch.uint8)[:, None]
-        latent_ids = torch.arange(128, device="cuda", dtype=torch.uint8)[None, :]
-
-        def observe(pattern: torch.Tensor) -> torch.Tensor:
-            pattern = pattern.expand(128, 128).contiguous()
-            packed_pattern = pattern[:, 0::2] | (pattern[:, 1::2] << 4)
-            matrix_output.zero_()
+    if OBSERVE_FULL_OUTPUT:
+        matrix = matrix_output[0]
+        expected = codebook_values[codes[:64].long()].float()
+        zero = torch.zeros_like(expected[:, :128])
+        torch.testing.assert_close(matrix[0, :, 0:128], expected[:, 0:128])
+        torch.testing.assert_close(matrix[0, :, 128:256], zero)
+        torch.testing.assert_close(matrix[0, :, 256:384], expected[:, 256:384])
+        torch.testing.assert_close(matrix[0, :, 384:512], zero)
+        torch.testing.assert_close(matrix[1, :, 0:128], zero)
+        torch.testing.assert_close(matrix[1, :, 128:256], expected[:, 128:256])
+        torch.testing.assert_close(matrix[1, :, 256:384], zero)
+        torch.testing.assert_close(matrix[1, :, 384:512], expected[:, 384:512])
+        torch.testing.assert_close(matrix.sum(dim=0), expected, rtol=0, atol=0)
+    for _ in range(20):
+        compiled(
+            output,
+            packed_v,
+            codebook_values.view(torch.uint8),
+            p_input,
+            matrix_output,
+        )
+    torch.cuda.synchronize()
+    timings = []
+    for _ in range(5):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(200):
             compiled(
                 output,
-                packed_pattern,
+                packed_v,
                 codebook_values.view(torch.uint8),
                 p_input,
                 matrix_output,
             )
-            torch.cuda.synchronize()
-            observed = torch.full_like(matrix_output[0], -1, dtype=torch.int32)
-            for code_idx in range(16):
-                observed[matrix_output[0] == codebook_values[code_idx].float()] = (
-                    code_idx
-                )
-            return observed
-
-        latent_low = observe(latent_ids % 16)
-        latent_high = observe(latent_ids // 16)
-        token_low = observe(token_ids % 16)
-        token_high = observe(token_ids // 16)
-        print("observed latent low [0,:16]=", latent_low[0, :16].cpu())
-        print("observed latent high [0,:32]=", latent_high[0, :32].cpu())
-        print("observed token low [:32,0]=", token_low[:32, 0].cpu())
-        print("observed token high [:64,0]=", token_high[:64, 0].cpu())
-        print(
-            "token mapping column invariant=",
-            torch.equal(token_high, token_high[:, 0:1].expand_as(token_high)),
-        )
-    torch.testing.assert_close(matrix_output[0], expected, rtol=0, atol=0)
-    torch.testing.assert_close(matrix_output[1], expected, rtol=0, atol=0)
+        end.record()
+        end.synchronize()
+        timings.append(start.elapsed_time(end) * 1000.0 / 200)
+    timings.sort()
     print(
-        f"PASS random_codebook_matrix=True qk_group=2 vp_group=1 qk_cols={qk_cols} "
+        f"PASS random_codebook_matrix={OBSERVE_FULL_OUTPUT} clusters={NUM_CLUSTERS} "
+        f"qk_group=2 vp_group=1 qk_cols={qk_cols} "
         f"vp_cols={vp_cols} score_cols={score_cols} output_cols={output_cols} "
         f"correction_cols={correction_cols} v_operand_cols={v_operand_cols} "
         f"v_operand_offset={v_operand_offset} total_cols={total_cols}"
+    )
+    print(
+        json.dumps(
+            {
+                "status": "PASS" if OBSERVE_FULL_OUTPUT else "DIAGNOSTIC",
+                "scope": "128token_512latent_fullwidth_cluster_scaling",
+                "clusters": NUM_CLUSTERS,
+                "full_output_checked": OBSERVE_FULL_OUTPUT,
+                "windows_us": timings,
+                "median_us": timings[len(timings) // 2],
+            },
+            sort_keys=True,
+        )
     )
 
 
