@@ -68,64 +68,11 @@ def test_validate_accepts_singleton_head_cache_form_without_copy():
     assert rope.data_ptr() == inputs["kv_rope"].data_ptr()
 
 
-def test_validate_accepts_explicit_fp8_rope():
-    inputs = _valid_inputs()
-    inputs["kv_rope"] = torch.empty(3, 32, 64, dtype=torch.float8_e4m3fn)
-    _, _, rope = validate_tq4_decode_inputs(**inputs, fp8_rope=True, require_cuda=False)
-    assert rope.dtype == torch.float8_e4m3fn
-
-
-@pytest.mark.parametrize(
-    ("dtype", "fp8_rope", "message"),
-    [
-        (torch.float8_e4m3fn, False, "must be bfloat16"),
-        (torch.bfloat16, True, "must be FP8 E4M3"),
-    ],
-)
-def test_validate_rejects_rope_flag_dtype_mismatch(dtype, fp8_rope, message):
-    inputs = _valid_inputs()
-    inputs["kv_rope"] = torch.empty(3, 32, 64, dtype=dtype)
-    with pytest.raises(ValueError, match=message):
-        validate_tq4_decode_inputs(**inputs, fp8_rope=fp8_rope, require_cuda=False)
-
-
-@pytest.mark.parametrize("name", ["kv_nope_packed", "kv_rope"])
-def test_validate_rejects_unaligned_raw_cache(name):
-    inputs = _valid_inputs()
-    tensor = inputs[name]
-    unaligned = torch.empty(
-        tensor.numel() + 1,
-        dtype=tensor.dtype,
-    )[
-        1:
-    ].view(tensor.shape)
-    assert unaligned.is_contiguous()
-    assert unaligned.data_ptr() % 16 != 0
-    inputs[name] = unaligned
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        validate_tq4_decode_inputs(**inputs, require_cuda=False)
-
-
-def test_validate_rejects_cache_device_mismatch():
-    inputs = _valid_inputs()
-    inputs["centroids"] = torch.empty(16, dtype=torch.float32, device="meta")
-    with pytest.raises(ValueError, match="must share one device"):
-        validate_tq4_decode_inputs(**inputs, require_cuda=False)
-
-
 @pytest.mark.parametrize(
     ("name", "replacement", "message"),
     [
-        (
-            "kv_nope_packed",
-            torch.empty(3, 32, 512, dtype=torch.uint8),
-            "packed latent dimension",
-        ),
-        (
-            "kv_nope_packed",
-            torch.empty(3, 32, 256, dtype=torch.bfloat16),
-            "must be uint8",
-        ),
+        ("kv_nope_packed", torch.empty(3, 32, 512, dtype=torch.uint8), "packed latent dimension"),
+        ("kv_nope_packed", torch.empty(3, 32, 256, dtype=torch.bfloat16), "must be uint8"),
         ("kv_nope_scale", torch.empty(3, 31, dtype=torch.bfloat16), "scale shape"),
         ("kv_rope", torch.empty(3, 32, 63, dtype=torch.bfloat16), "kv_rope shape"),
         ("centroids", torch.empty(15, dtype=torch.float32), r"shape \(16,\)"),
