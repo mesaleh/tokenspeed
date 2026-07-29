@@ -46,7 +46,6 @@ from tokenspeed_mla.utils import (
     torch_to_cutlass_dtype,
 )
 
-
 _DUMMY_TREE_MASK_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_CMASK_OFF_CACHE: dict[str, torch.Tensor] = {}
 
@@ -172,6 +171,7 @@ def _get_compiled_mla_kernel(
     fold_q_chunk_size: int = 0,
     use_pdl: bool = False,
     tq4_cache: bool = False,
+    tq4_fp8_rope: bool = False,
     tq4_tiles_per_split: int = 1,
     tq4_codebook: bool = False,
     return_lse: bool = False,
@@ -194,6 +194,8 @@ def _get_compiled_mla_kernel(
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     if tq4_cache and not is_fp8:
         raise ValueError("native TQ4 decode requires an FP8 query")
+    if tq4_fp8_rope and not tq4_cache:
+        raise ValueError("FP8 RoPE storage requires the native TQ4 cache")
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -228,6 +230,7 @@ def _get_compiled_mla_kernel(
             kernel_kwargs["tree_mask_mode"] = True
         if tq4_cache:
             kernel_kwargs["tq4_cache"] = True
+            kernel_kwargs["tq4_fp8_rope"] = tq4_fp8_rope
             kernel_kwargs["tq4_tiles_per_split"] = tq4_tiles_per_split
     kernel_obj = KernelClass(**kernel_kwargs)
 
@@ -280,7 +283,11 @@ def _get_compiled_mla_kernel(
     )
     # c_rope: [kv_batch, seq_len_k, rope_dim] — non-contiguous slice
     c_rope_fake = cute.runtime.make_fake_tensor(
-        cutlass.BFloat16 if tq4_cache else cutlass_dtype,
+        (
+            cutlass.Float8E4M3FN
+            if tq4_fp8_rope
+            else (cutlass.BFloat16 if tq4_cache else cutlass_dtype)
+        ),
         (sym_kv_batch, sym_seq_kv, sym_rope),
         stride=(cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
@@ -426,6 +433,7 @@ def tokenspeed_mla_decode(
     _tq4_scale: Optional[torch.Tensor] = None,
     _tq4_centroids: Optional[torch.Tensor] = None,
     _tq4_rope_cache: Optional[torch.Tensor] = None,
+    _tq4_fp8_rope: bool = False,
     _tq4_split_kv: Optional[int] = None,
     _tq4_codebook: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -489,21 +497,23 @@ def tokenspeed_mla_decode(
         FP32 base-2 log-sum-exp with shape [B, q_len, H].
     """
     tq4_cache = any(
-        tensor is not None
-        for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
+        tensor is not None for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
     )
     if tq4_cache and any(
-        tensor is None
-        for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
+        tensor is None for tensor in (_tq4_scale, _tq4_centroids, _tq4_rope_cache)
     ):
         raise ValueError("native TQ4 decode requires scale, centroids, and RoPE cache")
+    if _tq4_fp8_rope and not tq4_cache:
+        raise ValueError("FP8 RoPE storage requires the native TQ4 cache")
 
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
     ), f"tokenspeed_mla_decode only supports {supported_dtypes}, got {query.dtype}"
     if tq4_cache:
-        assert query.dtype == torch.float8_e4m3fn, "native TQ4 decode requires FP8 query"
+        assert (
+            query.dtype == torch.float8_e4m3fn
+        ), "native TQ4 decode requires FP8 query"
     else:
         assert (
             kv_cache.dtype == query.dtype
@@ -625,11 +635,7 @@ def tokenspeed_mla_decode(
                 f"full 128-token tile page; need {required_page_columns}, got "
                 f"{block_tables.shape[1]}"
             )
-        split_kv = (
-            min(split_kv, tq4_tiles)
-            if _tq4_split_kv is None
-            else _tq4_split_kv
-        )
+        split_kv = min(split_kv, tq4_tiles) if _tq4_split_kv is None else _tq4_split_kv
         if split_kv < 1 or split_kv > tq4_tiles:
             raise ValueError(
                 f"native TQ4 split count must be in [1, {tq4_tiles}], got "
@@ -680,9 +686,7 @@ def tokenspeed_mla_decode(
         if lse_out.dtype != torch.float32:
             raise ValueError(f"lse_out must be FP32, got {lse_out.dtype}")
         if lse_out.device != query.device:
-            raise ValueError(
-                f"lse_out must be on {query.device}, got {lse_out.device}"
-            )
+            raise ValueError(f"lse_out must be on {query.device}, got {lse_out.device}")
         if not lse_out.is_contiguous():
             raise ValueError("lse_out must be contiguous")
     lse_k = (
@@ -741,6 +745,7 @@ def tokenspeed_mla_decode(
         fold_q_chunk_size=fold_q_chunk_size,
         use_pdl=enable_pdl,
         tq4_cache=tq4_cache,
+        tq4_fp8_rope=_tq4_fp8_rope,
         tq4_tiles_per_split=tq4_tiles_per_split,
         tq4_codebook=_tq4_codebook is not None,
         return_lse=return_lse,
@@ -771,9 +776,7 @@ def tokenspeed_mla_decode(
             Float32(output_scale),
         )
         if tq4_cache:
-            compiled_kernel(
-                *args, _tq4_scale, _tq4_centroids, _tq4_codebook
-            )
+            compiled_kernel(*args, _tq4_scale, _tq4_centroids, _tq4_codebook)
         else:
             compiled_kernel(*args)
 
@@ -804,6 +807,7 @@ def tokenspeed_mla_decode_tq4(
     split_kv_override: Optional[int] = None,
     kv_nope_codebook: Optional[torch.Tensor] = None,
     native_e2m1: bool = False,
+    fp8_rope: bool = False,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -825,6 +829,7 @@ def tokenspeed_mla_decode_tq4(
         out,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        fp8_rope=fp8_rope,
     )
     if centroids.dtype != torch.float32:
         raise ValueError("native TQ4 decode requires persistent float32 centroids")
@@ -862,6 +867,7 @@ def tokenspeed_mla_decode_tq4(
         _tq4_scale=kv_nope_scale,
         _tq4_centroids=centroids,
         _tq4_rope_cache=rope,
+        _tq4_fp8_rope=fp8_rope,
         _tq4_split_kv=split_kv_override,
         _tq4_codebook=kv_nope_codebook,
         return_lse=return_lse,
