@@ -484,7 +484,7 @@ def main() -> None:
     if mixed_mode:
         dense_timing = bench(dense_bench_fn)
     result = {
-        "status": "PASS",
+        "status": "TIMING_ONLY" if args.timing_only else "PASS",
         "context": args.context,
         "max_context": max_context,
         "batch": args.batch,
@@ -518,7 +518,7 @@ def main() -> None:
         "required_free_bytes": required_free_bytes,
         "calculated_tq_cache_bytes": calculated_tq_cache_bytes,
         "calculated_dense_cache_bytes": calculated_dense_cache_bytes,
-        "max_abs_diff": max_abs_diff,
+        "max_abs_diff": None if args.timing_only else max_abs_diff,
         "atol": args.atol,
         "native_e2m1": args.native_e2m1,
         "e2m1_data": e2m1_data,
