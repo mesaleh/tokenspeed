@@ -78,8 +78,8 @@ try:
     from .fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from .tq4_cutedsl import (
         copy_bulk_smem_to_dsmem,
-        dequantize_tq4_word_to_fp8_shfl,
         lookup_tq4_word_from_fp8_codebook_prmt,
+        make_tq4_fp8_codebook_word_shfl,
     )
 except ImportError:
     from mla_helpers import (
@@ -94,8 +94,8 @@ except ImportError:
     from fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from tq4_cutedsl import (
         copy_bulk_smem_to_dsmem,
-        dequantize_tq4_word_to_fp8_shfl,
         lookup_tq4_word_from_fp8_codebook_prmt,
+        make_tq4_fp8_codebook_word_shfl,
     )
 
 """
@@ -2307,10 +2307,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 codebook_word_lanes[iteration] = codebook_word
             centroid_lane = None
         else:
-            codebook_word_lanes = None
+            codebook_word_lanes = cute.make_rmem_tensor(
+                cute.make_layout(8), cutlass.Int32
+            )
             centroid_lane = cutlass.Float32(
                 common_params.mTQCentroids[local_tidx % 16]
             )
+            halfwarp_lane = local_tidx % 16
+            for iteration in cutlass.range_constexpr(8):
+                linear_word = iteration * 128 + local_tidx
+                row = linear_word // 16
+                page = row // self.page_size
+                page_row = row % self.page_size
+                physical_page = page_table[(k_index * 2 + cta) * 2 + page]
+                scale = cutlass.Float32(
+                    common_params.mTQScale[page_row, physical_page]
+                )
+                codebook_word_lanes[iteration] = (
+                    make_tq4_fp8_codebook_word_shfl(
+                        scale, centroid_lane, halfwarp_lane
+                    )
+                )
         common_params.load_k_pipeline.producer_acquire(output_k_producer_state)
         common_params.load_v_pipeline.producer_acquire(output_v_producer_state)
         common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
@@ -2336,18 +2353,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 chunk_word = linear_word % 16
                 page = row // self.page_size
                 page_row = row % self.page_size
-                physical_page = page_table[(k_index * 2 + cta) * 2 + page]
-                if cutlass.const_expr(common_params.mTQCodebook is not None):
-                    fp8_0, fp8_1 = lookup_tq4_word_from_fp8_codebook_prmt(
-                        raw_words[iteration], codebook_word_lanes[iteration]
-                    )
-                else:
-                    scale = cutlass.Float32(
-                        common_params.mTQScale[page_row, physical_page]
-                    )
-                    fp8_0, fp8_1 = dequantize_tq4_word_to_fp8_shfl(
-                        raw_words[iteration], scale, centroid_lane
-                    )
+                fp8_0, fp8_1 = lookup_tq4_word_from_fp8_codebook_prmt(
+                    raw_words[iteration], codebook_word_lanes[iteration]
+                )
                 logical_byte = (
                     page_row * 128
                     + chunk_word * 8
