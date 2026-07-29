@@ -29,7 +29,7 @@ import math
 import torch
 import triton.testing
 
-from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
+from tokenspeed_mla import get_num_sm, tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
 from tokenspeed_mla.tq4_contract import dequantize_tq4_reference
 
 LATENT = 512
@@ -260,22 +260,17 @@ def main() -> None:
         else:
             codebook_layers.extend([None] * (args.cache_layers - 1))
 
-    if args.timing_only:
-        dense_cache = torch.zeros(
-            pages,
-            PAGE,
-            LATENT + ROPE,
-            device=device,
-            dtype=fp8,
-        )
-    else:
-        dense_latent = dequantize_tq4_reference(
-            packed, scales, centroids, dtype=torch.float32
-        )
-        dense_cache = torch.cat((dense_latent, rope.float()), dim=-1).to(fp8)
+    # Keep timing-only controls on the same nonzero distribution as the
+    # correctness oracle. Zero-filled K/V makes the SM100 softmax path skip
+    # accumulator corrections and produces an artificially fast control.
+    dense_latent = dequantize_tq4_reference(
+        packed, scales, centroids, dtype=torch.float32
+    )
+    dense_cache = torch.cat((dense_latent, rope.float()), dim=-1).to(fp8)
+    del dense_latent
     dense_layers = [dense_cache]
     if args.dense_cache_layers > 1:
-        extra_dense = torch.zeros(
+        extra_dense = torch.empty(
             args.dense_cache_layers - 1,
             pages,
             PAGE,
@@ -283,6 +278,7 @@ def main() -> None:
             device=device,
             dtype=fp8,
         )
+        extra_dense.copy_(dense_cache)
         dense_layers.extend(extra_dense.unbind())
     page_table = torch.stack(
         [
@@ -487,6 +483,10 @@ def main() -> None:
             for name, value in dense_timing.items()
         },
         "dense_cache_layers": args.dense_cache_layers,
+        # All supported benchmark shapes fold q_len into heads, so the dense
+        # kernel's simplified policy sees S=1. Record the resolved policy next
+        # to the explicit TQ split keys so the comparison is auditable.
+        "dense_split_kv": min(max(1, get_num_sm(device) // args.batch // 2), 32),
         "tq4": tq4_timings,
         "mixed": mixed_timings,
         "mixed_dense_before": args.mixed_dense_before,
