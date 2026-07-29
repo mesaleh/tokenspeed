@@ -64,6 +64,12 @@ def main() -> None:
     parser.add_argument("--splits", default=None)
     parser.add_argument("--profile-split", type=int, default=None)
     parser.add_argument("--atol", type=float, default=0.002)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="Decode batch size; use 2 to match the Kimi DFlash target graph.",
+    )
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
     parser.add_argument("--q-len", type=int, choices=range(1, 6), default=5)
     parser.add_argument("--codebook", action="store_true")
@@ -80,6 +86,8 @@ def main() -> None:
         raise ValueError("--codebook and --no-codebook are mutually exclusive")
     if args.context <= args.q_len:
         raise ValueError("--context must exceed --q-len")
+    if args.batch <= 0:
+        raise ValueError("--batch must be positive")
     max_context = args.context if args.max_context is None else args.max_context
     if max_context < args.context:
         raise ValueError("--max-context must be >= --context")
@@ -89,10 +97,18 @@ def main() -> None:
     fp8 = torch.float8_e4m3fn
     # The native kernel loads complete 128-token tiles, so keep the synthetic
     # block table padded exactly as a serving-time max-context table is.
-    pages = math.ceil(max_context / 128) * (128 // PAGE)
+    pages_per_request = math.ceil(max_context / 128) * (128 // PAGE)
+    pages = args.batch * pages_per_request
 
     query = (
-        torch.randn(1, args.q_len, args.heads, LATENT + ROPE, device=device) * 0.1
+        torch.randn(
+            args.batch,
+            args.q_len,
+            args.heads,
+            LATENT + ROPE,
+            device=device,
+        )
+        * 0.1
     ).to(fp8)
     packed = torch.randint(
         0, 256, (pages, PAGE, LATENT // 2), device=device, dtype=torch.uint8
@@ -154,11 +170,26 @@ def main() -> None:
         packed, scales, centroids, dtype=torch.float32
     )
     dense_cache = torch.cat((dense_latent, rope), dim=-1).to(fp8)
-    page_table = torch.randperm(pages, device=device, dtype=torch.int32)[None]
-    seq_lens = torch.tensor([args.context], device=device, dtype=torch.int32)
+    page_table = torch.stack(
+        [
+            torch.randperm(
+                pages_per_request, device=device, dtype=torch.int32
+            )
+            + batch_index * pages_per_request
+            for batch_index in range(args.batch)
+        ]
+    )
+    seq_lens = torch.full(
+        (args.batch,), args.context, device=device, dtype=torch.int32
+    )
     workspace = torch.empty(64 << 20, device=device, dtype=torch.int8)
     out_dense = torch.empty(
-        1, args.q_len, args.heads, LATENT, device=device, dtype=torch.bfloat16
+        args.batch,
+        args.q_len,
+        args.heads,
+        LATENT,
+        device=device,
+        dtype=torch.bfloat16,
     )
     out_tq4 = torch.empty_like(out_dense)
     out_tq4_reference = torch.empty_like(out_dense)
@@ -259,6 +290,7 @@ def main() -> None:
                     "status": "PASS",
                     "context": args.context,
                     "max_context": max_context,
+                    "batch": args.batch,
                     "split": args.profile_split,
                     "max_abs_diff": difference,
                 },
@@ -287,6 +319,7 @@ def main() -> None:
         "status": "PASS",
         "context": args.context,
         "max_context": max_context,
+        "batch": args.batch,
         "q_len": args.q_len,
         "heads": args.heads,
         "dense": dense_timing,
