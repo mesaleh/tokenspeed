@@ -70,6 +70,16 @@ def main() -> None:
         default=1,
         help="Decode batch size; use 2 to match the Kimi DFlash target graph.",
     )
+    parser.add_argument(
+        "--cache-layers",
+        type=int,
+        default=1,
+        help=(
+            "Rotate timing through this many independent compressed-layer KV "
+            "caches; use 19 for the H36 material-value target or 61 for a "
+            "fully compressed Kimi target."
+        ),
+    )
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
     parser.add_argument("--q-len", type=int, choices=range(1, 6), default=5)
     parser.add_argument("--codebook", action="store_true")
@@ -88,6 +98,8 @@ def main() -> None:
         raise ValueError("--context must exceed --q-len")
     if args.batch <= 0:
         raise ValueError("--batch must be positive")
+    if args.cache_layers <= 0:
+        raise ValueError("--cache-layers must be positive")
     max_context = args.context if args.max_context is None else args.max_context
     if max_context < args.context:
         raise ValueError("--max-context must be >= --context")
@@ -116,20 +128,15 @@ def main() -> None:
     # Unit scale catches operand-layout corruption exactly. Realistic native
     # E2M1 norm corrections are small; the legacy range remains useful for
     # exercising arbitrary Lloyd centroids.
-    if args.scale_mode == "unit":
-        scales = torch.ones(
-            pages, PAGE, device=device, dtype=torch.bfloat16
-        )
-    elif args.scale_mode == "realistic":
-        scales = (
-            torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 0.15
-            + 0.05
-        )
-    else:
-        scales = (
-            torch.rand(pages, PAGE, device=device, dtype=torch.bfloat16) * 8.0
-            + 16.0
-        )
+    def make_scales(*shape: int) -> torch.Tensor:
+        if args.scale_mode == "unit":
+            return torch.ones(*shape, device=device, dtype=torch.bfloat16)
+        scales = torch.rand(*shape, device=device, dtype=torch.bfloat16)
+        if args.scale_mode == "realistic":
+            return scales * 0.15 + 0.05
+        return scales * 8.0 + 16.0
+
+    scales = make_scales(pages, PAGE)
     rope = (
         torch.randn(pages, PAGE, ROPE, device=device, dtype=torch.bfloat16) * 0.1
     )
@@ -165,6 +172,47 @@ def main() -> None:
         scales.float()[..., None] * centroids[None, None, :]
     ).to(fp8).view(torch.uint8).contiguous()
     use_codebook = not args.no_codebook and (args.codebook or e2m1_data)
+
+    packed_layers = [packed]
+    scale_layers = [scales]
+    rope_layers = [rope]
+    codebook_layers = [codebook if use_codebook else None]
+    if args.cache_layers > 1:
+        extra_packed = torch.randint(
+            0,
+            256,
+            (
+                args.cache_layers - 1,
+                pages,
+                PAGE,
+                LATENT // 2,
+            ),
+            device=device,
+            dtype=torch.uint8,
+        )
+        extra_scales = make_scales(args.cache_layers - 1, pages, PAGE)
+        extra_rope = (
+            torch.randn(
+                args.cache_layers - 1,
+                pages,
+                PAGE,
+                ROPE,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            * 0.1
+        )
+        packed_layers.extend(extra_packed.unbind())
+        scale_layers.extend(extra_scales.unbind())
+        rope_layers.extend(extra_rope.unbind())
+        if use_codebook:
+            extra_codebook = (
+                extra_scales.float()[..., None]
+                * centroids[None, None, None, :]
+            ).to(fp8).view(torch.uint8).contiguous()
+            codebook_layers.extend(extra_codebook.unbind())
+        else:
+            codebook_layers.extend([None] * (args.cache_layers - 1))
 
     dense_latent = dequantize_tq4_reference(
         packed, scales, centroids, dtype=torch.float32
@@ -219,12 +267,12 @@ def main() -> None:
     if not splits:
         raise ValueError("--splits must contain at least one value")
 
-    def run_tq4(split_kv: int):
+    def run_tq4_layer(layer_index: int, split_kv: int):
         return tokenspeed_mla_decode_tq4(
             query=query,
-            kv_nope_packed=packed,
-            kv_nope_scale=scales,
-            kv_rope=rope,
+            kv_nope_packed=packed_layers[layer_index],
+            kv_nope_scale=scale_layers[layer_index],
+            kv_rope=rope_layers[layer_index],
             centroids=centroids,
             workspace_buffer=workspace,
             kv_lora_rank=LATENT,
@@ -237,9 +285,18 @@ def main() -> None:
             causal_mask=True,
             enable_pdl=True,
             split_kv_override=split_kv,
-            kv_nope_codebook=codebook if use_codebook else None,
+            kv_nope_codebook=codebook_layers[layer_index],
             native_e2m1=args.native_e2m1,
         )
+
+    def run_tq4(split_kv: int):
+        return run_tq4_layer(0, split_kv)
+
+    def run_tq4_cache_ring(split_kv: int):
+        result = None
+        for layer_index in range(args.cache_layers):
+            result = run_tq4_layer(layer_index, split_kv)
+        return result
 
     def run_tq4_reference(split_kv: int):
         return tokenspeed_mla_decode_tq4(
@@ -275,15 +332,15 @@ def main() -> None:
         run_dense()
         run_tq4(args.profile_split)
         torch.cuda.synchronize()
+        difference = float((out_tq4.float() - out_dense.float()).abs().max())
+        torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
         torch.cuda.nvtx.range_push("dense_profile")
         run_dense()
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("tq4_profile")
-        run_tq4(args.profile_split)
+        run_tq4_cache_ring(args.profile_split)
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
-        difference = float((out_tq4.float() - out_dense.float()).abs().max())
-        torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
         print(
             json.dumps(
                 {
@@ -291,6 +348,8 @@ def main() -> None:
                     "context": args.context,
                     "max_context": max_context,
                     "batch": args.batch,
+                    "cache_layers": args.cache_layers,
+                    "codebook": use_codebook,
                     "split": args.profile_split,
                     "max_abs_diff": difference,
                 },
@@ -312,18 +371,26 @@ def main() -> None:
         difference = float((out_tq4.float() - out_dense.float()).abs().max())
         torch.testing.assert_close(out_tq4, out_dense, rtol=0, atol=args.atol)
         max_abs_diff = max(max_abs_diff, difference)
-        tq4_timings[str(split_kv)] = bench(
-            lambda split_kv=split_kv: run_tq4(split_kv)
+        timing = bench(
+            lambda split_kv=split_kv: run_tq4_cache_ring(split_kv)
         )
+        tq4_timings[str(split_kv)] = {
+            name: value / args.cache_layers for name, value in timing.items()
+        }
     result = {
         "status": "PASS",
         "context": args.context,
         "max_context": max_context,
         "batch": args.batch,
+        "cache_layers": args.cache_layers,
+        "codebook": use_codebook,
         "q_len": args.q_len,
         "heads": args.heads,
         "dense": dense_timing,
+        "dense_cache_layers": 1,
         "tq4": tq4_timings,
+        "tq4_cache_layers": args.cache_layers,
+        "correctness_cache_layers": 1,
         "max_abs_diff": max_abs_diff,
         "atol": args.atol,
         "native_e2m1": args.native_e2m1,
