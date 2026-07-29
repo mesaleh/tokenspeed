@@ -283,7 +283,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.load_tma_k_warp_id = 9
         self.load_tma_v_warp_id = 10
         self.empty_warp_ids = (11,)
-        self.tq4_conversion_warp_ids = (12, 13, 14, 15) if tq4_cache else ()
+        self.tq4_conversion_warp_ids = (
+            tuple(range(12, 20)) if tq4_cache else ()
+        )
+        self.tq4_conversion_threads = (
+            self.threads_per_warp * len(self.tq4_conversion_warp_ids)
+        )
+        self.tq4_words_per_thread = (
+            1024 // self.tq4_conversion_threads if tq4_cache else 0
+        )
         self.threads_per_cta = self.threads_per_warp * len(
             (
                 self.mma_warp_id,
@@ -301,9 +309,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.correction_reg_num = 256
         self.other_reg_num = 40
         self.tq4_correction_reg_num = 184
-        # Multi-tile conversion can use the CTA's final 1K-register headroom.
-        # Keep the one-tile specialization at 72 for its fully unrolled loader.
-        self.tq4_conversion_reg_num = 80 if tq4_tiles_per_split > 1 else 72
+        # Eight conversion warps each own half as many packed words as the
+        # prior four-warp path. Forty registers preserves the CTA's 64K total
+        # register budget while exposing twice the unpack/scale parallelism.
+        self.tq4_conversion_reg_num = 40
         # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
@@ -2280,18 +2289,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             swizzle_=None,
             dtype=cutlass.Int32,
         )
-        raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
+        raw_words = cute.make_rmem_tensor(
+            cute.make_layout(self.tq4_words_per_thread), cutlass.Int32
+        )
         if cutlass.const_expr(common_params.mTQCodebook is not None):
             codebook_word_lanes = cute.make_rmem_tensor(
-                cute.make_layout(8), cutlass.Int32
+                cute.make_layout(self.tq4_words_per_thread), cutlass.Int32
             )
             codebook_i32_ptr = cute.recast_ptr(
                 common_params.mTQCodebook.iterator,
                 dtype=cutlass.Int32,
             )
             halfwarp_lane = local_tidx % 16
-            for iteration in cutlass.range_constexpr(8):
-                linear_word = iteration * 128 + local_tidx
+            for iteration in cutlass.range_constexpr(
+                self.tq4_words_per_thread
+            ):
+                linear_word = (
+                    iteration * self.tq4_conversion_threads + local_tidx
+                )
                 row = linear_word // 16
                 page = row // self.page_size
                 page_row = row % self.page_size
@@ -2316,8 +2331,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
 
         for phase in cutlass.range_constexpr(4):
-            for iteration in cutlass.range_constexpr(8):
-                linear_word = iteration * 128 + local_tidx
+            for iteration in cutlass.range_constexpr(
+                self.tq4_words_per_thread
+            ):
+                linear_word = (
+                    iteration * self.tq4_conversion_threads + local_tidx
+                )
                 row = linear_word // 16
                 chunk_word = linear_word % 16
                 page = row // self.page_size
@@ -2330,8 +2349,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     raw_consumer_state.index,
                 ]
             self.tq4_conversion_sync_bar.arrive_and_wait()
-            for iteration in cutlass.range_constexpr(8):
-                linear_word = iteration * 128 + local_tidx
+            for iteration in cutlass.range_constexpr(
+                self.tq4_words_per_thread
+            ):
+                linear_word = (
+                    iteration * self.tq4_conversion_threads + local_tidx
+                )
                 row = linear_word // 16
                 chunk_word = linear_word % 16
                 page = row // self.page_size
