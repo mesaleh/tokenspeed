@@ -33,7 +33,6 @@ from typing import Optional
 
 import torch
 
-
 TQ4_BITS = 4
 TQ4_LEVELS = 1 << TQ4_BITS
 TQ4_LATENT_DIM = 512
@@ -86,6 +85,7 @@ def validate_tq4_decode_inputs(
     *,
     kv_lora_rank: int = TQ4_LATENT_DIM,
     qk_rope_head_dim: int = TQ4_ROPE_DIM,
+    fp8_rope: bool = False,
     require_cuda: bool = True,
 ) -> tuple[TQ4DecodeShape, torch.Tensor, torch.Tensor]:
     """Validate and normalize the native packed MLA decode ABI.
@@ -139,16 +139,25 @@ def validate_tq4_decode_inputs(
         f"kv_nope_packed must be uint8, got {packed.dtype}",
     )
     _require(packed.is_contiguous(), "kv_nope_packed must be contiguous")
-    _require(page_size == 32, f"initial TQ4 MLA kernel requires page_size=32, got {page_size}")
+    _require(
+        page_size == 32,
+        f"initial TQ4 MLA kernel requires page_size=32, got {page_size}",
+    )
     _require(
         rope.shape == (num_pages, page_size, TQ4_ROPE_DIM),
         f"kv_rope shape must be {(num_pages, page_size, TQ4_ROPE_DIM)}, got {tuple(rope.shape)}",
     )
     _require(
-        rope.dtype == torch.bfloat16,
-        f"kv_rope must be bfloat16, got {rope.dtype}",
+        rope.dtype == (torch.float8_e4m3fn if fp8_rope else torch.bfloat16),
+        "kv_rope must be "
+        f"{'FP8 E4M3' if fp8_rope else 'bfloat16'}, got {rope.dtype}",
     )
     _require(rope.is_contiguous(), "kv_rope must be contiguous")
+    _require(
+        packed.data_ptr() % 16 == 0,
+        "kv_nope_packed must be 16-byte aligned",
+    )
+    _require(rope.data_ptr() % 16 == 0, "kv_rope must be 16-byte aligned")
 
     _require(
         kv_nope_scale.shape == (num_pages, page_size),
@@ -180,7 +189,9 @@ def validate_tq4_decode_inputs(
         block_tables.dim() == 2 and block_tables.shape[0] == batch_size,
         f"block_tables must be [B, max_pages] with B={batch_size}, got {tuple(block_tables.shape)}",
     )
-    _require(block_tables.shape[1] > 0, "block_tables must contain at least one page column")
+    _require(
+        block_tables.shape[1] > 0, "block_tables must contain at least one page column"
+    )
     _require(
         block_tables.dtype == torch.int32,
         f"block_tables must be int32, got {block_tables.dtype}",
@@ -190,7 +201,9 @@ def validate_tq4_decode_inputs(
         seq_lens.shape == (batch_size,),
         f"seq_lens must have shape ({batch_size},), got {seq_lens.shape}",
     )
-    _require(seq_lens.dtype == torch.int32, f"seq_lens must be int32, got {seq_lens.dtype}")
+    _require(
+        seq_lens.dtype == torch.int32, f"seq_lens must be int32, got {seq_lens.dtype}"
+    )
     _require(seq_lens.is_contiguous(), "seq_lens must be contiguous")
 
     tensors = (
@@ -209,7 +222,9 @@ def validate_tq4_decode_inputs(
         "all TQ4 decode tensors must share one device",
     )
     if require_cuda:
-        _require(device.type == "cuda", f"TQ4 native decode requires CUDA, got {device}")
+        _require(
+            device.type == "cuda", f"TQ4 native decode requires CUDA, got {device}"
+        )
 
     if out is not None:
         _require(out.device == device, "out must be on the query device")
@@ -230,7 +245,9 @@ def validate_tq4_decode_inputs(
 def unpack_tq4_indices_reference(kv_nope_packed: torch.Tensor) -> torch.Tensor:
     """Test-only expansion of canonical low-even/high-odd TQ4 indices."""
 
-    _require(kv_nope_packed.dtype == torch.uint8, "packed reference input must be uint8")
+    _require(
+        kv_nope_packed.dtype == torch.uint8, "packed reference input must be uint8"
+    )
     _require(
         kv_nope_packed.shape[-1] == TQ4_PACKED_DIM,
         "packed reference input must end in 256 bytes",

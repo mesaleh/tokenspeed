@@ -186,6 +186,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tree_mask_mode: bool = False,
         fold_q_chunk_size: int = 0,
         tq4_cache: bool = False,
+        tq4_fp8_rope: bool = False,
         tq4_tiles_per_split: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
@@ -245,7 +246,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tree_mask_mode = tree_mask_mode
         # Compile-time switch for the canonical no-shadow TurboQuant cache.
         # The default FP8 specialization compiles the packed path out.
+        if tq4_fp8_rope and not tq4_cache:
+            raise ValueError("FP8 RoPE storage requires the native TQ4 cache")
         self.tq4_cache = tq4_cache
+        self.tq4_fp8_rope = tq4_fp8_rope
         self.tq4_tiles_per_split = tq4_tiles_per_split
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
@@ -421,7 +425,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
-        self.k_dtype = q_latent.element_type if self.tq4_cache else c_latent.element_type
+        self.k_dtype = (
+            q_latent.element_type if self.tq4_cache else c_latent.element_type
+        )
         self.v_dtype = self.k_dtype
         self.o_dtype = o.element_type
         self.skip_lse = lse is None
@@ -436,8 +442,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(self.tq4_cache):
             if cutlass.const_expr(c_latent.element_type != cutlass.Uint8):
                 raise TypeError("TQ4 latent cache must use canonical uint8 packing")
-            if cutlass.const_expr(c_rope.element_type != cutlass.BFloat16):
-                raise TypeError("TQ4 RoPE cache must be bfloat16")
+            expected_rope_dtype = (
+                cutlass.Float8E4M3FN if self.tq4_fp8_rope else cutlass.BFloat16
+            )
+            if cutlass.const_expr(c_rope.element_type != expected_rope_dtype):
+                raise TypeError(
+                    "TQ4 RoPE cache dtype does not match the compiled specialization"
+                )
             if cutlass.const_expr(tq4_scale is None or tq4_centroids is None):
                 raise TypeError("TQ4 scale and centroid tensors are required")
             if cutlass.const_expr(tq4_scale.element_type != cutlass.BFloat16):
@@ -445,8 +456,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if cutlass.const_expr(tq4_centroids.element_type != cutlass.Float32):
                 raise TypeError("TQ4 centroid tensor must be float32")
             if cutlass.const_expr(
-                tq4_codebook is not None
-                and tq4_codebook.element_type != cutlass.Uint8
+                tq4_codebook is not None and tq4_codebook.element_type != cutlass.Uint8
             ):
                 raise TypeError("TQ4 FP8 codebook tensor must carry raw uint8 bytes")
 
@@ -801,9 +811,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 qk_tiled_mma,
                 is_k_load=True,
             )
-            kc_rope_smem_layout = cute.select(
-                kc_rope_smem_layout_for_tma, mode=[0]
-            )
+            kc_rope_smem_layout = cute.select(kc_rope_smem_layout_for_tma, mode=[0])
             tma_atom_c_rope, tma_tensor_c_rope = self.make_paged_tiled_tma_atom(
                 tma_load_op,
                 c_rope,
@@ -880,9 +888,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tq4_raw_k_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_k_stage * 2
             ]
-            tq4_s2s_v_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_v_stage
-            ]
+            tq4_s2s_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_v_stage]
             mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
             p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
@@ -1236,9 +1242,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if warp_idx == 0:
                 with cute.arch.elect_one():
                     for stage in cutlass.range_constexpr(self.load_v_stage):
-                        cute.arch.mbarrier_init(
-                            s2s_v_mbar_ptr + stage, 1
-                        )
+                        cute.arch.mbarrier_init(s2s_v_mbar_ptr + stage, 1)
                     cute.arch.mbarrier_init_fence()
         else:
             raw_k_pipeline = None
@@ -2089,11 +2093,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         raw_producer_state: pipeline.PipelineState,
         output_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """TMA packed K and convert BF16 RoPE into its incumbent FP8 stage."""
+        """TMA packed K and populate its incumbent FP8 RoPE stage."""
         page_table = common_params.mPT[None, common_params.blk_coord[2]]
-        tiled_global = cute.flat_divide(
-            k_params.tma_tensor, (self.page_size, 128)
-        )
+        tiled_global = cute.flat_divide(k_params.tma_tensor, (self.page_size, 128))
         tma_stage, tma_global = cpasync.tma_partition(
             k_params.tma_atom,
             0,
@@ -2112,6 +2114,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ),
             cute.make_layout(cute.cosize(k_params.sKC_rope.layout) // 4),
         )
+        rope_raw_fp8 = cute.make_tensor(
+            cute.recast_ptr(
+                k_params.sKC_rope.iterator,
+                swizzle_=None,
+                dtype=cutlass.Float8E4M3FN,
+            ),
+            cute.make_layout(cute.cosize(k_params.sKC_rope.layout)),
+        )
+        rope_global_fp8 = cute.make_tensor(
+            cute.recast_ptr(
+                k_params.mKR.iterator,
+                dtype=cutlass.Float8E4M3FN,
+            ),
+            cute.make_layout(cute.cosize(k_params.mKR.layout)),
+        )
+        rope_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float8E4M3FN,
+            num_bits_per_copy=128,
+        )
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % self.threads_per_warp
         cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
@@ -2119,91 +2141,115 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for _ in cutlass.range_constexpr(1):
             common_params.load_k_pipeline.producer_acquire(output_producer_state)
             k_params.raw_pipeline.producer_acquire(raw_producer_state)
-            tma_bar_ptr = k_params.raw_pipeline.producer_get_barrier(
-                raw_producer_state
-            )
+            tma_bar_ptr = k_params.raw_pipeline.producer_get_barrier(raw_producer_state)
             for page in cutlass.range_constexpr(2):
                 physical_page = page_table[(k_index * 2 + cta) * 2 + page]
                 for chunk in cutlass.range_constexpr(4):
                     cute.copy(
                         k_params.tma_atom,
                         tma_global[None, 0, chunk, physical_page],
-                        tma_stage[
-                            None, page, chunk, raw_producer_state.index
-                        ],
+                        tma_stage[None, page, chunk, raw_producer_state.index],
                         tma_bar_ptr=tma_bar_ptr,
                     )
             k_params.raw_pipeline.producer_commit(raw_producer_state)
             raw_producer_state.advance()
 
-            # These loops must remain in separate constexpr branches: CuTe DSL
-            # requires both iterator kinds to be visible at the loop syntax.
-            if cutlass.const_expr(self.tq4_tiles_per_split == 1):
-                for iteration in cutlass.range_constexpr(32):
-                    word_linear = iteration * self.threads_per_warp + lane
-                    row = word_linear // 16
-                    dim_word = word_linear % 16
+            if cutlass.const_expr(self.tq4_fp8_rope):
+                for iteration in cutlass.range_constexpr(8):
+                    chunk_linear = iteration * self.threads_per_warp + lane
+                    row = chunk_linear // 4
+                    chunk = chunk_linear % 4
                     page = row // self.page_size
                     page_row = row % self.page_size
                     physical_page = page_table[(k_index * 2 + cta) * 2 + page]
-                    values = cute.make_rmem_tensor(
-                        cute.make_layout(4), cutlass.Float32
+                    source_byte = (
+                        physical_page * self.page_size * self.rope_dim
+                        + page_row * self.rope_dim
+                        + chunk * 16
                     )
-                    for element in cutlass.range_constexpr(4):
-                        values[element] = cutlass.Float32(
-                            k_params.mKR[
-                                page_row, dim_word * 4 + element, physical_page
-                            ]
-                        )
+                    source_byte = cute.assume(source_byte, 16)
                     logical_byte = (
                         page_row * 64
-                        + dim_word * 4
+                        + chunk * 16
                         + page * 2048
                         + output_producer_state.index * 4096
                     )
-                    physical_byte = logical_byte ^ (
-                        (logical_byte & 0x180) >> 3
+                    physical_byte = logical_byte ^ ((logical_byte & 0x180) >> 3)
+                    physical_byte = cute.assume(physical_byte, 16)
+                    source_chunk = cute.make_tensor(
+                        rope_global_fp8.iterator + source_byte,
+                        cute.make_layout(16),
                     )
-                    rope_raw_i32[
-                        physical_byte // 4
-                    ] = cvt_f32x4_to_f8x4_pack_i32(
-                        values, cutlass.Float8E4M3FN
+                    destination_chunk = cute.make_tensor(
+                        rope_raw_fp8.iterator + physical_byte,
+                        cute.make_layout(16),
                     )
+                    cute.copy(rope_copy_atom, source_chunk, destination_chunk)
             else:
-                for iteration in cutlass.range(32, unroll=1):
-                    rolled_word_linear = iteration * self.threads_per_warp + lane
-                    rolled_row = rolled_word_linear // 16
-                    rolled_dim_word = rolled_word_linear % 16
-                    rolled_page = rolled_row // self.page_size
-                    rolled_page_row = rolled_row % self.page_size
-                    rolled_physical_page = page_table[
-                        (k_index * 2 + cta) * 2 + rolled_page
-                    ]
-                    rolled_values = cute.make_rmem_tensor(
-                        cute.make_layout(4), cutlass.Float32
-                    )
-                    for element in cutlass.range_constexpr(4):
-                        rolled_values[element] = cutlass.Float32(
-                            k_params.mKR[
-                                rolled_page_row,
-                                rolled_dim_word * 4 + element,
-                                rolled_physical_page,
-                            ]
+                # These loops must remain in separate constexpr branches: CuTe DSL
+                # requires both iterator kinds to be visible at the loop syntax.
+                if cutlass.const_expr(self.tq4_tiles_per_split == 1):
+                    for iteration in cutlass.range_constexpr(32):
+                        word_linear = iteration * self.threads_per_warp + lane
+                        row = word_linear // 16
+                        dim_word = word_linear % 16
+                        page = row // self.page_size
+                        page_row = row % self.page_size
+                        physical_page = page_table[(k_index * 2 + cta) * 2 + page]
+                        values = cute.make_rmem_tensor(
+                            cute.make_layout(4), cutlass.Float32
                         )
-                    rolled_logical_byte = (
-                        rolled_page_row * 64
-                        + rolled_dim_word * 4
-                        + rolled_page * 2048
-                        + output_producer_state.index * 4096
-                    )
-                    rolled_physical_byte = rolled_logical_byte ^ (
-                        (rolled_logical_byte & 0x180) >> 3
-                    )
-                    rope_raw_i32[
-                        rolled_physical_byte // 4
-                    ] = cvt_f32x4_to_f8x4_pack_i32(
-                        rolled_values, cutlass.Float8E4M3FN
-                    )
+                        for element in cutlass.range_constexpr(4):
+                            values[element] = cutlass.Float32(
+                                k_params.mKR[
+                                    page_row, dim_word * 4 + element, physical_page
+                                ]
+                            )
+                        logical_byte = (
+                            page_row * 64
+                            + dim_word * 4
+                            + page * 2048
+                            + output_producer_state.index * 4096
+                        )
+                        physical_byte = logical_byte ^ ((logical_byte & 0x180) >> 3)
+                        rope_raw_i32[physical_byte // 4] = cvt_f32x4_to_f8x4_pack_i32(
+                            values, cutlass.Float8E4M3FN
+                        )
+                else:
+                    for iteration in cutlass.range(32, unroll=1):
+                        rolled_word_linear = iteration * self.threads_per_warp + lane
+                        rolled_row = rolled_word_linear // 16
+                        rolled_dim_word = rolled_word_linear % 16
+                        rolled_page = rolled_row // self.page_size
+                        rolled_page_row = rolled_row % self.page_size
+                        rolled_physical_page = page_table[
+                            (k_index * 2 + cta) * 2 + rolled_page
+                        ]
+                        rolled_values = cute.make_rmem_tensor(
+                            cute.make_layout(4), cutlass.Float32
+                        )
+                        for element in cutlass.range_constexpr(4):
+                            rolled_values[element] = cutlass.Float32(
+                                k_params.mKR[
+                                    rolled_page_row,
+                                    rolled_dim_word * 4 + element,
+                                    rolled_physical_page,
+                                ]
+                            )
+                        rolled_logical_byte = (
+                            rolled_page_row * 64
+                            + rolled_dim_word * 4
+                            + rolled_page * 2048
+                            + output_producer_state.index * 4096
+                        )
+                        rolled_physical_byte = rolled_logical_byte ^ (
+                            (rolled_logical_byte & 0x180) >> 3
+                        )
+                        rope_raw_i32[rolled_physical_byte // 4] = (
+                            cvt_f32x4_to_f8x4_pack_i32(
+                                rolled_values, cutlass.Float8E4M3FN
+                            )
+                        )
             cute.arch.fence_view_async_shared()
             common_params.load_k_pipeline.producer_commit(output_producer_state)
             output_producer_state.advance()
@@ -2261,9 +2307,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         local_tidx = tidx - self.tq4_conversion_warp_ids[0] * 32
         cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
         page_table = common_params.mPT[None, common_params.blk_coord[2]]
-        packed_i32 = cute.recast_tensor(
-            common_params.packed_k_stage, cutlass.Int32
-        )
+        packed_i32 = cute.recast_tensor(common_params.packed_k_stage, cutlass.Int32)
         # The fixed TQ4 ABI (page32, latent512) selects FP8 SW128
         # S<3,4,3>.  Recasting the composed tensor to Int32 permutes rows;
         # vectorize only after mapping the logical FP8 byte address ourselves.
@@ -2308,9 +2352,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             centroid_lane = None
         else:
             codebook_word_lanes = None
-            centroid_lane = cutlass.Float32(
-                common_params.mTQCentroids[local_tidx % 16]
-            )
+            centroid_lane = cutlass.Float32(common_params.mTQCentroids[local_tidx % 16])
         common_params.load_k_pipeline.producer_acquire(output_k_producer_state)
         common_params.load_v_pipeline.producer_acquire(output_v_producer_state)
         common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
@@ -2355,9 +2397,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     + phase * 8192
                     + output_k_producer_state.index * 32768
                 )
-                physical_byte = logical_byte ^ (
-                    (logical_byte & 0x380) >> 3
-                )
+                physical_byte = logical_byte ^ ((logical_byte & 0x380) >> 3)
                 output_k_raw_i32[physical_byte // 4] = fp8_0
                 output_k_raw_i32[physical_byte // 4 + 1] = fp8_1
 
@@ -2373,9 +2413,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         + cta * 16384
                         + output_v_producer_state.index * 32768
                     )
-                    v_physical_byte = v_logical_byte ^ (
-                        (v_logical_byte & 0x380) >> 3
-                    )
+                    v_physical_byte = v_logical_byte ^ ((v_logical_byte & 0x380) >> 3)
                     (output_v_ptr + v_physical_byte // 4).store(fp8_0)
                     (output_v_ptr + v_physical_byte // 4 + 1).store(fp8_1)
 
@@ -2387,19 +2425,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 peer_cta = cutlass.Int32(1) - cta
                 source_phase = cutlass.Int32(1) - cta
                 source_base = (
-                    source_phase * 8192
-                    + output_k_producer_state.index * 32768
+                    source_phase * 8192 + output_k_producer_state.index * 32768
                 )
-                destination_base = (
-                    cta * 16384 + output_v_producer_state.index * 32768
-                )
+                destination_base = cta * 16384 + output_v_producer_state.index * 32768
                 local_mbar_ptr = (
-                    common_params.s2s_v_mbar_ptr
-                    + output_v_producer_state.index
+                    common_params.s2s_v_mbar_ptr + output_v_producer_state.index
                 )
-                remote_mbar_ptr = cute.arch.map_dsmem_ptr(
-                    local_mbar_ptr, peer_cta
-                )
+                remote_mbar_ptr = cute.arch.map_dsmem_ptr(local_mbar_ptr, peer_cta)
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     local_mbar_ptr,
                     2 * 8192,
@@ -3467,9 +3499,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # True automatically, so no separate history branch is needed.
                         within_kv = cute.elem_less(kcol, common_params.K)
                         kcol_in = (
-                            kcol
-                            if within_kv
-                            else cutlass.Int32(common_params.K - 1)
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
                         )
                         cm_idx = (
                             common_params.cmask_off[common_params.blk_coord[2]]
@@ -3481,11 +3511,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             cutlass.Int32(common_params.cmask[cm_idx]),
                         )
                         tTR_rAcc[i] = (
-                            (
-                                tTR_rAcc[i]
-                                if cm_keep
-                                else self.acc_dtype(-1.0e6)
-                            )
+                            (tTR_rAcc[i] if cm_keep else self.acc_dtype(-1.0e6))
                             if within_kv
                             else self.acc_dtype(-1.0e6)
                         )
@@ -3576,9 +3602,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # True automatically, so no separate history branch is needed.
                         within_kv = cute.elem_less(kcol, common_params.K)
                         kcol_in = (
-                            kcol
-                            if within_kv
-                            else cutlass.Int32(common_params.K - 1)
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
                         )
                         cm_idx = (
                             common_params.cmask_off[common_params.blk_coord[2]]
@@ -3590,11 +3614,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             cutlass.Int32(common_params.cmask[cm_idx]),
                         )
                         tTR_rAcc[i] = (
-                            (
-                                tTR_rAcc[i]
-                                if cm_keep
-                                else self.acc_dtype(-1.0e6)
-                            )
+                            (tTR_rAcc[i] if cm_keep else self.acc_dtype(-1.0e6))
                             if within_kv
                             else self.acc_dtype(-1.0e6)
                         )
