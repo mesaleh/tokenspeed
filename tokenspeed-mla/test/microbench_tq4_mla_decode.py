@@ -280,9 +280,19 @@ def main() -> None:
         )
         extra_dense.copy_(dense_cache)
         dense_layers.extend(extra_dense.unbind())
+    # Cache-count-dependent allocations above consume the global RNG. Use a
+    # dedicated generator so controls and mixed candidates traverse an
+    # identical physical-page permutation.
+    page_generator = torch.Generator(device=device)
+    page_generator.manual_seed(20260722)
     page_table = torch.stack(
         [
-            torch.randperm(pages_per_request, device=device, dtype=torch.int32)
+            torch.randperm(
+                pages_per_request,
+                device=device,
+                dtype=torch.int32,
+                generator=page_generator,
+            )
             + batch_index * pages_per_request
             for batch_index in range(args.batch)
         ]
@@ -443,9 +453,12 @@ def main() -> None:
         run_dense()
         run_tq4(splits[0])
         torch.cuda.synchronize()
-    dense_timing = bench(
-        run_dense_cache_ring if args.dense_cache_layers > 1 else run_dense
-    )
+    dense_bench_fn = run_dense_cache_ring if args.dense_cache_layers > 1 else run_dense
+    # In mixed mode the mixed ring is the decisive measurement. Do not run a
+    # full dense-ring benchmark first: that gives candidate and control
+    # processes materially different sustained-load histories. The dense-only
+    # diagnostic is collected after the mixed timing instead.
+    dense_timing = {} if mixed_mode else bench(dense_bench_fn)
     tq4_timings = {}
     mixed_timings = {}
     max_abs_diff = 0.0
@@ -468,6 +481,8 @@ def main() -> None:
         tq4_timings[str(split_kv)] = {
             name: value / args.cache_layers for name, value in timing.items()
         }
+    if mixed_mode:
+        dense_timing = bench(dense_bench_fn)
     result = {
         "status": "PASS",
         "context": args.context,
@@ -483,6 +498,9 @@ def main() -> None:
             for name, value in dense_timing.items()
         },
         "dense_cache_layers": args.dense_cache_layers,
+        "dense_timing_position": (
+            "post_mixed_diagnostic" if mixed_mode else "before_tq_or_decisive"
+        ),
         # All supported benchmark shapes fold q_len into heads, so the dense
         # kernel's simplified policy sees S=1. Record the resolved policy next
         # to the explicit TQ split keys so the comparison is auditable.
