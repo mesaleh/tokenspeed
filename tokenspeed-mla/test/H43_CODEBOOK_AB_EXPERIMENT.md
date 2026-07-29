@@ -161,3 +161,10 @@ completion, P0/max clock, ECC/recovery/fabric health, and no new Xid.
   machine restrictions, rollback, and service restoration. LGTM for plan-only
   commit and collaborative review; no harness, live run, implementation, image,
   production, or upstream work is approved yet.
+- Claude Opus 5 collaborative review launched with the required exact model,
+  max effort, read-only sandbox, and a fresh reviewer session after the stored
+  session was stale. It emitted no response or finding for more than 11
+  minutes and was stopped; the audit log is retained at
+  `.claude/review-logs/review-20260729-141251-14081.log`. This is an unavailable
+  external review, not an external LGTM. Per owner direction, the three-round
+  self-review LGTM remains the gate for harness work.
