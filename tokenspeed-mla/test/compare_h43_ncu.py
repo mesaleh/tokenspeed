@@ -125,6 +125,11 @@ def summarize(launches: list[dict[str, Any]]) -> dict[str, Any]:
             row["sm__warps_active.avg.pct_of_peak_sustained_active"]
             for row in metric_rows
         ),
+        "achieved_occupancy_mean_pct": math.fsum(
+            row["sm__warps_active.avg.pct_of_peak_sustained_active"]
+            for row in metric_rows
+        )
+        / len(metric_rows),
         "theoretical_occupancy_min_pct": min(
             row["sm__maximum_warps_per_active_cycle_pct"] for row in metric_rows
         ),
@@ -138,6 +143,45 @@ def summarize(launches: list[dict[str, Any]]) -> dict[str, Any]:
             row["smsp__inst_executed_op_local_st.sum"] for row in metric_rows
         ),
     }
+
+
+def compare_resource_classes(
+    reference: dict[str, dict[str, Any]],
+    candidate: dict[str, dict[str, Any]],
+    contract: dict[str, Any],
+) -> dict[str, dict[str, bool]]:
+    tolerance = contract["ncu"]["achieved_occupancy_mean_tolerance_pct_points"]
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("NCU achieved-occupancy tolerance is invalid")
+    gates: dict[str, dict[str, bool]] = {}
+    for name in contract["ncu"]["launch_kernel_order"]:
+        reference_class = reference[name]
+        candidate_class = candidate[name]
+        achieved_regression = (
+            reference_class["achieved_occupancy_mean_pct"]
+            - candidate_class["achieved_occupancy_mean_pct"]
+        )
+        gates[name] = {
+            "registers": candidate_class["registers_per_thread_max"]
+            <= reference_class["registers_per_thread_max"],
+            "static_smem": candidate_class["static_smem_per_block_max"]
+            <= reference_class["static_smem_per_block_max"],
+            "dynamic_smem": candidate_class["dynamic_smem_per_block_max"]
+            <= reference_class["dynamic_smem_per_block_max"],
+            "achieved_occupancy_mean": achieved_regression <= tolerance + 1e-12,
+            "theoretical_occupancy": candidate_class["theoretical_occupancy_min_pct"]
+            >= reference_class["theoretical_occupancy_min_pct"],
+            "resident_blocks": candidate_class["resident_blocks_per_sm_min"]
+            >= reference_class["resident_blocks_per_sm_min"]
+            and candidate_class["resident_blocks_per_sm_min"] >= 1,
+            "reference_no_local_spills": reference_class["local_load_instructions_sum"]
+            == 0
+            and reference_class["local_store_instructions_sum"] == 0,
+            "candidate_no_local_spills": candidate_class["local_load_instructions_sum"]
+            == 0
+            and candidate_class["local_store_instructions_sum"] == 0,
+        }
+    return gates
 
 
 def main() -> None:
@@ -157,31 +201,7 @@ def main() -> None:
         name: summarize(launches)
         for name, launches in load_ncu(candidate_path, contract).items()
     }
-    gates: dict[str, dict[str, bool]] = {}
-    for name in contract["ncu"]["launch_kernel_order"]:
-        reference_class = reference[name]
-        candidate_class = candidate[name]
-        gates[name] = {
-            "registers": candidate_class["registers_per_thread_max"]
-            <= reference_class["registers_per_thread_max"],
-            "static_smem": candidate_class["static_smem_per_block_max"]
-            <= reference_class["static_smem_per_block_max"],
-            "dynamic_smem": candidate_class["dynamic_smem_per_block_max"]
-            <= reference_class["dynamic_smem_per_block_max"],
-            "achieved_occupancy": candidate_class["achieved_occupancy_min_pct"]
-            >= reference_class["achieved_occupancy_min_pct"],
-            "theoretical_occupancy": candidate_class["theoretical_occupancy_min_pct"]
-            >= reference_class["theoretical_occupancy_min_pct"],
-            "resident_blocks": candidate_class["resident_blocks_per_sm_min"]
-            >= reference_class["resident_blocks_per_sm_min"]
-            and candidate_class["resident_blocks_per_sm_min"] >= 1,
-            "reference_no_local_spills": reference_class["local_load_instructions_sum"]
-            == 0
-            and reference_class["local_store_instructions_sum"] == 0,
-            "candidate_no_local_spills": candidate_class["local_load_instructions_sum"]
-            == 0
-            and candidate_class["local_store_instructions_sum"] == 0,
-        }
+    gates = compare_resource_classes(reference, candidate, contract)
     value = {
         "schema_version": 1,
         "status": (
@@ -193,6 +213,9 @@ def main() -> None:
         "contract_digest": canonical_json_digest(contract),
         "reference_csv_sha256": sha256_file(reference_path),
         "candidate_csv_sha256": sha256_file(candidate_path),
+        "achieved_occupancy_mean_tolerance_pct_points": contract["ncu"][
+            "achieved_occupancy_mean_tolerance_pct_points"
+        ],
         "reference": reference,
         "candidate": candidate,
         "gates": gates,

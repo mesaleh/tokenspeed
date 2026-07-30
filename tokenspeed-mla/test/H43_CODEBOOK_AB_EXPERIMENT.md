@@ -921,3 +921,37 @@ request shape and concurrency before any promotion claim.
   suite, Python/JSON checks, targeted formatting, all repository non-format
   hooks, and real parent/candidate zero-hazard logs pass: `LGTM` for a new
   source-bound preparation.
+- Preparation 9 bound commit `a6873000`, both exact images, both source
+  manifests, and both 21-file AOT caches; cold/warm digests and zero-launch NCU
+  proofs passed while the accepted endpoint remained healthy. Qualification 6
+  then passed source identity, PDL order, both-context q1/q5 correctness, and
+  the raw-word probe, but stopped before sanitizers because one NCU predicate
+  failed: the candidate reduction-kernel achieved-occupancy minimum was 6.21%
+  versus 6.22% reference. Registers, static/dynamic shared memory, theoretical
+  occupancy, resident blocks, and reference/candidate local-load/store counts
+  all matched their strict gates; split-kernel achieved occupancy improved.
+  Both exact accepted ranks were restored, completion and GPU health passed,
+  no new Xid appeared, all timers were disarmed, and the complete evidence tar
+  was copied locally. This is `NO_DECISION`, not a resource pass.
+- Hypothesis: minimum achieved occupancy across 14 identical calls is an
+  unstable statistic at NCU's two-decimal reporting resolution. The prior and
+  current sealed reference profiles moved from a 6.21% to 6.22% reduction-
+  kernel minimum, while their 14-call means were 6.2271% and 6.2293%. In the
+  failed campaign the candidate mean was 6.2300%, slightly above reference;
+  only one candidate call rounded to 6.21%. Decision: retain the minimum as
+  diagnostic evidence, but gate the 14-call achieved-occupancy mean with a
+  frozen 0.02-percentage-point tolerance equal to the observed two-quantum
+  reference variation. Exact structural resource, theoretical occupancy,
+  resident-block, and zero-spill predicates remain unchanged, and the later
+  paired timing decision remains the performance authority.
+- NCU-noise repair self-review pass 1 compared all 14 selected launch values
+  across both sealed campaigns and rejected simply widening the old minimum
+  predicate: the mean is the stable statistic for identical calls. Pass 2
+  bounded the only tolerance to 0.02 percentage points, kept it contract- and
+  result-digest bound, retained the minimum in diagnostic output, and added a
+  fail-closed negative/invalid-tolerance test. Pass 3 replayed both real
+  reference/candidate CSV pairs through the revised comparator; both pass all
+  structural, spill, theoretical-occupancy, and mean-occupancy gates, while a
+  synthetic 0.021-point mean regression fails. The focused 39-test suite,
+  Python/JSON checks, targeted formatting, repository non-format hooks, and
+  exact raw-evidence replays pass: `LGTM` for a new source-bound preparation.

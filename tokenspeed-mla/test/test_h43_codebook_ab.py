@@ -20,7 +20,7 @@ from analyze_h43_codebook_ab import (
 from check_h43_no_kernel_launch import validate_ncu_no_kernel_launch
 from check_h43_racecheck import load_racecheck_log, load_target_log
 from check_h43_racecheck import main as check_racecheck_main
-from compare_h43_ncu import load_ncu
+from compare_h43_ncu import compare_resource_classes, load_ncu, summarize
 from h43_aot_loader import (
     AOT_MANIFEST_NAME,
     adapt_h43_aot_callable,
@@ -183,6 +183,55 @@ def test_ncu_uses_installed_raw_metric_contract_without_section_derived_metrics(
     ]
     assert '"--page",\n            "raw"' in method
     assert '"--section"' not in method
+
+
+def test_ncu_achieved_occupancy_uses_mean_with_frozen_noise_tolerance():
+    value = contract()
+    assert value["ncu"]["achieved_occupancy_mean_tolerance_pct_points"] == 0.02
+
+    def launch(launch_id, achieved):
+        metrics = {metric: 1.0 for metric in value["ncu"]["required_metrics"]}
+        metrics.update(
+            {
+                "launch__registers_per_thread": 64.0,
+                "launch__shared_mem_per_block_static": 0.0,
+                "launch__shared_mem_per_block_dynamic": 1024.0,
+                "launch__occupancy_limit_blocks": 8.0,
+                "launch__occupancy_limit_registers": 8.0,
+                "launch__occupancy_limit_shared_mem": 8.0,
+                "launch__occupancy_limit_warps": 8.0,
+                "sm__maximum_warps_per_active_cycle_pct": 50.0,
+                "sm__warps_active.avg.pct_of_peak_sustained_active": achieved,
+                "smsp__inst_executed_op_local_ld.sum": 0.0,
+                "smsp__inst_executed_op_local_st.sum": 0.0,
+            }
+        )
+        return {"id": launch_id, "kernel_name": "kernel", "metrics": metrics}
+
+    reference_summary = summarize([launch(0, 6.22), launch(1, 6.24)])
+    candidate_summary = summarize([launch(0, 6.21), launch(1, 6.25)])
+    reference = {
+        name: dict(reference_summary) for name in value["ncu"]["launch_kernel_order"]
+    }
+    candidate = {
+        name: dict(candidate_summary) for name in value["ncu"]["launch_kernel_order"]
+    }
+    gates = compare_resource_classes(reference, candidate, value)
+    assert (
+        candidate_summary["achieved_occupancy_min_pct"]
+        < reference_summary["achieved_occupancy_min_pct"]
+    )
+    assert all(gate["achieved_occupancy_mean"] for gate in gates.values())
+
+    for summary in candidate.values():
+        summary["achieved_occupancy_mean_pct"] -= 0.021
+    gates = compare_resource_classes(reference, candidate, value)
+    assert not any(gate["achieved_occupancy_mean"] for gate in gates.values())
+
+    invalid = json.loads(json.dumps(value))
+    invalid["ncu"]["achieved_occupancy_mean_tolerance_pct_points"] = -0.01
+    with pytest.raises(ValueError, match="tolerance is invalid"):
+        compare_resource_classes(reference, candidate, invalid)
 
 
 def test_no_kernel_ncu_proof_requires_positive_profiler_evidence():

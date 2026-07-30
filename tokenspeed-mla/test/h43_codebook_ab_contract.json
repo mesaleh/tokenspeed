@@ -164,6 +164,7 @@
     ]
   },
   "ncu": {
+    "achieved_occupancy_mean_tolerance_pct_points": 0.02,
     "nvtx_range": "H43_CODEBOOK_Q5_RING/",
     "expected_ring_calls": 61,
     "selected_call_start": 24,
