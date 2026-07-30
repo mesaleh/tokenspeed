@@ -82,6 +82,13 @@ experiment_hostname=$6
 health_url=$7
 gpu_index=$8
 curl -fsS --max-time 10 "${health_url}" >/dev/null
+base_tag="h43-${campaign}-base:accepted"
+sudo -n docker image inspect "${base_image}" >/dev/null
+sudo -n docker image tag "${base_image}" "${base_tag}"
+if [[ $(sudo -n docker image inspect "${base_tag}" --format '{{.Id}}') != "${base_image}" ]]; then
+  echo "H43 local base tag does not resolve to the accepted image ID" >&2
+  exit 2
+fi
 for role in candidate reference; do
   archive="${remote_root}/incoming/${role}.tar"
   if [[ $(sudo -n stat -c '%u %a' "${archive}") != "0 600" ]]; then
@@ -99,8 +106,12 @@ for role in candidate reference; do
     commit=${reference_commit}
   fi
   source_root="${remote_root}/${role}/source"
+  if [[ $(sudo -n docker image inspect "${base_tag}" --format '{{.Id}}') != "${base_image}" ]]; then
+    echo "H43 accepted base tag changed before ${role} build" >&2
+    exit 2
+  fi
   sudo -n docker build \
-    --build-arg "BASE_IMAGE=${base_image}" \
+    --build-arg "BASE_IMAGE=${base_tag}" \
     --build-arg "H43_SOURCE_COMMIT=${commit}" \
     --build-arg "H43_SOURCE_ROLE=${role}" \
     --file "${remote_root}/candidate/source/tokenspeed-mla/test/Dockerfile.h43" \

@@ -485,7 +485,10 @@ Candidate/reference archives are uploaded only into a root-owned mode-0700
 directory under the preparation root, verified root-owned mode 0600 before
 privileged extraction, and deleted afterward. Build logs stream directly into
 the root-owned role directory; no predictable `/tmp` archive or build-log path
-feeds a privileged operation.
+feeds a privileged operation. Because Dockerfile `FROM` cannot resolve a bare
+local `sha256:` image ID, preparation creates a campaign-specific local tag
+from the frozen accepted rank-0 image ID and re-verifies that tag resolves to
+the exact ID immediately before each candidate/reference build.
 
 Install and verify idempotent remote fail-safe units at experiment-budget plus
 five minutes: minute 25 for qualification or an n=10 decision and minute 33 for
@@ -691,3 +694,8 @@ request shape and concurrency before any promotion claim.
   before its baseline capture. The baseline health/identity pass now occurs at
   the start of `snapshot_and_verify`, followed by the live container snapshot
   and second telemetry comparison; a regression test freezes that ordering.
+- The first online-only preparation safely failed before CUDA because BuildKit
+  treated a bare `sha256:` `FROM` value as a registry repository. Preparation
+  now creates and re-verifies a campaign-local tag for the exact accepted image
+  ID before both builds; the endpoint remained healthy and no service window
+  or source-only prebuild was consumed.

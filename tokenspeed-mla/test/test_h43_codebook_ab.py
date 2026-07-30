@@ -178,6 +178,9 @@ def test_preparation_has_no_privileged_predictable_tmp_staging():
     assert '"${remote_root}/incoming"' in source
     assert "/tmp/h43-${campaign}" not in source
     assert "mesaleh@${rank0_host}:/tmp/" not in source
+    assert 'base_tag="h43-${campaign}-base:accepted"' in source
+    assert source.count('docker image inspect "${base_tag}" --format') == 2
+    assert '--build-arg "BASE_IMAGE=${base_tag}"' in source
 
 
 def test_decision_window_has_remote_atomic_single_use_marker():
