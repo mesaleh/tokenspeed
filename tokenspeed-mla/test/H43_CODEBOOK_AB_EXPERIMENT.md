@@ -1,6 +1,6 @@
 # H43 D1 deployable codebook-reader A/B
 
-Status: AOT arity repair self-reviewed LGTM; immutable preparation pending
+Status: NCU push/pop filter repair self-reviewed LGTM; preparation pending
 Machine scope: CT13 GPU0 only for CUDA work. CT14 runs no experiment but its
 accepted rank is stopped and restored with CT13. CT15, CT16, and SecurityLLMs
 are excluded.
@@ -808,3 +808,32 @@ request shape and concurrency before any promotion claim.
   dispatch. An AST regression freezes both production call shapes. Focused
   tests, parse checks, targeted format hooks, and repository-wide non-format
   hooks pass: `LGTM`.
+- The third qualification campaign proved the AOT repair: both exact contexts
+  passed eager and graph correctness, dense-oracle checks, replay-allocation
+  stability, and the raw-word probe. Reference and candidate NCU target logs
+  also completed correctness, but both profiler CSVs contained positive
+  attach/detach evidence and “No kernels were profiled”; the resource comparison
+  therefore failed before producing a result. The probe marks its ring with
+  `torch.cuda.nvtx.range_push/range_pop`, while the contract omitted the `/`
+  required for a single push/pop include expression and consequently selected
+  a start/end range that did not exist. NVIDIA's current CLI guide documents
+  the exact `--nvtx-include "A_range/"` form:
+  https://docs.nvidia.com/nsight-compute/2025.3/NsightComputeCli/index.html#nvtx-filtering
+  Both accepted ranks were restored, endpoint completion and GPU validation
+  passed, and the timers were disarmed. This is deterministic tooling evidence
+  and `NO_DECISION`; it is not a reader resource result.
+- The contract now uses `H43_CODEBOOK_Q5_RING/`, with a regression test binding
+  that push/pop filter to the probe's exact range name. The NCU parser also
+  converts an empty/no-kernel capture into an explicit fail-closed diagnostic
+  rather than leaking `StopIteration`. A new signed source identity and
+  immutable preparation are required before qualification.
+- NCU-filter repair self-review pass 1 traced the probe's default-domain
+  push/pop range, the contract value, runner argument vector, installed NCU
+  diagnostic, and NVIDIA grammar; `H43_CODEBOOK_Q5_RING/` is the single exact
+  expression and is shared by reference and candidate. Pass 2 confirmed that
+  contract-digest rebinding forces a fresh preparation, an empty capture remains
+  invalid rather than becoming a resource result, and the parser now reports
+  the missing metric table directly. The change cannot affect kernel code or
+  measured execution beyond selecting the already-frozen 61-call range.
+  Focused tests, JSON/Python parse checks, targeted format hooks, and
+  repository-wide non-format hooks pass: `LGTM`.

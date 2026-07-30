@@ -23,10 +23,15 @@ def parse_number(value: str) -> float:
 def load_ncu(path: Path, contract: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
     header_index = next(
-        index
-        for index, row in enumerate(rows)
-        if "Metric Name" in row and "Metric Value" in row and "ID" in row
+        (
+            index
+            for index, row in enumerate(rows)
+            if "Metric Name" in row and "Metric Value" in row and "ID" in row
+        ),
+        None,
     )
+    if header_index is None:
+        raise ValueError("NCU CSV has no metric table header or profiled kernels")
     header = rows[header_index]
     records = [
         dict(zip(header, row, strict=False))

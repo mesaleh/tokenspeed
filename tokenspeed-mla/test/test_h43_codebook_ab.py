@@ -144,6 +144,23 @@ def test_ncu_parser_models_two_kernel_launches_per_ring_call(tmp_path):
     )
 
 
+def test_ncu_push_pop_filter_and_empty_capture_fail_closed(tmp_path):
+    value = contract()
+    probe = (ROOT / "probe_h43_codebook_graph.py").read_text(encoding="utf-8")
+    assert value["ncu"]["nvtx_range"] == "H43_CODEBOOK_Q5_RING/"
+    assert 'torch.cuda.nvtx.range_push("H43_CODEBOOK_Q5_RING")' in probe
+    assert "torch.cuda.nvtx.range_pop()" in probe
+    path = tmp_path / "no-kernels.csv"
+    path.write_text(
+        "==PROF== Connected to process 1\n"
+        "==WARNING== No kernels were profiled.\n"
+        "==PROF== Disconnected from process 1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no metric table header"):
+        load_ncu(path, value)
+
+
 def test_no_kernel_ncu_proof_requires_positive_profiler_evidence():
     good = """==PROF== Connected to process 123
 ==WARNING== No kernels were profiled.

@@ -164,7 +164,7 @@
     ]
   },
   "ncu": {
-    "nvtx_range": "H43_CODEBOOK_Q5_RING",
+    "nvtx_range": "H43_CODEBOOK_Q5_RING/",
     "expected_ring_calls": 61,
     "selected_call_start": 24,
     "selected_call_count": 14,
