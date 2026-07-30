@@ -295,6 +295,33 @@ def validate_gpu_binding_and_health(
         expect_equal(sample.get(key), value, f"{label}.{key}", failures)
 
 
+def validate_gpu_boundaries(
+    result: dict[str, Any],
+    contract: dict[str, Any],
+    aggregate_ecc_baseline: str,
+    mode: str,
+    label: str,
+    failures: list[str],
+) -> None:
+    validate_gpu_binding_and_health(
+        result.get("gpu_before_cuda", {}),
+        contract,
+        aggregate_ecc_baseline,
+        f"{label}.gpu_before_cuda",
+        failures,
+    )
+    final_validator = (
+        validate_gpu_sample if mode == "smoke" else validate_gpu_binding_and_health
+    )
+    final_validator(
+        result.get("gpu_final", {}),
+        contract,
+        aggregate_ecc_baseline,
+        f"{label}.gpu_final",
+        failures,
+    )
+
+
 def validate_correctness(
     result: dict[str, Any], contract: dict[str, Any], label: str, failures: list[str]
 ) -> None:
@@ -463,19 +490,7 @@ def validate_common_result(
             before_digest, expected_cache_digest, f"{label}.cache_digest", failures
         )
     aggregate = str(result.get("aggregate_ecc_baseline"))
-    boundary_validator = (
-        validate_gpu_sample if mode == "smoke" else validate_gpu_binding_and_health
-    )
-    boundary_validator(
-        result.get("gpu_before_cuda", {}),
-        contract,
-        aggregate,
-        f"{label}.gpu_before_cuda",
-        failures,
-    )
-    boundary_validator(
-        result.get("gpu_final", {}), contract, aggregate, f"{label}.gpu_final", failures
-    )
+    validate_gpu_boundaries(result, contract, aggregate, mode, label, failures)
     validate_correctness(result, contract, label, failures)
     if not valid_sha256(result.get("codebook_sha256")):
         failures.append(f"{label}.codebook_sha256 is invalid")

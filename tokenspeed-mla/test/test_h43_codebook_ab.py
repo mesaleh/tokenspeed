@@ -14,6 +14,7 @@ from analyze_h43_codebook_ab import (
     balanced_process_recovery,
     validate_decision_contract,
     validate_gpu_binding_and_health,
+    validate_gpu_boundaries,
     validate_gpu_sample,
     validate_qualification_gates,
 )
@@ -808,3 +809,68 @@ def test_transient_pair_telemetry_is_excludable_but_hard_health_is_not():
     sample["ecc.errors.uncorrected.volatile.total"] = "1"
     validate_gpu_binding_and_health(sample, value, "0", "pair", failures)
     assert failures
+
+
+def test_smoke_tolerates_idle_pre_cuda_clock_but_requires_active_final_clock():
+    value = contract()
+    machine = value["machine"]
+    sample = {
+        "index": str(machine["gpu_index"]),
+        "uuid": machine["gpu_uuid"],
+        "name": machine["gpu_name"],
+        "pstate": machine["pstate"],
+        "clocks.sm": "1462",
+        "clocks.max.sm": str(machine["sm_clock_mhz"]),
+        "clocks_event_reasons.hw_slowdown": "Not Active",
+        "clocks_event_reasons.sw_thermal_slowdown": "Not Active",
+        "temperature.gpu": "30",
+        "temperature.gpu.tlimit": "60",
+        "power.draw.instant": "100",
+        "power.limit": str(machine["power_limit_w"]),
+        "ecc.errors.uncorrected.volatile.total": "0",
+        "ecc.errors.uncorrected.aggregate.total": "0",
+        "gpu_recovery_action": machine["recovery_action"],
+        "fabric.state": machine["fabric_state"],
+        "fabric.status": machine["fabric_status"],
+    }
+    failures: list[str] = []
+    validate_gpu_boundaries(
+        {"gpu_before_cuda": sample, "gpu_final": sample},
+        value,
+        "0",
+        "smoke",
+        "smoke.context10219.seq01",
+        failures,
+    )
+    assert failures == [
+        "smoke.context10219.seq01.gpu_final: clocks.sm='1462', expected '1965'"
+    ]
+    failures = []
+    sample["clocks.sm"] = str(machine["sm_clock_mhz"])
+    validate_gpu_boundaries(
+        {"gpu_before_cuda": {**sample, "clocks.sm": "1462"}, "gpu_final": sample},
+        value,
+        "0",
+        "smoke",
+        "smoke.context10219.seq01",
+        failures,
+    )
+    assert not failures
+    failures = []
+    unhealthy_before = {
+        **sample,
+        "clocks.sm": "1462",
+        "ecc.errors.uncorrected.volatile.total": "1",
+    }
+    validate_gpu_boundaries(
+        {"gpu_before_cuda": unhealthy_before, "gpu_final": sample},
+        value,
+        "0",
+        "smoke",
+        "smoke.context10219.seq01",
+        failures,
+    )
+    assert failures == [
+        "smoke.context10219.seq01.gpu_before_cuda."
+        "ecc.errors.uncorrected.volatile.total: observed '1', expected '0'"
+    ]

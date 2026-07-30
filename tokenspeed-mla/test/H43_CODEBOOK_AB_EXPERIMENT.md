@@ -955,3 +955,44 @@ request shape and concurrency before any promotion claim.
   synthetic 0.021-point mean regression fails. The focused 39-test suite,
   Python/JSON checks, targeted formatting, repository non-format hooks, and
   exact raw-evidence replays pass: `LGTM` for a new source-bound preparation.
+- Preparation 10 bound commit `94b8e8e4`, both exact images, source manifests,
+  and immutable 21-file AOT caches while the accepted endpoint remained
+  healthy. Qualification 7 passed every source, PDL-order, q1/q5 correctness,
+  raw-word, NCU-resource, memcheck, targeted-zero-hazard racecheck, initcheck,
+  cache-persistence, and Xid gate. All four A/A pilot processes completed with
+  zero contaminated pairs, but the pilot analyzer returned `NO_DECISION`
+  before authorizing a timing window because the two smoke `gpu_before_cuda`
+  samples reported instantaneous clocks of 1462 and 1597 MHz rather than 1965
+  MHz. Both samples were P0, retained the configured 1965 MHz maximum and 1200
+  W limit, reported no throttle event, and had clean ECC, recovery, and fabric
+  state. Both post-workload smoke samples were exactly 1965 MHz. Preflight
+  sequence-1 pre-CUDA samples independently showed the same normal idle-clock
+  behavior at 1080 and 840 MHz; their post-workload samples were 1965 MHz.
+  Both accepted ranks were restored, endpoint completion and all-GPU health
+  passed, no new Xid appeared, every timer was disarmed, and the complete local
+  archive was sealed. This is analyzer-contract `NO_DECISION`, not a reader or
+  pilot-statistics failure.
+- Hypothesis: the analyzer accidentally applied the steady-state smoke
+  telemetry predicate to the boundary intentionally captured before CUDA
+  initialization. Expected mechanism: no CUDA workload exists yet to hold the
+  instantaneous SM clock at its configured maximum. Exact change: require GPU
+  identity plus hard ECC/recovery/fabric health for every pre-CUDA sample, but
+  retain the existing strict P-state, clock, throttle, power, and temperature
+  predicate for the post-workload smoke sample. Preflight/decision behavior is
+  unchanged. Replaying the complete sealed Qualification 7 archive changes
+  only the two idle-clock failures: the pilot becomes `READY`, retains zero
+  contaminated pairs, measures sigma 0.006877 us/layer, selects the frozen
+  n=10 branch, and projects 0.001092 campaign invalidation probability and
+  278.36 seconds decision runtime. This replay diagnoses the rejected archive;
+  it does not retroactively authorize a decision window. A new signed source
+  identity, immutable preparation, and qualification campaign remain required.
+- Idle-boundary repair self-review pass 1 traced collection order and confirmed
+  that `gpu_before_cuda` is sampled before `Experiment` initializes CUDA, while
+  `gpu_final` follows the correctness workload. Pass 2 audited every analyzer
+  call site: only the pre-CUDA boundary changes; smoke final telemetry remains
+  strict, preflight/decision pair exclusion rules are unchanged, and missing or
+  hard-unhealthy pre-CUDA samples still fail closed. Pass 3 replayed the exact
+  six-result Qualification 7 archive, added positive idle-clock and negative
+  ECC-fault regressions, and rechecked the isolated diff. The focused 40-test
+  suite, Python checks, targeted formatting, repository non-format hooks, and
+  sealed-evidence replay pass: `LGTM` for a new source-bound preparation.
