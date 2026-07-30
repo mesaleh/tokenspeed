@@ -1,8 +1,9 @@
 """CPU contract tests for the native TurboQuant-4 MLA ABI."""
 
+from pathlib import Path
+
 import pytest
 import torch
-
 from tokenspeed_mla.tq4_contract import (
     TQ4_LATENT_DIM,
     dequantize_tq4_reference,
@@ -167,3 +168,21 @@ def test_validate_rejects_noncontiguous_packed_pages():
     inputs["kv_nope_packed"] = torch.empty(3, 32, 512, dtype=torch.uint8)[..., ::2]
     with pytest.raises(ValueError, match="kv_nope_packed must be contiguous"):
         validate_tq4_decode_inputs(**inputs, require_cuda=False)
+
+
+def test_codebook_page_table_and_global_loads_follow_raw_pipeline_wait():
+    source = (
+        Path(__file__).parents[1] / "python" / "tokenspeed_mla" / "mla_decode_fp8.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("    def convert_tq4_kv(")
+    end = source.index("\n    @cute.jit", start + 1)
+    body = source[start:end]
+
+    wait = body.index("common_params.raw_k_pipeline.consumer_wait")
+    page_table = body.index("page_table = common_params.mPT")
+    codebook_pointer = body.index("codebook_i32_ptr = cute.recast_ptr")
+    codebook_load = body.index(").load()", codebook_pointer)
+    centroid = body.index("common_params.mTQCentroids")
+
+    assert centroid < wait
+    assert wait < page_table < codebook_pointer < codebook_load

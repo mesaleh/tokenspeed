@@ -1,0 +1,13 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG H43_SOURCE_COMMIT
+ARG H43_SOURCE_ROLE
+LABEL com.omniva.h43.source_commit=${H43_SOURCE_COMMIT} \
+      com.omniva.h43.source_role=${H43_SOURCE_ROLE}
+
+COPY tokenspeed-mla /opt/h43/tokenspeed-mla
+RUN python3 -m pip install --no-build-isolation --no-deps --force-reinstall \
+      /opt/h43/tokenspeed-mla && \
+    rm -rf /opt/h43 /root/.cache/pip
+
+ENV PYTHONDONTWRITEBYTECODE=1

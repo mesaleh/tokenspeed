@@ -1,6 +1,6 @@
 # H43 D1 deployable codebook-reader A/B
 
-Status: revised plan and draft harness under review; no live run yet
+Status: implementation and maintenance harness under review; no live run yet
 Machine scope: CT13 GPU0 only for CUDA work. CT14 runs no experiment but its
 accepted rank is stopped and restored with CT13. CT15, CT16, and SecurityLLMs
 are excluded.
@@ -23,11 +23,19 @@ are excluded.
   `sha256:cc6fa1f338da513f9da20ee9310ba8dafbc964e2d9a6b7d528bdef9500c1920c`.
 - CT13 GPU0 UUID:
   `GPU-9f90e004-9332-4d9d-fa34-018fb9f07fca`.
+- Accepted restore identities are rank-local, not assumed identical: CT13 rank
+  0 container `03b4ce2c...` uses image `sha256:cc6fa1f3...`; CT14 rank 1
+  container `a64d7605...` uses image `sha256:d4171492...`. The executable
+  contract contains the complete IDs and refuses drift.
 
 Every source used in D1 must be in a pushed signed-off commit and in the
 committed SHA-256 source manifest before service is stopped. `a9af4c57` is the
-parent, not the eventual timed source; the final D1 TokenSpeed commit is added
-to the contract and this section after implementation review.
+parent, not the eventual timed source. Because a commit cannot contain its own
+hash, preparation writes the reviewed final D1 TokenSpeed commit to manifested
+`H43_SOURCE_COMMIT`, verifies the matching immutable image label, and records
+it in this section/evidence after implementation review. The executable
+contract pins the parent; its digest and the source-manifest digest bind the
+final timed tree without a self-referential hash.
 
 ## Corrected hypothesis
 
@@ -178,10 +186,15 @@ once after verifying its source, uses `PYTHONDONTWRITEBYTECODE=1` with no
 `__pycache__`/`.pyc`, builds the exact manifest-listed specialization tuples,
 and records cold wall time per key. The D1 set contains eight TQ keys—frozen
 `tq4_tiles_per_split` values 32/50 by q1/q5 by codebook false/true—plus dense
-q1/q5. Any unexpected CUDA
+q1/q5. Their `is_var_seq=True` and `is_persistent=False` fields are derived
+from the dense and TQ runtime APIs' shared production default rather than
+duplicated as an independent fixed-sequence choice. Any unexpected CUDA
 kernel launch or endpoint-health change aborts before maintenance. The compiler
 process exits before the service is stopped; exclusive empty-compute-app checks
 apply to qualification and decision CUDA execution, not this source-only build.
+The no-launch NCU proof requires connected and disconnected profiler banners,
+NCU's explicit `No kernels were profiled` result, zero metric rows, and no
+unrelated warning; silence or disabled performance counters fail closed.
 The prebuild serializes every dispatch-key field, performs a second source-only
 lookup of all ten tuples, and requires an identical artifact manifest before a
 service window is authorized.
@@ -196,7 +209,8 @@ in-process Python dispatch-key misses remain required. Stop and restart the
 unchanged experiment container during qualification to prove the bind mount
 survives. The very first qualification CUDA process recomputes the actual
 runtime dispatch tuples and must create zero new compiled artifacts; a miss
-immediately ends qualification and restores service rather than consuming the
+is compared against the entry artifact digest inside the process and
+immediately ends qualification, restoring service rather than consuming the
 remaining budget. Every decision process must see the qualification-close artifact
 manifest before CUDA initialization and after completion. A missing/new/changed
 compiled artifact yields `NO_DECISION` before performance analysis. The source
@@ -209,7 +223,8 @@ Run smoke only in qualification. Before any codebook-arm timing, each of the
 four fresh preflight processes runs 20 decision-replay-equivalent A/A pairs of
 the no-codebook graph, alternating pseudo-AB/BA order. This reveals no codebook
 contrast. For each context, take the larger of (a) the sample SD of its 40 A/A
-recoveries `(A1_us-A2_us)/14` and (b) the sample SD of its two process means;
+recoveries `(A1_us-A2_us)/14`, divided by `sqrt(20)` to put it on the
+20-pair process-mean scale, and (b) the sample SD of its two process means;
 define `sigma_pilot` as the worse of the two context values.
 The internal-pilot rule may only increase sample size: use `n=10` fresh
 decision processes per context when `sigma_pilot <= 1.0 us/layer`, and `n=14`
@@ -231,9 +246,14 @@ allocation-check replays before timing:
   first pair for even sequences;
 - compute each paired recovery as
   `(no_codebook_ring_us - codebook_ring_us) / 14`;
-- use the mean of the 20 paired recoveries as the process resampling unit;
+- use the equally weighted mean of the retained AB mean and retained BA mean
+  as the process resampling unit, so telemetry exclusions cannot reintroduce
+  order bias;
 - bracket the paired block with excluded 100-replay no-codebook sentinels and
-  require absolute sentinel drift at most 0.5% of ring time;
+  require absolute sentinel drift at most 0.5% of ring time when both
+  sentinels have valid transient telemetry. If either sentinel has a transient
+  P-state/clock/throttle/power reason, abstain from that process's drift gate;
+  identity, ECC, recovery, or fabric failures remain hard failures;
 - query excluded P-state, clock, throttle, power, and temperature telemetry
   before and after every pair. Exclude a pair if either sample is not P0/1965
   MHz, reports hardware-slowdown or software-thermal-slowdown active, has a
@@ -373,11 +393,16 @@ positive ordering test. Sanitizer is memory-access hygiene only.
 Requalify the reordered primitive before timing: run the Phase 18 exhaustive
 raw-word PRMT probe, q1/q5 eager/graph checks, and an excluded Nsight Compute
 LaunchStats/Occupancy capture on both the accepted pre-move build and the D1
-post-wait build. Require launch success and no D1 regression in registers per
-thread, static or dynamic SMEM, achieved occupancy, or theoretical occupancy;
-both builds must report zero local-memory spill loads and stores and at least
-one resident block per SM. Archive the exact comparative Nsight metrics in the
-source-manifest evidence. Nsight durations are excluded from every timing gate.
+post-wait build. Each of the 61 reader calls emits a split-KV kernel followed
+by a reduction kernel, so require the exact 122-launch alternating sequence and
+select calls 24-37 rather than raw launch IDs. Compare the 14 selected split-KV
+launches and 14 corresponding reduction launches as separate kernel classes.
+Require launch success and no D1 regression in registers per thread, static or
+dynamic SMEM, achieved occupancy, or theoretical occupancy for either class;
+both builds and classes must report zero local-memory spill loads and stores
+and at least one resident block per SM. Archive the exact comparative Nsight
+metrics in the source-manifest evidence. Nsight durations are excluded from
+every timing gate.
 
 ## Memory contract
 
@@ -407,6 +432,11 @@ with identical committed source, contract, cache-namespace rule, and procedure.
 A source, correctness, sanitizer, resource, cache-integrity, or machine-health
 failure cannot be retried under H43; it requires a new reviewed plan. The
 decision window is always single-shot.
+Immediately before arming a decision window, CT13 atomically creates a
+root-owned `O_EXCL` consumption record under the immutable preparation root,
+bound to the contract and decision-contract digests. Any later campaign name
+using that preparation state fails while the accepted endpoint is still live;
+operator naming cannot create an extra decision sample.
 
 1. **Qualification window**: source/idle checks, dedicated-cache verification,
    q1/q5 smoke, raw-word and comparative resource gates, all three sanitizer
@@ -418,8 +448,9 @@ decision window is always single-shot.
    neither absolute ring variance nor any post-codebook statistic can alter
    eligibility or `n`. Record every process wall time and compiled-artifact
    manifest. The projected decision runtime is
-   `1.2 * (2*n) * max(second-preflight wall time by context)` plus fixed launch
-   overhead and must fit the selected decision experiment budget: 20 minutes
+   `1.2 * (2*n) * (max(second-preflight wall time by context) + 2 seconds)`;
+   the frozen two seconds conservatively cover each fresh process launch. It
+   must fit the selected decision experiment budget: 20 minutes
    for n=10 or 28 minutes for n=14. Otherwise no decision window opens.
 2. **Decision window**: the internally selected and sealed `n` processes per
    context exactly once. No
@@ -439,10 +470,22 @@ decision attempt requires a new reviewed plan and reports every prior raw
 attempt; windows cannot be silently sampled until pass.
 
 Before stopping service, capture both container inspections, health, image
-identities, journal/Xid baseline, and accepted endpoint responses. The source
+identities, journal/Xid baseline, and accepted endpoint responses. Prove while
+the service is still live that `docker top -eo pid,args` contains the frozen
+rank-specific `--node-rank 0/1` process marker and that logs from the current
+container start contain the matching `node_rank=0/1` server marker; restore
+uses those same predicates. Re-query every GPU on CT13 and CT14 at the final
+pre-stop snapshot and require the same P0/1965 MHz, throttle, power-limit,
+ECC/recovery/fabric, name, and UUID-baseline predicates used after restoration;
+pre-existing machine drift therefore blocks the window. The source
 manifest covers every imported installed `tokenspeed_mla/*.py` file, every
 `/work` harness/contract/orchestrator file, the PDL source test, and the image
 digest—not merely the package path.
+Candidate/reference archives are uploaded only into a root-owned mode-0700
+directory under the preparation root, verified root-owned mode 0600 before
+privileged extraction, and deleted afterward. Build logs stream directly into
+the root-owned role directory; no predictable `/tmp` archive or build-log path
+feeds a privileged operation.
 
 Install and verify idempotent remote fail-safe units at experiment-budget plus
 five minutes: minute 25 for qualification or an n=10 decision and minute 33 for
@@ -453,11 +496,31 @@ only after every restore gate passes. Both
 explicit and fail-safe paths use the same rank-local `flock`, inspect the exact
 container ID/state, and start only the stopped accepted container, so a
 concurrent invocation is harmless.
-CT13 stops the named H43 container without removing it and polls until GPU0 has
-no compute process for 60 seconds. CT14 starts original rank 1. CT13 starts
+The fail-safe repeats every 60 seconds after its first deadline until
+validation disarms it. A separate terminal timer stops and resets the
+restore/alert timers at the contracted 44.75/40.75/48.75-minute bound, emits a
+final manual-escalation alert, and prevents an unbounded failed-unit loop. CT14
+publishes a random 256-bit nonce path on a
+temporary host HTTP listener only after the exact rank-1 container, process,
+and new-start log marker pass; CT13 refuses to start rank 0 without the exact
+nonce and rank-1 container ID. A pre-maintenance connectivity test opens and
+removes the same listener while the accepted endpoint remains online. The
+HTTP server's document root is the nonce-specific mode-0700 directory, so the
+parent cannot expose campaign nonces through a directory listing. The
+rank-0 restore script also stops only the exact manifested H43 experiment
+container before starting the accepted rank; a name/ID mismatch fails closed.
+After the candidate stop, the rank-0 restore script itself polls the contracted
+GPU index for three consecutive empty compute-process samples within the
+60-second GPU-idle timeout, covering both explicit and fail-safe restoration.
+If the exact accepted rank is already running, it skips that self-defeating
+idle wait. If an unknown process remains after the bound, it logs the hazard
+but still attempts to start the exact accepted rank rather than vetoing all
+future recovery.
+CT14 starts original rank 1. CT13 starts
 original rank 0 only after CT14's exact container and expected server process
 remain running and its log emits the accepted `server_args` marker with
-`node_rank=1`, all within 120 seconds; the dummy HTTP health server appears
+`node_rank=1`, all within 120 seconds. Marker publication then receives a fresh
+15-second deadline; the dummy HTTP health server appears
 only after distributed initialization and therefore cannot gate rank-0 startup.
 After both ranks start, allow at most 600 seconds for full HTTP health. Every
 poll loop and every `ssh`, `docker`, `curl`, completion, and health command has
@@ -468,11 +531,12 @@ This uses real predicates, never a fixed delay. The local orchestrator has a
 unconditional EXIT trap that invokes the same restore scripts.
 
 The maintenance alert target is minute 35 for qualification/n=10 and minute 43
-for n=14, without mutating service state. Qualification has a bounded 40-minute
-worst case; n=10 decision, 36; n=14 decision, 44. Each consists of the selected
-24/20/28-minute experiment timeout plus at most 1 minute for GPU-idle proof, 2
-for rank-1 readiness, 10 for HTTP health, and 3 for completion plus final
-health/archive checks. All command and poll timeouts guarantee a terminal
+for n=14, without mutating service state. Qualification has a bounded
+44.75-minute terminal result; n=10 decision, 40.75; n=14 decision, 48.75. Each
+combines the selected 24/20/28-minute experiment timeout with independently
+bounded rank-1 readiness/marker publication, rank-0 GPU-idle/marker/HTTP-health
+restoration, three minutes of final validation, and one minute of terminal
+margin. All command and poll timeouts guarantee a terminal
 restore result or escalation by the applicable bound; the alert is not
 mislabeled as a hard cap. Any
 staging, source-verification, idle, smoke, sanitizer,
@@ -481,8 +545,9 @@ analysis. During explicit restoration require both health checks, rank-0 model
 information, an independent exact 64-token completion, P0/max clock,
 ECC/recovery/fabric health, and no new Xid. Only after these pass cancel the
 restore fail-safe units, then cancel the alert. If validation fails,
-leave the fail-safe armed, preserve both original containers and logs, make no
-replacement container, and stop for owner escalation.
+leave the fail-safe armed only until the terminal cleanup bound, preserve both
+original containers and logs, make no replacement container, and stop for
+owner escalation.
 
 ## Advancement after D1 only
 
@@ -596,3 +661,33 @@ request shape and concurrency before any promotion claim.
   graph equivalence, threshold arithmetic, and restore bounds. The fixes are
   mutually consistent: `LGTM` for the plan. This does not approve the current
   quarantined draft code or any live run.
+- The first implementation review found eight substantive issues. This revision
+  corrects the two-kernel-per-call NCU model; puts pilot sigma on the
+  process-mean scale; equally weights retained AB/BA orders; makes transient
+  sentinel telemetry abstain rather than invalidate; proves live restore
+  predicates; uses the supported `docker top -eo pid,args` form; waits for an
+  idle CT13 GPU in the shared restore script; gives marker publication a fresh
+  deadline; and makes the source-only NCU proof require positive attach,
+  detach, and explicit no-kernel evidence. These implementation-driven plan
+  corrections require renewed code/plan review before any live window.
+- The fresh implementation review then found the runtime/prebuild dispatch
+  mismatch, a privileged predictable-`/tmp` staging race, nonce-parent listing,
+  delayed cache-miss detection, an imprecise sigma failure label, and a missing
+  programmatic single-shot interlock. This revision derives variable-sequence
+  dispatch flags from both runtime API defaults, uses root-owned preparation
+  staging/logs, scopes the marker server to the nonce directory, fails inside
+  the first process on cache drift, preserves the original pilot failure, and
+  atomically consumes the decision contract before a maintenance window can be
+  armed. Its restore-budget finding is also resolved by contract-derived rank
+  timeouts and enlarged terminal bounds.
+- The next Opus pass found remote-shell argument re-splitting, a recovery-veto
+  interaction in the GPU-idle proof, unbounded periodic restore timers, and a
+  too-late all-GPU clock check. This revision shell-quotes every remote-script
+  argument; skips the idle proof for an already running accepted rank and logs
+  rather than vetoes after a bounded busy wait; adds terminal cleanup units;
+  and applies the full final GPU predicate to every CT13/CT14 GPU immediately
+  before service stop.
+- The following stable-tree pass found that the pre-stop comparison executed
+  before its baseline capture. The baseline health/identity pass now occurs at
+  the start of `snapshot_and_verify`, followed by the live container snapshot
+  and second telemetry comparison; a regression test freezes that ordering.

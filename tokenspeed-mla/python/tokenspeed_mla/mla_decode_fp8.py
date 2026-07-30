@@ -66,6 +66,7 @@ from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
+    from .fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from .mla_helpers import (
         LOG2_E,
         MAX_SPLITS,
@@ -75,13 +76,13 @@ try:
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
     )
-    from .fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from .tq4_cutedsl import (
         copy_bulk_smem_to_dsmem,
         dequantize_tq4_word_to_fp8_shfl,
         lookup_tq4_word_from_fp8_codebook_prmt,
     )
 except ImportError:
+    from fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from mla_helpers import (
         LOG2_E,
         MAX_SPLITS,
@@ -91,7 +92,6 @@ except ImportError:
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
     )
-    from fmha_helpers import cvt_f32x4_to_f8x4_pack_i32
     from tq4_cutedsl import (
         copy_bulk_smem_to_dsmem,
         dequantize_tq4_word_to_fp8_shfl,
@@ -2306,7 +2306,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tidx, _, _ = cute.arch.thread_idx()
         local_tidx = tidx - self.tq4_conversion_warp_ids[0] * 32
         cta = common_params.blk_coord[0] % self.cluster_shape_mnk[0]
-        page_table = common_params.mPT[None, common_params.blk_coord[2]]
         packed_i32 = cute.recast_tensor(common_params.packed_k_stage, cutlass.Int32)
         # The fixed TQ4 ABI (page32, latent512) selects FP8 SW128
         # S<3,4,3>.  Recasting the composed tensor to Int32 permutes rows;
@@ -2325,6 +2324,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             dtype=cutlass.Int32,
         )
         raw_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
+        if cutlass.const_expr(common_params.mTQCodebook is not None):
+            centroid_lane = None
+        else:
+            # Centroids are immutable for the process lifetime and need no PDL
+            # dependency on the per-token writer.
+            centroid_lane = cutlass.Float32(common_params.mTQCentroids[local_tidx % 16])
+        common_params.load_k_pipeline.producer_acquire(output_k_producer_state)
+        common_params.load_v_pipeline.producer_acquire(output_v_producer_state)
+        common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
+
+        # The raw-load producer performs griddepcontrol_wait() before releasing
+        # this pipeline stage. Keep every mutable page-table/codebook load after
+        # consumer_wait so a PDL predecessor's codebook writes are ordered.
+        page_table = common_params.mPT[None, common_params.blk_coord[2]]
         if cutlass.const_expr(common_params.mTQCodebook is not None):
             codebook_word_lanes = cute.make_rmem_tensor(
                 cute.make_layout(8), cutlass.Int32
@@ -2349,13 +2362,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         + halfwarp_lane
                     ).load()
                 codebook_word_lanes[iteration] = codebook_word
-            centroid_lane = None
         else:
             codebook_word_lanes = None
-            centroid_lane = cutlass.Float32(common_params.mTQCentroids[local_tidx % 16])
-        common_params.load_k_pipeline.producer_acquire(output_k_producer_state)
-        common_params.load_v_pipeline.producer_acquire(output_v_producer_state)
-        common_params.raw_k_pipeline.consumer_wait(raw_consumer_state)
 
         for phase in cutlass.range_constexpr(4):
             for iteration in cutlass.range_constexpr(8):
