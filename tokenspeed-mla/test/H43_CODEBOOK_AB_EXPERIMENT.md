@@ -699,3 +699,21 @@ request shape and concurrency before any promotion claim.
   now creates and re-verifies a campaign-local tag for the exact accepted image
   ID before both builds; the endpoint remained healthy and no service window
   or source-only prebuild was consumed.
+- The second online-only preparation built the candidate image, then safely
+  failed its installed-source provenance check before compilation. The NGC
+  entrypoint writes its CUDA license banner to stdout, contaminating the
+  captured source manifest, installed-module digest, and eventual prebuild
+  JSON. Direct `--entrypoint python3` and `--entrypoint ncu` probes reproduced
+  clean machine-readable output. Preparation now bypasses the image entrypoint
+  for every captured Python/NCU command and immediately validates the complete
+  manifest, digest shape, and phase-tagged JSON. The rejected campaign is
+  retained as evidence; it consumed no service window or CUDA kernel launch,
+  and the accepted endpoint remained healthy.
+- Preparation-fix self-review pass 1 expanded the repair from the observed
+  digest failure to every stdout-captured machine-readable artifact and added
+  fail-closed format checks. Pass 2 exercised the corrected manifest, digest,
+  and NCU entrypoint forms against the immutable candidate image while the
+  accepted endpoint stayed healthy. Pass 3 traced verification ordering so no
+  contaminated manifest can select a cache and no malformed prebuild result can
+  enter identity evidence. The focused 24-test suite, Bash parse, diff checks,
+  targeted format hooks, and repository-wide non-format hooks pass: `LGTM`.

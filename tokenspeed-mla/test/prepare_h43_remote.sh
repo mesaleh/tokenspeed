@@ -125,19 +125,27 @@ for role in candidate reference; do
   printf '%s\n' "${image_id}" | sudo -n tee "${remote_root}/${role}/work/H43_IMAGE_ID" >/dev/null
   printf '%s\n' "${commit}" | sudo -n tee "${remote_root}/${role}/work/H43_SOURCE_COMMIT" >/dev/null
   printf '%s\n' "${role}" | sudo -n tee "${remote_root}/${role}/work/H43_SOURCE_ROLE" >/dev/null
-  sudo -n docker run --rm \
+  sudo -n docker run --rm --entrypoint python3 \
     --volume "${remote_root}/${role}/work:/work:ro" \
     "${image_id}" \
-    python3 /work/build_h43_source_manifest.py --work /work \
+    /work/build_h43_source_manifest.py --work /work \
     | sudo -n tee "${remote_root}/${role}/work/H43_D1_SOURCE_MANIFEST.sha256" >/dev/null
+  sudo -n docker run --rm --entrypoint sha256sum \
+    --volume "${remote_root}/${role}/work:/work:ro" \
+    "${image_id}" --check --strict /work/H43_D1_SOURCE_MANIFEST.sha256 \
+    >/dev/null
   manifest_digest=$(sudo -n sha256sum "${remote_root}/${role}/work/H43_D1_SOURCE_MANIFEST.sha256" | awk '{print $1}')
   cache_root="/var/lib/h43-codebook-cache/${manifest_digest}"
   sudo -n install -d -m 0755 "${cache_root}"
-  installed_sha=$(sudo -n docker run --rm "${image_id}" python3 -c \
+  installed_sha=$(sudo -n docker run --rm --entrypoint python3 "${image_id}" -c \
     'import hashlib,pathlib,tokenspeed_mla.mla_decode_fp8 as m; p=pathlib.Path(m.__file__); print(hashlib.sha256(p.read_bytes()).hexdigest())')
+  if [[ ! ${installed_sha} =~ ^[0-9a-f]{64}$ ]]; then
+    echo "H43 installed TokenSpeed MLA digest is not one SHA-256 value" >&2
+    exit 2
+  fi
   for phase in cold warm; do
     runtime=(
-      python3 /work/prebuild_h43_codebook_cache.py
+      /work/prebuild_h43_codebook_cache.py
       --contract /work/h43_codebook_ab_contract.json
       --cache-root "${cache_root}"
       --source-manifest-digest "${manifest_digest}"
@@ -153,19 +161,23 @@ for role in candidate reference; do
       --volume "${cache_root}:${cache_root}" \
     )
     if [[ ${phase} == cold ]]; then
-      "${container_prefix[@]}" "${image_id}" "${runtime[@]}" \
+      "${container_prefix[@]}" --entrypoint python3 "${image_id}" \
+        "${runtime[@]}" \
         | sudo -n tee "${remote_root}/${role}/prebuild-${phase}.json" >/dev/null
     else
-      "${container_prefix[@]}" --cap-add SYS_ADMIN \
+      "${container_prefix[@]}" --entrypoint ncu --cap-add SYS_ADMIN \
         --volume "${remote_root}/${role}:/evidence" \
-        "${image_id}" ncu --section LaunchStats --csv \
+        "${image_id}" --section LaunchStats --csv \
           --log-file /evidence/prebuild-warm-ncu.csv \
-          "${runtime[@]}" \
+          python3 "${runtime[@]}" \
         | sudo -n tee "${remote_root}/${role}/prebuild-${phase}.json" >/dev/null
       sudo -n python3 "${remote_root}/candidate/source/tokenspeed-mla/test/check_h43_no_kernel_launch.py" \
         --ncu-log "${remote_root}/${role}/prebuild-warm-ncu.csv" \
         | sudo -n tee "${remote_root}/${role}/prebuild-no-kernel.json" >/dev/null
     fi
+    sudo -n python3 -c \
+      'import json,sys; value=json.load(open(sys.argv[1],encoding="utf-8")); sys.exit(0 if value.get("status") == "PASS" and value.get("phase") == sys.argv[2] else "invalid H43 prebuild evidence")' \
+      "${remote_root}/${role}/prebuild-${phase}.json" "${phase}"
     curl -fsS --max-time 10 "${health_url}" >/dev/null
   done
   cache_digest=$(sudo -n python3 -c \

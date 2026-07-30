@@ -183,6 +183,17 @@ def test_preparation_has_no_privileged_predictable_tmp_staging():
     assert '--build-arg "BASE_IMAGE=${base_tag}"' in source
 
 
+def test_preparation_capture_commands_bypass_noisy_image_entrypoint():
+    source = (ROOT / "prepare_h43_remote.sh").read_text(encoding="utf-8")
+    assert source.count("--entrypoint python3") == 3
+    assert source.count("--entrypoint ncu") == 1
+    assert source.count("--entrypoint sha256sum") == 1
+    assert '"${image_id}" ncu ' not in source
+    assert '"${image_id}" python3 ' not in source
+    assert "installed TokenSpeed MLA digest is not one SHA-256 value" in source
+    assert "invalid H43 prebuild evidence" in source
+
+
 def test_decision_window_has_remote_atomic_single_use_marker():
     source = (ROOT / "run_h43_maintenance.py").read_text(encoding="utf-8")
     assert "DECISION_WINDOW_CONSUMED.json" in source
