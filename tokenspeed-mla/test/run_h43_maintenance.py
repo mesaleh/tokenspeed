@@ -912,7 +912,7 @@ exit 1
             raise RuntimeError("docker did not start the exact candidate container")
 
     def exec_candidate(
-        self, arguments: list[str], timeout: int
+        self, arguments: list[str], timeout: int, *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         if self.container_id is None:
             raise RuntimeError("candidate container has not started")
@@ -920,6 +920,7 @@ exit 1
             self.host0,
             ["docker", "exec", self.container_id, *arguments],
             timeout=timeout,
+            check=check,
         )
 
     def remaining_experiment_seconds(self) -> int:
@@ -1143,7 +1144,7 @@ exit 1
 
     def run_sanitizers(self) -> None:
         timeout = self.contract["timeouts_seconds"]["sanitizer_each"]
-        for tool in ("memcheck", "racecheck", "initcheck"):
+        for tool in ("memcheck", "initcheck"):
             command = [
                 "timeout",
                 "--signal=TERM",
@@ -1153,7 +1154,7 @@ exit 1
                 "--tool",
                 tool,
                 "--error-exitcode",
-                "86",
+                str(self.contract["sanitizers"]["error_exit_code"]),
                 "--target-processes",
                 "all",
                 "python3",
@@ -1165,7 +1166,7 @@ exit 1
                 "--sequence",
                 "1",
             ]
-            result = self.exec_candidate(command, timeout=timeout + 30)
+            result = self.exec_candidate(command, timeout=timeout + 30, check=False)
             log = f"sanitizer-{tool}.log"
             write_remote_root_file(
                 self.host0,
@@ -1173,7 +1174,165 @@ exit 1
                 result.stdout + result.stderr,
                 "0644",
             )
+            if result.returncode:
+                raise RuntimeError(
+                    f"{tool} failed ({result.returncode}); preserved {log}"
+                )
             self.write_gate(f"sanitizer_{tool}", [log], [shlex.join(command)])
+
+        probe = [
+            "python3",
+            "/work/probe_h43_tq_racecheck.py",
+            "--contract",
+            "/work/h43_codebook_ab_contract.json",
+            "--context",
+            str(self.resource_context),
+            "--sequence",
+            "1",
+        ]
+        common = [
+            "compute-sanitizer",
+            "--tool",
+            "racecheck",
+            "--error-exitcode",
+            str(self.contract["sanitizers"]["error_exit_code"]),
+            "--target-processes",
+            "all",
+        ]
+        reference_name = f"ct13-h43-race-reference-{self.campaign}"
+        reference_command = [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=15s",
+            f"{timeout}s",
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            reference_name,
+            "--gpus",
+            f'"device={self.gpu_index}"',
+            "--cap-add",
+            "SYS_ADMIN",
+            "--ipc",
+            "host",
+            "--env",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "--env",
+            f"CUTE_DSL_CACHE_DIR={self.reference['cache_root']}",
+            "--env",
+            f"H43_AOT_MANIFEST={self.reference['cache_root']}/h43-aot-manifest.json",
+            "--env",
+            f"H43_AOT_EXPECTED_ENTRIES={self.contract['cache']['dense_dispatch_keys'] + self.contract['cache']['tq_dispatch_keys']}",
+            "--env",
+            f"H43_SOURCE_MANIFEST_DIGEST={self.reference['source_manifest_digest']}",
+            "--env",
+            f"H43_INSTALLED_MLA_SHA256={self.reference['installed_mla_sha256']}",
+            "--volume",
+            f"{self.reference_work}:/work:ro",
+            "--volume",
+            f"{self.reference['cache_root']}:{self.reference['cache_root']}:ro",
+            "--volume",
+            f"{self.results}:/results",
+            self.reference["image_id"],
+            *common,
+            "--log-file",
+            "/results/sanitizer-racecheck-reference.log",
+            *probe,
+        ]
+        try:
+            reference_result = remote(
+                self.host0,
+                reference_command,
+                timeout=timeout + 30,
+                check=False,
+            )
+        finally:
+            remote(
+                self.host0,
+                ["docker", "rm", "--force", reference_name],
+                timeout=60,
+                check=False,
+            )
+        reference_target = "sanitizer-racecheck-reference-target.log"
+        write_remote_root_file(
+            self.host0,
+            f"{self.results}/{reference_target}",
+            reference_result.stdout + reference_result.stderr,
+            "0644",
+        )
+        if reference_result.returncode:
+            raise RuntimeError(
+                "reference racecheck failed "
+                f"({reference_result.returncode}); preserved {reference_target}"
+            )
+
+        candidate_command = [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=15s",
+            f"{timeout}s",
+            *common,
+            "--log-file",
+            "/results/sanitizer-racecheck-candidate.log",
+            *probe,
+        ]
+        candidate_result = self.exec_candidate(
+            candidate_command,
+            timeout=timeout + 30,
+            check=False,
+        )
+        candidate_target = "sanitizer-racecheck-candidate-target.log"
+        write_remote_root_file(
+            self.host0,
+            f"{self.results}/{candidate_target}",
+            candidate_result.stdout + candidate_result.stderr,
+            "0644",
+        )
+        if candidate_result.returncode:
+            raise RuntimeError(
+                "candidate racecheck failed "
+                f"({candidate_result.returncode}); preserved {candidate_target}"
+            )
+
+        comparison = "sanitizer-racecheck-comparison.json"
+        compare_command = [
+            "python3",
+            f"{self.work}/check_h43_racecheck.py",
+            "--contract",
+            f"{self.work}/h43_codebook_ab_contract.json",
+            "--context",
+            str(self.resource_context),
+            "--reference-log",
+            f"{self.results}/sanitizer-racecheck-reference.log",
+            "--candidate-log",
+            f"{self.results}/sanitizer-racecheck-candidate.log",
+            "--reference-target",
+            f"{self.results}/{reference_target}",
+            "--candidate-target",
+            f"{self.results}/{candidate_target}",
+            "--reference-exit-code",
+            str(reference_result.returncode),
+            "--candidate-exit-code",
+            str(candidate_result.returncode),
+        ]
+        shell = f"{shlex.join(compare_command)} > {self.results}/{comparison}"
+        remote(self.host0, ["bash", "-lc", shell], timeout=120)
+        self.write_gate(
+            "sanitizer_racecheck",
+            [
+                "sanitizer-racecheck-reference.log",
+                "sanitizer-racecheck-candidate.log",
+                reference_target,
+                candidate_target,
+                comparison,
+            ],
+            [
+                shlex.join(reference_command),
+                "docker exec CANDIDATE " + shlex.join(candidate_command),
+                shlex.join(compare_command),
+            ],
+        )
 
     def cache_persistence(self) -> None:
         if self.container_id is None:

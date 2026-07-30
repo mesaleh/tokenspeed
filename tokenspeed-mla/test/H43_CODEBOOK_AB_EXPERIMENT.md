@@ -874,3 +874,50 @@ request shape and concurrency before any promotion claim.
   selection, summary, and comparison, and rechecked the unchanged timeout and
   restoration arithmetic. Focused tests, Python/JSON checks, formatting, and
   the repository's non-format file hooks pass: `LGTM`.
+- The fifth qualification campaign passed source identity, PDL source order,
+  q1/q5 eager and graph correctness at both frozen contexts, the raw-word
+  probe, the full 122-launch reference/candidate NCU comparison, and memcheck.
+  Racecheck then exited with its configured error code after reporting 83
+  shared-memory errors from the mixed 61-layer probe. Because the runner raised
+  before writing the combined output, the failed-campaign tar retained no
+  racecheck log even though the terminal trace contained the summary. Both
+  exact accepted ranks were restored, endpoint completion and all-GPU health
+  checks passed, no new Xid appeared, and every timer was disarmed. The result
+  is `NO_DECISION`; it is neither a reader defect nor a qualification pass.
+- Hypothesis: the racecheck report belongs to H43's newly ordered codebook
+  loads. Expected mechanism: moving mutable global reads after
+  `raw_k_pipeline.consumer_wait` could alter synchronization visible in the q5
+  split kernel. Exact control: Compute Sanitizer 2025.2.1 ran the frozen parent
+  and candidate images with identical context 37932 inputs and the full mixed
+  probe. Both produced the same 83-error shared-memory pattern at the same
+  split-kernel instruction offsets; the candidate additionally hit the tool's
+  hazard-report cap. This rules out H43 as the origin but does not make a
+  capped whole-ring comparison an acceptable gate. NVIDIA's release notes also
+  document multiple subsequent Blackwell/mbarrier racecheck fixes, reinforcing
+  the need to isolate the changed path rather than suppress reports:
+  https://docs.nvidia.com/cuda/developer-preview/13.4/compute-sanitizer/ReleaseNotes/index.html
+- Follow-up hypothesis: dense calls in the mixed probe, not q5 codebook calls,
+  generate the baseline. Exact change: run one deterministic q5 codebook call
+  with no dense call under racecheck, independently for the frozen parent and
+  candidate. Both completed in 58-59 seconds with exactly zero hazards, zero
+  errors, and zero warnings; their target logs were identical. Decision: retain
+  an absolute zero-hazard requirement and replace the polluted mixed racecheck
+  target with this source-bound q5-only probe. The sealed gate will execute
+  both reference and candidate, require matching codebook/output digests, and
+  preserve every target log before raising on a nonzero tool exit. Memcheck and
+  initcheck continue to use the full correctness/resource probe. The online
+  controls are tooling evidence only and do not substitute for a new immutable
+  preparation and qualification campaign.
+- Racecheck repair self-review pass 1 traced every reported instruction back
+  to the mixed probe and confirmed that the new target executes the modified
+  q5 split/reduction path without a dense MLA call. Pass 2 made the evidence
+  fail closed on unexpected diagnostics, target-schema or digest drift,
+  reference/candidate output drift, and nonzero exits; it also moved the common
+  sanitizer error code out of the racecheck-specific contract. Pass 3 verified
+  that failed memcheck/initcheck output is written before raising, both
+  racecheck logs are mounted directly into the sealed results directory, the
+  exact parent image and AOT cache are bound in the recorded command, and the
+  qualification still requires all three sanitizer gates. The focused 38-test
+  suite, Python/JSON checks, targeted formatting, all repository non-format
+  hooks, and real parent/candidate zero-hazard logs pass: `LGTM` for a new
+  source-bound preparation.

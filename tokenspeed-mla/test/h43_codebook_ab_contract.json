@@ -183,6 +183,16 @@
       "smsp__inst_executed_op_local_st.sum"
     ]
   },
+  "racecheck": {
+    "required_errors": 0,
+    "required_hazards": 0,
+    "required_warnings": 0,
+    "target_query_length": 1,
+    "target_tq_calls": 1
+  },
+  "sanitizers": {
+    "error_exit_code": 86
+  },
   "timeouts_seconds": {
     "command": 60,
     "case_process": 900,

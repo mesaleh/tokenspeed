@@ -18,6 +18,8 @@ from analyze_h43_codebook_ab import (
     validate_qualification_gates,
 )
 from check_h43_no_kernel_launch import validate_ncu_no_kernel_launch
+from check_h43_racecheck import load_racecheck_log, load_target_log
+from check_h43_racecheck import main as check_racecheck_main
 from compare_h43_ncu import load_ncu
 from h43_aot_loader import (
     AOT_MANIFEST_NAME,
@@ -201,6 +203,150 @@ def test_no_kernel_ncu_proof_requires_positive_profiler_evidence():
         validate_ncu_no_kernel_launch("==WARNING== No kernels were profiled.\n")
 
 
+def test_racecheck_gate_requires_an_exact_zero_hazard_summary(tmp_path):
+    value = contract()
+    path = tmp_path / "racecheck.log"
+    path.write_text(
+        "========= COMPUTE-SANITIZER\n"
+        "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n",
+        encoding="utf-8",
+    )
+    observed = load_racecheck_log(path, value)
+    assert observed["hazards"] == observed["errors"] == observed["warnings"] == 0
+
+    path.write_text(
+        "========= COMPUTE-SANITIZER\n"
+        "========= Warning: Maximum number of hazards reached.\n"
+        "========= RACECHECK SUMMARY: 1 hazards displayed (0 errors, 1 warnings)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="racecheck summary"):
+        load_racecheck_log(path, value)
+
+    path.write_text(
+        "========= COMPUTE-SANITIZER\n"
+        "unexpected informational line\n"
+        "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unexpected racecheck diagnostic"):
+        load_racecheck_log(path, value)
+
+
+def test_racecheck_target_result_is_digest_and_contract_bound(tmp_path):
+    value = contract()
+    target = {
+        "schema_version": 1,
+        "status": "PASS",
+        "experiment": value["experiment"],
+        "contract_digest": canonical_json_digest(value),
+        "context": 37932,
+        "sequence": 1,
+        "query_length": value["racecheck"]["target_query_length"],
+        "target_tq_calls": value["racecheck"]["target_tq_calls"],
+        "codebook_sha256": "a" * 64,
+        "output_sha256": "b" * 64,
+        "output_finite": True,
+    }
+    target["result_digest"] = canonical_json_digest(target)
+    path = tmp_path / "target.log"
+    path.write_text(
+        "NGC entrypoint banner\n" + json.dumps(target, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert load_target_log(path, value, 37932)["output_sha256"] == "b" * 64
+    target["context"] = 10219
+    path.write_text(json.dumps(target) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        load_target_log(path, value, 37932)
+
+
+def test_racecheck_comparison_rejects_output_drift_and_nonzero_exit(
+    tmp_path, monkeypatch
+):
+    value = contract()
+    summary = (
+        "========= COMPUTE-SANITIZER\n"
+        "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n"
+    )
+    reference_log = tmp_path / "reference-racecheck.log"
+    candidate_log = tmp_path / "candidate-racecheck.log"
+    reference_log.write_text(summary, encoding="utf-8")
+    candidate_log.write_text(summary, encoding="utf-8")
+
+    def write_target(path, output_sha256):
+        target = {
+            "schema_version": 1,
+            "status": "PASS",
+            "experiment": value["experiment"],
+            "contract_digest": canonical_json_digest(value),
+            "context": 37932,
+            "sequence": 1,
+            "query_length": value["racecheck"]["target_query_length"],
+            "target_tq_calls": value["racecheck"]["target_tq_calls"],
+            "codebook_sha256": "a" * 64,
+            "output_sha256": output_sha256,
+            "output_finite": True,
+        }
+        target["result_digest"] = canonical_json_digest(target)
+        path.write_text(json.dumps(target) + "\n", encoding="utf-8")
+
+    reference_target = tmp_path / "reference-target.log"
+    candidate_target = tmp_path / "candidate-target.log"
+    write_target(reference_target, "b" * 64)
+    write_target(candidate_target, "c" * 64)
+    arguments = [
+        "check_h43_racecheck.py",
+        "--contract",
+        str(CONTRACT_PATH),
+        "--context",
+        "37932",
+        "--reference-log",
+        str(reference_log),
+        "--candidate-log",
+        str(candidate_log),
+        "--reference-target",
+        str(reference_target),
+        "--candidate-target",
+        str(candidate_target),
+        "--reference-exit-code",
+        "0",
+        "--candidate-exit-code",
+        "0",
+    ]
+    monkeypatch.setattr("sys.argv", arguments)
+    with pytest.raises(ValueError, match="output_sha256 mismatch"):
+        check_racecheck_main()
+
+    arguments[-1] = "86"
+    monkeypatch.setattr("sys.argv", arguments)
+    with pytest.raises(ValueError, match="exit codes must both be zero"):
+        check_racecheck_main()
+
+
+def test_racecheck_probe_and_runner_are_tq_only_and_preserve_failures():
+    value = contract()
+    probe = (ROOT / "probe_h43_tq_racecheck.py").read_text(encoding="utf-8")
+    runner = (ROOT / "run_h43_maintenance.py").read_text(encoding="utf-8")
+    method = runner[
+        runner.index("    def run_sanitizers") : runner.index(
+            "    def cache_persistence"
+        )
+    ]
+    assert value["racecheck"]["target_tq_calls"] == 1
+    assert "experiment.tq_call(" in probe
+    assert "use_codebook=True" in probe
+    assert "experiment.correctness()" not in probe
+    assert "experiment.dense_call(" not in probe
+    assert method.count("probe_h43_tq_racecheck.py") == 1
+    assert "sanitizer-racecheck-reference.log" in method
+    assert "sanitizer-racecheck-candidate.log" in method
+    assert method.count("check=False") >= 4
+    assert method.index("write_remote_root_file(") < method.index(
+        "if result.returncode:"
+    )
+
+
 def test_restore_scripts_use_verified_predicates_and_fresh_marker_deadline():
     rank0 = (ROOT / "restore_h43_rank0.sh").read_text(encoding="utf-8")
     rank1 = (ROOT / "restore_h43_rank1.sh").read_text(encoding="utf-8")
@@ -376,9 +522,9 @@ def test_h43_runtime_is_wired_to_exact_aot_manifest():
     assert "compiled.export_to_c" in prebuild
     assert "find_runtime_libraries(enable_tvm_ffi=True)" in prebuild
     assert "install_h43_aot_from_environment()" in benchmark
-    assert runner.count("H43_AOT_MANIFEST=") == 2
-    assert runner.count("H43_AOT_EXPECTED_ENTRIES=") == 2
-    assert runner.count("['cache_root']}:ro") == 2
+    assert runner.count("H43_AOT_MANIFEST=") == 3
+    assert runner.count("H43_AOT_EXPECTED_ENTRIES=") == 3
+    assert runner.count("['cache_root']}:ro") == 3
     preparation = (ROOT / "prepare_h43_remote.sh").read_text(encoding="utf-8")
     assert '"${cache_root}:${cache_root}:ro"' in preparation
 
