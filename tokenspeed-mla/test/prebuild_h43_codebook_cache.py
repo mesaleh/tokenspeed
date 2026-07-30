@@ -7,22 +7,27 @@ import argparse
 import inspect
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+import tokenspeed_mla.mla_decode as mla_decode
 import torch
+from h43_aot_loader import (
+    AOT_MANIFEST_NAME,
+    dispatch_key,
+    install_h43_aot_from_environment,
+    load_aot_manifest,
+    write_aot_manifest,
+)
 from h43_codebook_ab_common import (
     canonical_json_digest,
     compiled_artifact_manifest,
     load_contract,
     sha256_file,
 )
-from tokenspeed_mla.mla_decode import (
-    _get_compiled_mla_kernel,
-    tokenspeed_mla_decode,
-    tokenspeed_mla_decode_tq4,
-)
+from tokenspeed_mla.mla_decode import tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +86,53 @@ def serializable(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def export_aot_kernel(
+    *,
+    compiled: Any,
+    cache_root: Path,
+    label: str,
+    key: str,
+) -> dict[str, Any]:
+    from cutlass import cute
+
+    function_name = f"h43_{label.replace('-', '_')}"
+    object_dir = cache_root / "objects"
+    library_dir = cache_root / "libraries"
+    object_dir.mkdir(exist_ok=True)
+    library_dir.mkdir(exist_ok=True)
+    object_path = object_dir / f"{function_name}.o"
+    library_path = library_dir / f"{function_name}.so"
+    temporary_object = object_dir / f".tmp-{function_name}.o"
+    temporary_library = library_dir / f".tmp-{function_name}.so"
+    if object_path.exists() or library_path.exists():
+        raise RuntimeError(f"H43 AOT artifact already exists for {label}")
+    compiled.export_to_c(str(temporary_object), function_name=function_name)
+    runtime_libraries = cute.runtime.find_runtime_libraries(enable_tvm_ffi=True)
+    subprocess.run(
+        [
+            "gcc",
+            "-shared",
+            "-o",
+            str(temporary_library),
+            str(temporary_object),
+            *runtime_libraries,
+        ],
+        check=True,
+        timeout=120,
+    )
+    os.replace(temporary_object, object_path)
+    os.replace(temporary_library, library_path)
+    return {
+        "dispatch_key": key,
+        "label": label,
+        "function_name": function_name,
+        "object": object_path.relative_to(cache_root).as_posix(),
+        "object_sha256": sha256_file(object_path),
+        "library": library_path.relative_to(cache_root).as_posix(),
+        "library_sha256": sha256_file(library_path),
+    }
+
+
 def main() -> None:
     args = parse_args()
     contract = load_contract(args.contract.resolve())
@@ -99,6 +151,12 @@ def main() -> None:
     ).resolve()
     if sha256_file(imported) != args.installed_mla_sha256:
         raise RuntimeError("installed mla_decode_fp8.py digest mismatch")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError("H43 prebuild requires exactly one visible CUDA device")
+    torch.cuda.set_device(0)
+    torch.cuda.init()
+    if torch.cuda.current_device() != 0:
+        raise RuntimeError("H43 prebuild failed to bind visible CUDA device 0")
     before = compiled_artifact_manifest(cache_root, contract["cache"])
     if args.phase == "cold" and before["files"]:
         raise RuntimeError("cold prebuild requires an empty cache namespace")
@@ -130,15 +188,31 @@ def main() -> None:
     if len(keys) != expected_count:
         raise RuntimeError(f"prebuild key count {len(keys)} != {expected_count}")
 
+    getter = mla_decode._get_compiled_mla_kernel
+    if args.phase == "warm":
+        getter = install_h43_aot_from_environment(expected_count)
+
     evidence: list[dict[str, Any]] = []
+    aot_entries: dict[str, dict[str, Any]] = {}
     for label, arguments in keys:
-        cache_before = _get_compiled_mla_kernel.cache_info()
+        cache_before = getter.cache_info()
         started = time.monotonic()
-        _get_compiled_mla_kernel(**arguments)
+        compiled = getter(**arguments)
         elapsed = time.monotonic() - started
-        cache_after = _get_compiled_mla_kernel.cache_info()
+        cache_after = getter.cache_info()
         if cache_after.misses - cache_before.misses != 1:
             raise RuntimeError(f"{label} did not create one fresh dispatch entry")
+        key = dispatch_key(mla_decode._get_compiled_mla_kernel, **arguments)
+        if args.phase == "cold":
+            entry = export_aot_kernel(
+                compiled=compiled,
+                cache_root=cache_root,
+                label=label,
+                key=key,
+            )
+            if key in aot_entries:
+                raise RuntimeError(f"duplicate H43 AOT dispatch key for {label}")
+            aot_entries[key] = entry
         evidence.append(
             {
                 "label": label,
@@ -149,7 +223,26 @@ def main() -> None:
                 ),
             }
         )
+    if args.phase == "cold":
+        write_aot_manifest(
+            cache_root / AOT_MANIFEST_NAME,
+            experiment=contract["experiment"],
+            source_manifest_digest=args.source_manifest_digest,
+            installed_mla_sha256=args.installed_mla_sha256,
+            entries=aot_entries,
+        )
+    load_aot_manifest(
+        cache_root / AOT_MANIFEST_NAME,
+        expected_source_manifest_digest=args.source_manifest_digest,
+        expected_installed_mla_sha256=args.installed_mla_sha256,
+        expected_entries=expected_count,
+    )
     after = compiled_artifact_manifest(cache_root, contract["cache"])
+    expected_artifacts = 2 * expected_count + 1
+    if len(after["files"]) != expected_artifacts:
+        raise RuntimeError(
+            f"H43 AOT artifact count {len(after['files'])} != {expected_artifacts}"
+        )
     if args.phase == "warm" and before["digest"] != after["digest"]:
         raise RuntimeError("warm prebuild created or changed a compiled artifact")
     result = {

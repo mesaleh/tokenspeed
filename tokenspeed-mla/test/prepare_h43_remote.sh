@@ -158,15 +158,19 @@ for role in candidate reference; do
       --env PYTHONDONTWRITEBYTECODE=1 \
       --env "CUTE_DSL_CACHE_DIR=${cache_root}" \
       --volume "${remote_root}/${role}/work:/work:ro" \
-      --volume "${cache_root}:${cache_root}" \
     )
     if [[ ${phase} == cold ]]; then
-      "${container_prefix[@]}" --entrypoint python3 "${image_id}" \
+      "${container_prefix[@]}" --volume "${cache_root}:${cache_root}" \
+        --entrypoint python3 "${image_id}" \
         "${runtime[@]}" \
         | sudo -n tee "${remote_root}/${role}/prebuild-${phase}.json" >/dev/null
     else
       "${container_prefix[@]}" --entrypoint ncu --cap-add SYS_ADMIN \
+        --env "H43_AOT_MANIFEST=${cache_root}/h43-aot-manifest.json" \
+        --env "H43_SOURCE_MANIFEST_DIGEST=${manifest_digest}" \
+        --env "H43_INSTALLED_MLA_SHA256=${installed_sha}" \
         --volume "${remote_root}/${role}:/evidence" \
+        --volume "${cache_root}:${cache_root}:ro" \
         "${image_id}" --section LaunchStats --csv \
           --log-file /evidence/prebuild-warm-ncu.csv \
           python3 "${runtime[@]}" \

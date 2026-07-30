@@ -18,6 +18,15 @@ from analyze_h43_codebook_ab import (
 )
 from check_h43_no_kernel_launch import validate_ncu_no_kernel_launch
 from compare_h43_ncu import load_ncu
+from h43_aot_loader import (
+    AOT_MANIFEST_NAME,
+    dispatch_key,
+    load_aot_manifest,
+)
+from h43_aot_loader import sha256_file as aot_sha256_file
+from h43_aot_loader import (
+    write_aot_manifest,
+)
 from h43_codebook_ab_common import (
     canonical_json_digest,
     compiled_artifact_manifest,
@@ -171,6 +180,121 @@ def test_prebuild_derives_production_variable_sequence_dispatch_flags():
     assert "inspect.signature(tokenspeed_mla_decode_tq4)" in source
     assert '"is_persistent": not is_var_seq' in source
     assert '"is_var_seq": is_var_seq' in source
+
+
+def test_prebuild_initializes_exactly_one_visible_cuda_device_before_compile():
+    source = (ROOT / "prebuild_h43_codebook_cache.py").read_text(encoding="utf-8")
+    count = source.index("torch.cuda.device_count() != 1")
+    initialize = source.index("torch.cuda.init()")
+    compile_call = source.index("compiled = getter(**arguments)")
+    assert count < initialize < compile_call
+    assert "torch.cuda.set_device(0)" in source
+    assert "torch.cuda.current_device() != 0" in source
+
+
+def test_aot_dispatch_key_binds_defaults_and_keyword_order():
+    def sample(alpha, beta=0.5, *, enabled=True):
+        return alpha, beta, enabled
+
+    first = dispatch_key(sample, 7, enabled=False)
+    second = dispatch_key(sample, enabled=False, alpha=7, beta=0.5)
+    assert first == second
+    assert first != dispatch_key(sample, 7, enabled=True)
+
+
+def test_aot_manifest_seals_source_and_artifacts(tmp_path):
+    root = tmp_path / "aot"
+    objects = root / "objects"
+    libraries = root / "libraries"
+    objects.mkdir(parents=True)
+    libraries.mkdir()
+    object_path = objects / "h43_dense_q1.o"
+    library_path = libraries / "h43_dense_q1.so"
+    object_path.write_bytes(b"object")
+    library_path.write_bytes(b"library")
+    key = "a" * 64
+    entry = {
+        "dispatch_key": key,
+        "label": "dense-q1",
+        "function_name": "h43_dense_q1",
+        "object": "objects/h43_dense_q1.o",
+        "object_sha256": aot_sha256_file(object_path),
+        "library": "libraries/h43_dense_q1.so",
+        "library_sha256": aot_sha256_file(library_path),
+    }
+    source_digest = "b" * 64
+    installed_digest = "c" * 64
+    manifest_path = root / AOT_MANIFEST_NAME
+    write_aot_manifest(
+        manifest_path,
+        experiment="H43_D1_CODEBOOK_READER_AB",
+        source_manifest_digest=source_digest,
+        installed_mla_sha256=installed_digest,
+        entries={key: entry},
+    )
+    loaded = load_aot_manifest(
+        manifest_path,
+        expected_source_manifest_digest=source_digest,
+        expected_installed_mla_sha256=installed_digest,
+        expected_entries=1,
+    )
+    assert loaded["entries"][key] == entry
+    library_path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="artifact digest mismatch"):
+        load_aot_manifest(
+            manifest_path,
+            expected_source_manifest_digest=source_digest,
+            expected_installed_mla_sha256=installed_digest,
+            expected_entries=1,
+        )
+
+
+def test_aot_manifest_rejects_artifact_path_traversal(tmp_path):
+    root = tmp_path / "aot"
+    root.mkdir()
+    escaped_object = tmp_path / "escaped.o"
+    escaped_object.write_bytes(b"object")
+    library_path = root / "library.so"
+    library_path.write_bytes(b"library")
+    key = "d" * 64
+    write_aot_manifest(
+        root / AOT_MANIFEST_NAME,
+        experiment="H43_D1_CODEBOOK_READER_AB",
+        source_manifest_digest="e" * 64,
+        installed_mla_sha256="f" * 64,
+        entries={
+            key: {
+                "dispatch_key": key,
+                "label": "dense-q1",
+                "function_name": "h43_dense_q1",
+                "object": "../escaped.o",
+                "object_sha256": aot_sha256_file(escaped_object),
+                "library": "library.so",
+                "library_sha256": aot_sha256_file(library_path),
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="invalid H43 AOT artifact path"):
+        load_aot_manifest(
+            root / AOT_MANIFEST_NAME,
+            expected_source_manifest_digest="e" * 64,
+            expected_installed_mla_sha256="f" * 64,
+            expected_entries=1,
+        )
+
+
+def test_h43_runtime_is_wired_to_exact_aot_manifest():
+    prebuild = (ROOT / "prebuild_h43_codebook_cache.py").read_text(encoding="utf-8")
+    benchmark = (ROOT / "microbench_h43_codebook_ab.py").read_text(encoding="utf-8")
+    runner = (ROOT / "run_h43_maintenance.py").read_text(encoding="utf-8")
+    assert "compiled.export_to_c" in prebuild
+    assert "find_runtime_libraries(enable_tvm_ffi=True)" in prebuild
+    assert "install_h43_aot_from_environment()" in benchmark
+    assert runner.count("H43_AOT_MANIFEST=") == 2
+    assert runner.count("H43_AOT_EXPECTED_ENTRIES=") == 2
+    assert runner.count("['cache_root']}:ro") == 2
+    preparation = (ROOT / "prepare_h43_remote.sh").read_text(encoding="utf-8")
+    assert '"${cache_root}:${cache_root}:ro"' in preparation
 
 
 def test_preparation_has_no_privileged_predictable_tmp_staging():

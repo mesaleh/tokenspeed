@@ -1,6 +1,6 @@
 # H43 D1 deployable codebook-reader A/B
 
-Status: implementation and maintenance harness under review; no live run yet
+Status: TVM-FFI AOT implementation self-reviewed LGTM; immutable preparation pending
 Machine scope: CT13 GPU0 only for CUDA work. CT14 runs no experiment but its
 accepted rank is stopped and restored with CT13. CT15, CT16, and SecurityLLMs
 are excluded.
@@ -63,6 +63,15 @@ Python cache writer. The other CUDA readers are standard-head Triton or scalar
 FP32 CUDA paths rather than fused Kimi MLA/SM100 kernels. No public
 `kv_nope_codebook` implementation or deployable SM100 q5 Kimi MLA path was
 found. Recheck these exact heads before any later upstream claim.
+
+The 2026-07-02 NVIDIA [CuTe DSL JIT-caching
+documentation](https://docs.nvidia.com/cutlass/4.5.2/media/docs/pythonDSL/cute_dsl_general/dsl_jit_caching.html)
+states that `cute.compile` deliberately bypasses the implicit/file JIT cache and
+returns a process-local executor. NVIDIA's 2026-07-18 [TVM-FFI export
+documentation](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html#exporting-compiled-module)
+instead supports `export_to_c`, linking with the discovered CuTe/TVM runtime
+libraries, and fresh-process `cute.runtime.load_module(...,
+enable_tvm_ffi=True)`. H43 now uses that supported AOT route.
 
 ## PDL ordering correction before measurement
 
@@ -171,51 +180,57 @@ In every process:
 The literal declared operation count is descriptive only. It is not treated as
 physical trace evidence.
 
-Compiled artifacts use dedicated CT13 bind-mount namespaces keyed by their
+Compiled AOT artifacts use dedicated CT13 bind-mount namespaces keyed by their
 committed source-manifest digests. The accepted pre-move reference and D1 build
-have separate manifests, installed-package trees, and cache namespaces. The
-reference resource run is archived against its own source hash and is exempt
-only from the D1-package equality predicate; it must match its own package.
-Reference work finishes before the D1 qualification-close state is captured.
+have separate source manifests, installed-package trees, artifact namespaces,
+and dispatch manifests. The reference resource run is archived against its own
+source hash and is exempt only from the D1-package equality predicate; it must
+match its own package. Reference work finishes before the D1
+qualification-close state is captured.
 
-Before any service window, a source-only cache-build process runs while the
-accepted endpoint remains online. It calls `_get_compiled_mla_kernel` directly,
-whose `cute.compile` path uses fake tensors and a fake stream, and never launches
-a reader kernel or allocates the experiment cache ring. It clears each namespace
-once after verifying its source, uses `PYTHONDONTWRITEBYTECODE=1` with no
-`__pycache__`/`.pyc`, builds the exact manifest-listed specialization tuples,
-and records cold wall time per key. The D1 set contains eight TQ keys—frozen
-`tq4_tiles_per_split` values 32/50 by q1/q5 by codebook false/true—plus dense
-q1/q5. Their `is_var_seq=True` and `is_persistent=False` fields are derived
-from the dense and TQ runtime APIs' shared production default rather than
-duplicated as an independent fixed-sequence choice. Any unexpected CUDA
-kernel launch or endpoint-health change aborts before maintenance. The compiler
-process exits before the service is stopped; exclusive empty-compute-app checks
-apply to qualification and decision CUDA execution, not this source-only build.
-The no-launch NCU proof requires connected and disconnected profiler banners,
-NCU's explicit `No kernels were profiled` result, zero metric rows, and no
-unrelated warning; silence or disabled performance counters fail closed.
-The prebuild serializes every dispatch-key field, performs a second source-only
-lookup of all ten tuples, and requires an identical artifact manifest before a
-service window is authorized.
+Before any service window, a source-only AOT build runs while the accepted
+endpoint remains online. It initializes one explicitly bound CUDA context for
+the SM100 occupancy query, then calls `_get_compiled_mla_kernel` with fake
+tensors and a fake stream; it never invokes the returned executor, launches a
+reader kernel, or allocates the experiment cache ring. Each TVM-FFI executor is
+exported to an object with a unique symbol and linked to a shared library using
+`cute.runtime.find_runtime_libraries(enable_tvm_ffi=True)`. The sealed AOT
+manifest binds the complete signature-derived dispatch key, label, function,
+object and library paths/hashes, installed MLA hash, and source-manifest digest.
+It is published only after all artifacts succeed. Temporary partial names are
+excluded from evidence; any final artifact in a cold namespace fails closed.
 
-The cache invariant is the sorted manifest of immutable content-addressed
-compiled artifacts `(relative_path, size, sha256)`, not lock, temporary,
-access-time, or index metadata. Exact excluded metadata patterns are frozen in
-the contract. Record this artifact-manifest digest after every qualification
-process and at close. The last two warm preflight processes must create no new
-compiled artifact and yield identical artifact manifests; their expected fresh
-in-process Python dispatch-key misses remain required. Stop and restart the
-unchanged experiment container during qualification to prove the bind mount
-survives. The very first qualification CUDA process recomputes the actual
-runtime dispatch tuples and must create zero new compiled artifacts; a miss
-is compared against the entry artifact digest inside the process and
-immediately ends qualification, restoring service rather than consuming the
-remaining budget. Every decision process must see the qualification-close artifact
-manifest before CUDA initialization and after completion. A missing/new/changed
-compiled artifact yields `NO_DECISION` before performance analysis. The source
-manifest includes the cache rule and installed packages; generated artifacts
-are evidence rather than source.
+The exact set is eight TQ entries—frozen `tq4_tiles_per_split` values 32/50 by
+q1/q5 by codebook false/true—plus dense q1/q5. Their `is_var_seq=True` and
+`is_persistent=False` fields are derived from the dense and TQ runtime APIs'
+shared production default rather than duplicated as an independent
+fixed-sequence choice. The successful namespace contains exactly ten `.o`, ten
+`.so`, and one sealed JSON manifest. Its sorted immutable content manifest is
+`(relative_path, size, sha256)`; lock, temporary, access-time, or index metadata
+remain excluded by the frozen contract.
+
+A second fresh process mounts this namespace read-only, validates every source,
+manifest, object, and library digest, installs the H43 loader, and resolves all
+ten functions with `cute.runtime.load_module(..., enable_tvm_ffi=True)`. NCU
+must show connected and disconnected profiler banners, its explicit `No kernels
+were profiled` result, zero metric rows, and no unrelated warning. Silence or
+disabled counters fail closed. Any unexpected CUDA kernel launch or endpoint
+health change aborts before maintenance. The AOT process exits before service
+stop; exclusive empty-compute-app checks apply to qualification and decision
+CUDA execution, not source-only build/load.
+
+Every qualification and decision process mounts artifacts read-only. Before
+CUDA initialization it revalidates the sealed manifest and installed source;
+immediately before each first load it rehashes the selected library. The
+signature-compatible patched dispatch remains an in-process LRU, so the frozen
+fresh-process miss counts still prove all required q1/q5/dense/codebook entries
+were selected, but no JIT compilation is allowed. Record the immutable artifact
+digest after every process and at close. The two warm qualification preflights
+must create no artifact and yield identical manifests. Stop and restart the
+unchanged experiment container to prove the read-only bind mount survives. A
+missing/new/changed artifact or absent dispatch key yields `NO_DECISION` before
+performance analysis. The source manifest includes the AOT builder/loader and
+installed packages; generated binaries are evidence rather than source.
 
 ## Timing design and statistical gate
 
@@ -457,8 +472,9 @@ operator naming cannot create an extra decision sample.
    smoke, profiling, sanitizer, source change, cache clearing, compilation, or
    tuning occurs in this window.
 
-Cold compilation is excluded from downtime because its source-only build and
-per-key cost record finish before maintenance. The qualification experiment
+Cold AOT compilation, export, linking, and fresh-process load proof are excluded
+from downtime because their source-only work and per-key cost record finish
+before maintenance. The qualification experiment
 budget is explicitly 23 minutes: 2 minutes for source/staging/idle and cache
 persistence, 1 for smoke, 1 for the raw-word probe, 3 for comparative Nsight,
 9 for three 180-second sanitizers, 6 for four preflights, and 1 for
@@ -717,3 +733,37 @@ request shape and concurrency before any promotion claim.
   contaminated manifest can select a cache and no malformed prebuild result can
   enter identity evidence. The focused 24-test suite, Bash parse, diff checks,
   targeted format hooks, and repository-wide non-format hooks pass: `LGTM`.
+- The third online-only preparation passed source provenance and reached the
+  first compile key, then safely failed the SM100 occupancy query with
+  `CUDA_ERROR_INVALID_CONTEXT`. Unlike the allocating microbench path, the
+  source-only compiler path had never initialized PyTorch's lazy CUDA context.
+  A real-image probe with exactly one visible GPU showed that explicit device-0
+  binding plus `torch.cuda.init()` makes the query return 152 clusters without
+  a kernel launch. Prebuild now freezes that one-device invariant and initializes
+  the context before any compile key. The accepted endpoint remained healthy
+  and no maintenance window was consumed.
+- The initialized diagnostic compiled all ten exact keys successfully, but its
+  declared cache namespace remained empty. Installed NVIDIA source and the
+  current official JIT-caching guide both confirm that `cute.compile` forces
+  `no_cache=True`; prior H43 persistence language was therefore invalid. This
+  rules out a file-JIT prebuild and explains why the warm process could not be
+  a hit. A one-key real-image probe then used the matching official TVM-FFI API
+  to export `dense_q1.o`, link `dense_q1.so` against the discovered CuTe/TVM
+  libraries, and load its callable symbol in a fresh process without a kernel
+  invocation. The endpoint remained healthy. H43 now generalizes that proven
+  AOT mechanism to all ten exact keys rather than weakening the no-JIT gate.
+- AOT self-review pass 1 traced source-to-dispatch-to-library identity and made
+  published artifacts read-only for warm and maintenance consumers, with a
+  final selected-library rehash. Pass 2 froze the manifest/entry schemas, exact
+  SHA forms, path containment, unique symbols, and fail-closed missing-key
+  behavior. Pass 3 proved one-key cross-process load with one LRU miss and a
+  positive NCU attach/detach/no-kernel result. Pass 4 ran all ten cold
+  compile/export/link operations, obtained exactly 21 immutable artifacts,
+  loaded all ten from a read-only mount in a fresh process, matched cold/warm
+  digests, and again proved zero launches; endpoint health stayed green. The
+  collaborative-review session is already at its mandatory five-round maximum,
+  so no sixth invocation is allowed. The focused 29-test suite, Python/Bash
+  parse checks, targeted format hooks, and repository-wide non-format hooks
+  pass: `LGTM` for the AOT preparation implementation. This still does not
+  authorize a service window without a clean signed commit and immutable
+  preparation state.

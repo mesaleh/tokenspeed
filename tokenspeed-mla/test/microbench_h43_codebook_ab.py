@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from h43_aot_loader import install_h43_aot_from_environment
 from h43_codebook_ab_common import (
     canonical_json_digest,
     compiled_artifact_manifest,
@@ -30,7 +31,8 @@ from h43_codebook_ab_common import (
     telemetry_reasons,
 )
 from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
-from tokenspeed_mla.mla_decode import _get_compiled_mla_kernel
+
+_get_compiled_mla_kernel = install_h43_aot_from_environment()
 
 E2M1_CENTROIDS = (
     0.0,
