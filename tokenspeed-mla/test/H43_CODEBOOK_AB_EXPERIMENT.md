@@ -1,6 +1,6 @@
 # H43 D1 deployable codebook-reader A/B
 
-Status: TVM-FFI AOT implementation self-reviewed LGTM; immutable preparation pending
+Status: AOT arity repair self-reviewed LGTM; immutable preparation pending
 Machine scope: CT13 GPU0 only for CUDA work. CT14 runs no experiment but its
 accepted rank is stopped and restored with CT13. CT15, CT16, and SecurityLLMs
 are excluded.
@@ -784,3 +784,27 @@ request shape and concurrency before any promotion claim.
   `0755` directory creation on both nodes, deterministic preservation of the
   rejected attempt, and a clean import-only AOT loader without an inapplicable
   executable shebang. Focused tests and targeted format hooks pass: `LGTM`.
+- The second qualification campaign reached the guarded service window and
+  passed source-manifest and PDL-source-order gates, then failed the first dense
+  correctness call before any timing. The exported TVM-FFI symbol requires all
+  18 parameters, including the three TQ-only parameters compiled as `None`,
+  while TokenSpeed's dense runtime deliberately invokes the CuTe JIT executor's
+  compact 15-argument form. A raw exported symbol does not retain that executor
+  adaptation, so it rejected the call. The runner restored both exact accepted
+  containers, passed endpoint completion and GPU health validation, found no
+  Xid, and disarmed all timers. This is a deterministic source/correctness
+  failure and `NO_DECISION`, not an infrastructure retry.
+- The AOT loader now restores the frozen executor ABI at its narrow boundary:
+  exactly 15 runtime arguments receive three trailing `None` values; exactly 18
+  pass unchanged; every other count fails closed. A regression test covers all
+  three cases. No kernel, dispatch key, manifest schema, or production module is
+  changed by this adapter; a new signed source identity and immutable
+  preparation are required before qualification.
+- AOT-arity repair self-review pass 1 matched the failure's named 18-parameter
+  TVM-FFI signature against the exact 15-element dense tuple and 15+3 TQ call
+  sites. Pass 2 traced loader caching, module lifetime, compact and expanded
+  paths, malformed-count rejection, and source-manifest rebinding; the adapter
+  is outside measured kernel execution and adds no timing-path work after
+  dispatch. An AST regression freezes both production call shapes. Focused
+  tests, parse checks, targeted format hooks, and repository-wide non-format
+  hooks pass: `LGTM`.

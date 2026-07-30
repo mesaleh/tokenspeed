@@ -17,6 +17,8 @@ from typing import Any, Callable
 AOT_MANIFEST_NAME = "h43-aot-manifest.json"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 FUNCTION_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+COMPACT_RUNTIME_ARGUMENTS = 15
+EXPORTED_RUNTIME_ARGUMENTS = 18
 
 
 def sha256_file(path: Path) -> str:
@@ -55,6 +57,23 @@ def dispatch_key(function: Callable[..., Any], *args: Any, **kwargs: Any) -> str
         for name, value in bound.arguments.items()
     ]
     return canonical_json_digest(payload)
+
+
+def adapt_h43_aot_callable(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Restore the optional-None padding supplied by CuTe's JIT executor."""
+
+    def invoke(*args: Any) -> Any:
+        if len(args) == COMPACT_RUNTIME_ARGUMENTS:
+            args = (*args, None, None, None)
+        elif len(args) != EXPORTED_RUNTIME_ARGUMENTS:
+            raise TypeError(
+                "H43 AOT runtime expects either "
+                f"{COMPACT_RUNTIME_ARGUMENTS} compact or "
+                f"{EXPORTED_RUNTIME_ARGUMENTS} exported arguments, got {len(args)}"
+            )
+        return function(*args)
+
+    return invoke
 
 
 def _artifact_path(root: Path, relative: str, suffix: str) -> Path:
@@ -268,7 +287,7 @@ def install_h43_aot_from_environment(
                 if not callable(function):
                     raise RuntimeError("H43 AOT export is not callable")
                 modules[library] = module
-                functions[key] = function
+                functions[key] = adapt_h43_aot_callable(function)
             return functions[key]
 
     patched = functools.lru_cache(maxsize=None)(load_kernel)

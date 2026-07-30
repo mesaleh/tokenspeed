@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import importlib.util
 import json
@@ -20,6 +21,7 @@ from check_h43_no_kernel_launch import validate_ncu_no_kernel_launch
 from compare_h43_ncu import load_ncu
 from h43_aot_loader import (
     AOT_MANIFEST_NAME,
+    adapt_h43_aot_callable,
     dispatch_key,
     load_aot_manifest,
 )
@@ -200,6 +202,51 @@ def test_aot_dispatch_key_binds_defaults_and_keyword_order():
     second = dispatch_key(sample, enabled=False, alpha=7, beta=0.5)
     assert first == second
     assert first != dispatch_key(sample, 7, enabled=True)
+
+
+def test_aot_callable_restores_dense_optional_none_arguments():
+    calls = []
+
+    def exported(*args):
+        calls.append(args)
+        return "called"
+
+    adapted = adapt_h43_aot_callable(exported)
+    dense = tuple(range(15))
+    tq = tuple(range(18))
+    assert adapted(*dense) == "called"
+    assert calls[-1] == (*dense, None, None, None)
+    assert adapted(*tq) == "called"
+    assert calls[-1] == tq
+    with pytest.raises(TypeError, match="got 17"):
+        adapted(*range(17))
+
+
+def test_aot_adapter_arity_matches_the_installed_mla_call_sites():
+    source = (ROOT.parent / "python" / "tokenspeed_mla" / "mla_decode.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    runtime_tuples = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "args"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Tuple)
+    ]
+    assert [len(value.elts) for value in runtime_tuples] == [15]
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "compiled_kernel"
+    ]
+    assert sorted(len(call.args) for call in calls) == [1, 4]
+    assert all(isinstance(call.args[0], ast.Starred) for call in calls)
 
 
 def test_aot_manifest_seals_source_and_artifacts(tmp_path):
