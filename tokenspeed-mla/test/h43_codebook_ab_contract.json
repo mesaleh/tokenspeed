@@ -177,9 +177,7 @@
       "launch__occupancy_limit_registers",
       "launch__occupancy_limit_shared_mem",
       "launch__occupancy_limit_warps",
-      "derived__pct_occupancy_per_register_count",
-      "derived__pct_occupancy_per_shared_mem_size",
-      "derived__pct_occupancy_per_block_size",
+      "sm__maximum_warps_per_active_cycle_pct",
       "sm__warps_active.avg.pct_of_peak_sustained_active",
       "smsp__inst_executed_op_local_ld.sum",
       "smsp__inst_executed_op_local_st.sum"

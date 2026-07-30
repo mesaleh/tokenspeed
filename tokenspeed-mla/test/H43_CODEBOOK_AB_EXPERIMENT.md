@@ -837,3 +837,40 @@ request shape and concurrency before any promotion claim.
   measured execution beyond selecting the already-frozen 61-call range.
   Focused tests, JSON/Python parse checks, targeted format hooks, and
   repository-wide non-format hooks pass: `LGTM`.
+- The fourth qualification campaign reached a real profiled launch with the
+  corrected push/pop filter, then Nsight Compute rejected
+  `derived__pct_occupancy_per_block_size` before collecting a resource result.
+  The runner restored both exact accepted ranks, passed endpoint completion and
+  all-GPU health validation, found no new Xid, and disarmed every timer. This is
+  deterministic profiler-contract evidence and `NO_DECISION`, not a reader
+  performance result.
+- Installed-image one-launch probes showed two related protocol defects. First,
+  `LaunchStats`/`Occupancy` can emit their derived values, but this NCU build
+  cannot accept all of those derived names through `--metrics`. Second,
+  `--page raw` emits one wide row per launch while the comparator expected the
+  details page's row-oriented metric table. A minimal explicit metric set was
+  then proven against the exact reference image: it retains registers, static
+  and dynamic shared memory, all four resident-block limits, theoretical and
+  achieved occupancy, and local load/store instruction counts without section
+  expansion or derived-metric rejection.
+- The resource gate now freezes that explicit raw schema and parses one exact
+  row per launch. Theoretical occupancy uses the installed
+  `sm__maximum_warps_per_active_cycle_pct` metric. Although the initial dense
+  launch has local-memory instructions, a full ring profile confirmed zero
+  local loads and stores across all 14 selected q5 split/reduction calls; the
+  stronger absolute no-spill gates therefore remain unchanged. That full
+  61-call/122-launch reference diagnostic completed in seven seconds, so the
+  frozen 90-second per-profiler timeout and 24-minute qualification budget also
+  remain unchanged. An exact candidate diagnostic produced the same 122-launch
+  shape in six seconds, and the revised comparator passed every resource gate
+  against the reference: unchanged registers, shared memory, resident-block and
+  theoretical-occupancy limits, zero selected-call spills, and no achieved-
+  occupancy regression. These online diagnostics validate the tooling only;
+  they do not substitute for the sealed qualification campaign.
+- NCU-contract repair self-review pass 1 caught and reverted an attempted
+  weakening of the no-spill predicate after distinguishing the first dense
+  launch from the selected q5 calls. Pass 2 replayed the parser against the two
+  real 122-row raw CSVs, traced all required columns through collection,
+  selection, summary, and comparison, and rechecked the unchanged timeout and
+  restoration arithmetic. Focused tests, Python/JSON checks, formatting, and
+  the repository's non-format file hooks pass: `LGTM`.

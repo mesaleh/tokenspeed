@@ -128,12 +128,18 @@ def test_ncu_parser_models_two_kernel_launches_per_ring_call(tmp_path):
     path = tmp_path / "ncu.csv"
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["ID", "Kernel Name", "Metric Name", "Metric Value"])
+        writer.writerow(["ID", "Kernel Name", *value["ncu"]["required_metrics"]])
+        writer.writerow(["", "", *["unit" for _ in value["ncu"]["required_metrics"]]])
         launch_id = 0
         for _ in range(value["ncu"]["expected_ring_calls"]):
             for kernel_name in value["ncu"]["launch_kernel_order"]:
-                for metric in value["ncu"]["required_metrics"]:
-                    writer.writerow([launch_id, f"void {kernel_name}<x>", metric, "1"])
+                writer.writerow(
+                    [
+                        launch_id,
+                        f"void {kernel_name}<x>",
+                        *["1" for _ in value["ncu"]["required_metrics"]],
+                    ]
+                )
                 launch_id += 1
     selected = load_ncu(path, value)
     assert [launch["id"] for launch in selected["split_kv_kernel"]] == list(
@@ -157,8 +163,24 @@ def test_ncu_push_pop_filter_and_empty_capture_fail_closed(tmp_path):
         "==PROF== Disconnected from process 1\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="no metric table header"):
+    with pytest.raises(ValueError, match="no raw metric header"):
         load_ncu(path, value)
+
+
+def test_ncu_uses_installed_raw_metric_contract_without_section_derived_metrics():
+    value = contract()
+    metrics = value["ncu"]["required_metrics"]
+    assert "sm__maximum_warps_per_active_cycle_pct" in metrics
+    assert not any(metric.startswith("derived__") for metric in metrics)
+    assert value["timeouts_seconds"]["ncu_each"] == 90
+    runner = (ROOT / "run_h43_maintenance.py").read_text(encoding="utf-8")
+    method = runner[
+        runner.index("    def run_ncu_resource_gate") : runner.index(
+            "    def run_sanitizers"
+        )
+    ]
+    assert '"--page",\n            "raw"' in method
+    assert '"--section"' not in method
 
 
 def test_no_kernel_ncu_proof_requires_positive_profiler_evidence():

@@ -22,38 +22,38 @@ def parse_number(value: str) -> float:
 
 def load_ncu(path: Path, contract: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    required = contract["ncu"]["required_metrics"]
+    required_columns = {"ID", "Kernel Name", *required}
     header_index = next(
-        (
-            index
-            for index, row in enumerate(rows)
-            if "Metric Name" in row and "Metric Value" in row and "ID" in row
-        ),
+        (index for index, row in enumerate(rows) if required_columns.issubset(row)),
         None,
     )
     if header_index is None:
-        raise ValueError("NCU CSV has no metric table header or profiled kernels")
+        raise ValueError("NCU CSV has no raw metric header or profiled kernels")
     header = rows[header_index]
-    records = [
-        dict(zip(header, row, strict=False))
-        for row in rows[header_index + 1 :]
-        if len(row) >= len(header) and row[header.index("ID")] != "ID"
-    ]
-    required = contract["ncu"]["required_metrics"]
+    if len(header) != len(set(header)):
+        raise ValueError("NCU raw metric header contains duplicate columns")
+    indices = {name: header.index(name) for name in required_columns}
     by_launch: dict[int, dict[str, Any]] = {}
-    for record in records:
-        metric = record.get("Metric Name")
-        if metric not in required:
+    for row in rows[header_index + 1 :]:
+        if len(row) != len(header):
             continue
-        launch_id = int(record["ID"])
-        launch = by_launch.setdefault(
-            launch_id,
-            {"id": launch_id, "kernel_name": record.get("Kernel Name"), "metrics": {}},
-        )
-        if launch["kernel_name"] != record.get("Kernel Name"):
-            raise ValueError(f"launch {launch_id} has inconsistent kernel names")
-        if metric in launch["metrics"]:
-            raise ValueError(f"launch {launch_id} repeats metric {metric}")
-        launch["metrics"][metric] = parse_number(record["Metric Value"])
+        raw_id = row[indices["ID"]].strip()
+        if not raw_id:
+            continue
+        try:
+            launch_id = int(raw_id)
+        except ValueError as error:
+            raise ValueError(f"NCU raw launch ID is invalid: {raw_id!r}") from error
+        if launch_id in by_launch:
+            raise ValueError(f"NCU raw CSV repeats launch {launch_id}")
+        by_launch[launch_id] = {
+            "id": launch_id,
+            "kernel_name": row[indices["Kernel Name"]],
+            "metrics": {
+                metric: parse_number(row[indices[metric]]) for metric in required
+            },
+        }
     launches = [by_launch[key] for key in sorted(by_launch)]
     ncu = contract["ncu"]
     kernel_order = ncu["launch_kernel_order"]
@@ -103,11 +103,6 @@ def load_ncu(path: Path, contract: dict[str, Any]) -> dict[str, list[dict[str, A
 
 def summarize(launches: list[dict[str, Any]]) -> dict[str, Any]:
     metric_rows = [launch["metrics"] for launch in launches]
-    theoretical_names = (
-        "derived__pct_occupancy_per_register_count",
-        "derived__pct_occupancy_per_shared_mem_size",
-        "derived__pct_occupancy_per_block_size",
-    )
     block_limit_names = (
         "launch__occupancy_limit_blocks",
         "launch__occupancy_limit_registers",
@@ -131,7 +126,7 @@ def summarize(launches: list[dict[str, Any]]) -> dict[str, Any]:
             for row in metric_rows
         ),
         "theoretical_occupancy_min_pct": min(
-            min(row[name] for name in theoretical_names) for row in metric_rows
+            row["sm__maximum_warps_per_active_cycle_pct"] for row in metric_rows
         ),
         "resident_blocks_per_sm_min": min(
             min(row[name] for name in block_limit_names) for row in metric_rows
