@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Source-bound TVM-FFI AOT artifacts for the H43 MLA experiment."""
 
 from __future__ import annotations

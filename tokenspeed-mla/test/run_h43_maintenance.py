@@ -370,6 +370,10 @@ finally:
             ["install", "-d", "-m", "0755", self.results, f"{self.results}/gates"],
             timeout=60,
         )
+        for host in (self.host0, self.host1):
+            remote(
+                host, ["install", "-d", "-m", "0755", "/usr/local/libexec"], timeout=60
+            )
         test_dir = self.args.contract.resolve().parent
         install_remote(
             self.host0,

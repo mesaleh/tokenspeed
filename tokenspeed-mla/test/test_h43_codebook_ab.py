@@ -337,6 +337,16 @@ def test_remote_script_quotes_space_containing_arguments_and_timers_are_bounded(
     assert "automatic actions stopped" in terminal
 
 
+def test_setup_creates_the_system_helper_directory_before_installing_scripts():
+    source = (ROOT / "run_h43_maintenance.py").read_text(encoding="utf-8")
+    setup = source[
+        source.index("    def setup") : source.index("    def verify_preparation")
+    ]
+    assert setup.index('"/usr/local/libexec"') < setup.index(
+        'test_dir / "restore_h43_rank0.sh"'
+    )
+
+
 def test_all_gpu_health_predicate_matches_frozen_baseline():
     value = contract()
     machine = value["machine"]

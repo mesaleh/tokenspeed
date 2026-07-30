@@ -767,3 +767,20 @@ request shape and concurrency before any promotion claim.
   pass: `LGTM` for the AOT preparation implementation. This still does not
   authorize a service window without a clean signed commit and immutable
   preparation state.
+- The first qualification attempt stopped safely during online setup, before
+  fail-safe arming or any service stop, because CT13 did not already contain
+  `/usr/local/libexec`; atomic helper installation therefore could not create
+  its temporary file. Both accepted ranks and HTTP health remained unchanged.
+  Setup now creates the conventional root-owned `0755` helper directory on
+  both nodes before installing the restore, alert, or terminal scripts, and a
+  regression check freezes that ordering. The rejected campaign and local
+  evidence manifest remain preserved; a new source-bound preparation is
+  required before another qualification attempt.
+- Qualification-setup repair self-review pass 1 traced the exact execution
+  order: immutable preparation and endpoint checks precede root creation;
+  helper-directory creation and atomic script installation precede snapshot,
+  fail-safe arming, and service stop. A failure on either node therefore still
+  leaves both accepted ranks untouched. Pass 2 verified idempotent root-owned
+  `0755` directory creation on both nodes, deterministic preservation of the
+  rejected attempt, and a clean import-only AOT loader without an inapplicable
+  executable shebang. Focused tests and targeted format hooks pass: `LGTM`.
