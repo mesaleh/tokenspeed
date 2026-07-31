@@ -220,6 +220,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_causal: bool = False,
         num_heads: int = 128,
         seq_len_q: int = 1,
+        tree_mask_mode: bool = False,
         cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
@@ -266,6 +267,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # row r → (q_tok_in_group = r // num_heads, head = r % num_heads).
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
+        # Tree verification consumes a flattened [q_len, K] bool mask per
+        # request. The wrapper rejects DCP combinations until rank-local mask
+        # semantics are defined.
+        self.tree_mask_mode = tree_mask_mode
         self.cp_world = cp_world
         if mma_qk_tiler_mn[0] == 128:
             self.cluster_shape_mnk = (2, 1, 1)
@@ -404,6 +409,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         c_latent: cute.Tensor,
         c_rope: cute.Tensor,
         page_table: cute.Tensor,
+        custom_mask: cute.Tensor,
+        cmask_off: cute.Tensor,
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
         workspace: cute.Tensor,
@@ -950,6 +957,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tma_atom_c_latent_transpose,
             tma_tensor_c_latent_transpose,
             page_table,
+            custom_mask,
+            cmask_off,
             o,
             lse if not self.skip_lse else None,
             acc_o,
@@ -1058,6 +1067,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
         mCLT: cute.Tensor,
         mPT: cute.Tensor,
+        mCmask: cute.Tensor,
+        mCmaskOff: cute.Tensor,
         mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mAccO: Optional[cute.Tensor],
@@ -1289,7 +1300,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         if warp_idx == self.load_tma_k_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
-            cute.arch.griddepcontrol_wait()
             load_k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_k_pipeline_stage
             )
@@ -1303,6 +1313,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            cute.arch.griddepcontrol_wait()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
@@ -1350,7 +1361,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         if warp_idx == self.load_tma_v_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
-            cute.arch.griddepcontrol_wait()
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
             )
@@ -1361,6 +1371,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            cute.arch.griddepcontrol_wait()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
@@ -1456,6 +1467,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Now wait for TMEM allocation and broadcast pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            cute.arch.griddepcontrol_wait()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
@@ -1550,6 +1562,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            cute.arch.griddepcontrol_wait()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
@@ -1565,6 +1578,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
+                        cmask=mCmask,
+                        cmask_off=mCmaskOff,
+                        cmask_len=mCmask.shape[0],
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1619,6 +1635,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            cute.arch.griddepcontrol_wait()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
@@ -2785,12 +2802,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         correction_factor = self.acc_dtype(1)
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
-        # Number of tiles from the global-K end that may contain causal-masked
-        # positions. For causal, min k_bound = K - (S_q-1), which can span up
-        # to ceil((S_q-1)/tile_N)+1 tiles (tile-boundary-crossing case).
-        # Non-causal only needs the final K-bound tile.
+        # Number of tiles from the global-K end that may contain causal or tree
+        # mask positions. Both contracts differ from full-history attention only
+        # within the final S_q columns.
         tile_n = self.mma_qk_tiler[1]
-        if cutlass.const_expr(self.is_causal):
+        if cutlass.const_expr(self.is_causal or self.tree_mask_mode):
             mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
         else:
             mask_tile_count = 1
@@ -3172,7 +3188,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
-                    if cutlass.const_expr(self.is_causal):
+                    if cutlass.const_expr(self.tree_mask_mode):
                         if cutlass.const_expr(self.fold_sq_factor > 1):
                             qk_row = tTR_tS[i][0]
                             q_tok = (
@@ -3182,32 +3198,78 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             )
                         else:
                             q_tok = common_params.blk_coord[1]
-                        if cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
-                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
-                        else:
-                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
-                            # the context (key c -> global position c*cp_world + dcp_rank). The
-                            # causal bound is therefore taken over the GLOBAL length passed in
-                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
-                            k_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
-                                + self.cp_world
-                                - 1
-                            ) // self.cp_world
-                    else:
-                        k_bound = common_params.K
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            qk_col + self.mma_qk_tiler[1] * k_index,
-                            k_bound,
+                        kcol = qk_col + self.mma_qk_tiler[1] * k_index
+                        within_q = cute.elem_less(q_tok, self.seq_len_q)
+                        within_kv = cute.elem_less(kcol, common_params.K)
+                        q_tok_in = (
+                            q_tok if within_q else cutlass.Int32(self.seq_len_q - 1)
                         )
-                        else self.acc_dtype(-1.0e6)
-                    )
+                        kcol_in = (
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
+                        )
+                        cm_idx = (
+                            common_params.cmask_off[common_params.blk_coord[2]]
+                            + q_tok_in * common_params.K
+                            + kcol_in
+                        )
+                        cm_idx_nonnegative = cute.elem_less(
+                            cutlass.Int32(-1), cutlass.Int32(cm_idx)
+                        )
+                        cm_idx_in = cm_idx if cm_idx_nonnegative else cutlass.Int32(0)
+                        within_mask = cute.elem_less(cm_idx_in, common_params.cmask_len)
+                        cm_idx_in = cm_idx_in if within_mask else cutlass.Int32(0)
+                        cm_keep = cute.elem_less(
+                            cutlass.Int32(0),
+                            cutlass.Int32(common_params.cmask[cm_idx_in]),
+                        )
+                        cm_keep = cm_keep if within_mask else False
+                        cm_keep = cm_keep if cm_idx_nonnegative else False
+                        tTR_rAcc[i] = (
+                            (
+                                (tTR_rAcc[i] if cm_keep else self.acc_dtype(-1.0e6))
+                                if within_kv
+                                else self.acc_dtype(-1.0e6)
+                            )
+                            if within_q
+                            else self.acc_dtype(-1.0e6)
+                        )
+                    else:
+                        if cutlass.const_expr(self.is_causal):
+                            if cutlass.const_expr(self.fold_sq_factor > 1):
+                                qk_row = tTR_tS[i][0]
+                                q_tok = (
+                                    common_params.blk_coord[1] * self.fold_sq_factor
+                                    + (qk_row + common_params.blk_coord[0] * cta_m_rows)
+                                    // self.num_heads
+                                )
+                            else:
+                                q_tok = common_params.blk_coord[1]
+                            if cutlass.const_expr(self.cp_world == 1):
+                                # Non-DCP: causal bound is the full local context length
+                                # (identical to the pre-DCP behavior; folded at compile time).
+                                k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                            else:
+                                # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
+                                # the context (key c -> global position c*cp_world + dcp_rank). The
+                                # causal bound is therefore taken over the GLOBAL length passed in
+                                # K_causal (= global_seq - dcp_rank), divided by cp_world.
+                                k_bound = (
+                                    common_params.K_causal
+                                    - (self.seq_len_q - 1)
+                                    + q_tok
+                                    + self.cp_world
+                                    - 1
+                                ) // self.cp_world
+                        else:
+                            k_bound = common_params.K
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                qk_col + self.mma_qk_tiler[1] * k_index,
+                                k_bound,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
@@ -3238,7 +3300,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    if cutlass.const_expr(self.is_causal):
+                    if cutlass.const_expr(self.tree_mask_mode):
                         if cutlass.const_expr(self.fold_sq_factor > 1):
                             q_tok = (
                                 common_params.blk_coord[1] * self.fold_sq_factor
@@ -3250,35 +3312,83 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             )
                         else:
                             q_tok = common_params.blk_coord[1]
-                        # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
-                        # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
-                        # Int32 __rsub__ quirks when self.seq_len_q==1.
-                        if cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
-                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
-                        else:
-                            # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
-                            # the context (key c -> global position c*cp_world + dcp_rank). The
-                            # causal bound is therefore taken over the GLOBAL length passed in
-                            # K_causal (= global_seq - dcp_rank), divided by cp_world.
-                            k_bound = (
-                                common_params.K_causal
-                                - (self.seq_len_q - 1)
-                                + q_tok
-                                + self.cp_world
-                                - 1
-                            ) // self.cp_world
-                    else:
-                        k_bound = common_params.K
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            k_bound,
+                        kcol = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+                        within_q = cute.elem_less(q_tok, self.seq_len_q)
+                        within_kv = cute.elem_less(kcol, common_params.K)
+                        q_tok_in = (
+                            q_tok if within_q else cutlass.Int32(self.seq_len_q - 1)
                         )
-                        else self.acc_dtype(-1.0e6)
-                    )
+                        kcol_in = (
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
+                        )
+                        cm_idx = (
+                            common_params.cmask_off[common_params.blk_coord[2]]
+                            + q_tok_in * common_params.K
+                            + kcol_in
+                        )
+                        cm_idx_nonnegative = cute.elem_less(
+                            cutlass.Int32(-1), cutlass.Int32(cm_idx)
+                        )
+                        cm_idx_in = cm_idx if cm_idx_nonnegative else cutlass.Int32(0)
+                        within_mask = cute.elem_less(cm_idx_in, common_params.cmask_len)
+                        cm_idx_in = cm_idx_in if within_mask else cutlass.Int32(0)
+                        cm_keep = cute.elem_less(
+                            cutlass.Int32(0),
+                            cutlass.Int32(common_params.cmask[cm_idx_in]),
+                        )
+                        cm_keep = cm_keep if within_mask else False
+                        cm_keep = cm_keep if cm_idx_nonnegative else False
+                        tTR_rAcc[i] = (
+                            (
+                                (tTR_rAcc[i] if cm_keep else self.acc_dtype(-1.0e6))
+                                if within_kv
+                                else self.acc_dtype(-1.0e6)
+                            )
+                            if within_q
+                            else self.acc_dtype(-1.0e6)
+                        )
+                    else:
+                        if cutlass.const_expr(self.is_causal):
+                            if cutlass.const_expr(self.fold_sq_factor > 1):
+                                q_tok = (
+                                    common_params.blk_coord[1] * self.fold_sq_factor
+                                    + (
+                                        tTR_tS[i][0]
+                                        + common_params.blk_coord[0] * cta_m_rows
+                                    )
+                                    // self.num_heads
+                                )
+                            else:
+                                q_tok = common_params.blk_coord[1]
+                            # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
+                            # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
+                            # Int32 __rsub__ quirks when self.seq_len_q==1.
+                            if cutlass.const_expr(self.cp_world == 1):
+                                # Non-DCP: causal bound is the full local context length
+                                # (identical to the pre-DCP behavior; folded at compile time).
+                                k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                            else:
+                                # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
+                                # the context (key c -> global position c*cp_world + dcp_rank). The
+                                # causal bound is therefore taken over the GLOBAL length passed in
+                                # K_causal (= global_seq - dcp_rank), divided by cp_world.
+                                k_bound = (
+                                    common_params.K_causal
+                                    - (self.seq_len_q - 1)
+                                    + q_tok
+                                    + self.cp_world
+                                    - 1
+                                ) // self.cp_world
+                        else:
+                            k_bound = common_params.K
+                        tTR_rAcc[i] = (
+                            tTR_rAcc[i]
+                            if cute.elem_less(
+                                tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                                k_bound,
+                            )
+                            else self.acc_dtype(-1.0e6)
+                        )
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0
@@ -4672,6 +4782,12 @@ def run(
     page_table_ref, page_table, page_table_torch = create_page_table(
         batch_size, seq_len_k, is_var_seq, page_size
     )
+    # The standalone self-check uses causal/non-causal decode, but the FP8
+    # callable always carries stable tree-mask pointers in its ABI.
+    custom_mask_torch = torch.ones(1, dtype=torch.bool, device="cuda")
+    custom_mask = from_dlpack(custom_mask_torch.view(torch.int8), assumed_align=1)
+    cmask_off_torch = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    cmask_off = from_dlpack(cmask_off_torch, assumed_align=4)
     cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
     hardware_info = utils.HardwareInfo()
     max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4784,6 +4900,8 @@ def run(
         c_latent,
         c_rope,
         page_table,
+        custom_mask,
+        cmask_off,
         o,
         lse,
         workspace,
@@ -4898,6 +5016,8 @@ def run(
             c_latent,
             c_rope,
             page_table,
+            custom_mask,
+            cmask_off,
             o,
             lse,
             workspace,
@@ -5035,6 +5155,8 @@ def run(
             c_latent,
             c_rope,
             page_table,
+            custom_mask,
+            cmask_off,
             o,
             lse,
             workspace,

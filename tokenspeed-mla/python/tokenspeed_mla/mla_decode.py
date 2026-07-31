@@ -49,6 +49,37 @@ from tokenspeed_mla.utils import (
     torch_to_cutlass_dtype,
 )
 
+_DUMMY_TREE_MASK_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_ZERO_CMASK_OFF_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _get_dummy_tree_mask_tensors(
+    device: torch.device, batch_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return persistent placeholders for the FP8 tree-mask kernel ABI."""
+
+    key = (str(device), int(batch_size))
+    cached = _DUMMY_TREE_MASK_CACHE.get(key)
+    if cached is None:
+        cached = (
+            torch.empty(1, dtype=torch.int8, device=device),
+            torch.empty(batch_size, dtype=torch.int32, device=device),
+        )
+        _DUMMY_TREE_MASK_CACHE[key] = cached
+    return cached
+
+
+def _get_zero_cmask_off_tensor(device: torch.device) -> torch.Tensor:
+    if torch.cuda.is_current_stream_capturing():
+        # A zero-fill first recorded during capture has not executed yet, so it
+        # must not escape into the eager cache before the graph is replayed.
+        return torch.zeros(1, dtype=torch.int32, device=device)
+    cached = _ZERO_CMASK_OFF_CACHE.get(str(device))
+    if cached is None:
+        cached = torch.zeros(1, dtype=torch.int32, device=device)
+        _ZERO_CMASK_OFF_CACHE[str(device)] = cached
+    return cached
+
 
 @functools.cache
 def _get_split_kv_and_workspace_size(
@@ -158,6 +189,7 @@ def _get_compiled_mla_kernel(
     causal_mask: bool = True,
     num_heads: int = 128,
     seq_len_q: int = 1,
+    tree_mask_mode: bool = False,
     cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
@@ -210,6 +242,8 @@ def _get_compiled_mla_kernel(
     if is_fp8:
         # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
+        if tree_mask_mode:
+            kernel_kwargs["tree_mask_mode"] = True
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -269,6 +303,17 @@ def _get_compiled_mla_kernel(
         stride_order=(1, 0),
         assumed_align=4,
     )
+    if is_fp8:
+        custom_mask_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int8,
+            (cute.sym_int(),),
+            assumed_align=1,
+        )
+        cmask_off_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch,),
+            assumed_align=4,
+        )
     # o: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
     o_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_out_dtype,
@@ -329,6 +374,10 @@ def _get_compiled_mla_kernel(
         c_latent_fake,
         c_rope_fake,
         page_table_fake,
+    ]
+    if is_fp8:
+        compile_args += [custom_mask_fake, cmask_off_fake]
+    compile_args += [
         o_fake,
         lse_fake,
         workspace_fake,
@@ -366,6 +415,8 @@ def tokenspeed_mla_decode(
     out: Optional[torch.Tensor] = None,
     is_var_seq: bool = True,
     causal_mask: bool = True,
+    custom_mask: Optional[torch.Tensor] = None,
+    cmask_off: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     return_lse: bool = False,  # also return log-sum-exp (DCP cross-rank merge)
     causal_seqs: Optional[
@@ -395,7 +446,9 @@ def tokenspeed_mla_decode(
     qk_rope_head_dim : int
         RoPE dimension (e.g. 64).
     block_tables : torch.Tensor
-        [B, max_pages] — page table indices.
+        [B, max_pages] — page table indices. Each request must provide enough
+        entries for complete 128-column key tiles, including the final padded
+        tile: ``ceil(seq_len_k / 128) * (128 / page_size)`` entries.
     seq_lens : torch.Tensor
         [B] — per-request KV sequence lengths.
     max_seq_len : int
@@ -413,6 +466,17 @@ def tokenspeed_mla_decode(
     causal_mask : bool
         Whether to enable causal masking in the CuTe DSL kernel.
         Currently this is effective for the FP8 kernel path.
+    custom_mask : Optional[torch.Tensor]
+        Contiguous CUDA bool tensor containing each request's row-major
+        ``[q_len, seq_len_k]`` SGLang EAGLE tree mask, concatenated over the
+        batch. Every history column before the final ``q_len`` columns must be
+        True; this is not a general sparse/window attention mask. Supported only
+        by the FP8 kernel.
+    cmask_off : Optional[torch.Tensor]
+        Contiguous CUDA int32 tensor with one base offset per request. Each
+        request must use compact row-major stride ``seq_lens[b]``; padded
+        ``max_seq_len`` row strides are unsupported. When omitted, compact
+        offsets are derived from ``seq_lens``.
     enable_pdl : bool
         When True, enables Programmatic Dependent Launch (PDL) on the
         underlying CuTe DSL decode kernel. Tokenspeed callers wire this from
@@ -477,6 +541,63 @@ def tokenspeed_mla_decode(
 
     # Page table: [B, max_pages]: passed directly, kernel reinterprets.
     page_table_k = block_tables
+
+    # Tree attention mask. View bool as int8 so graph capture retains the
+    # address of SGLang's persistent mask buffer.
+    if custom_mask is not None:
+        if q_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "custom_mask is supported only for the FP8 MLA decode kernel; "
+                f"got query dtype {q_dtype}"
+            )
+        if cp_world > 1:
+            raise ValueError(
+                "custom_mask with decode-context parallelism is unsupported: "
+                "the tree mask is rank-local while DCP causal bounds are global"
+            )
+        if custom_mask.dtype != torch.bool:
+            raise ValueError(
+                f"custom_mask must have dtype torch.bool, got {custom_mask.dtype}"
+            )
+        if custom_mask.device != query.device:
+            raise ValueError(
+                "custom_mask must be on the query device; "
+                f"got {custom_mask.device} and {query.device}"
+            )
+        if custom_mask.ndim != 1 or not custom_mask.is_contiguous():
+            raise ValueError("custom_mask must be a contiguous flattened 1-D tensor")
+        if custom_mask.numel() < q_len * max_seq_len:
+            raise ValueError(
+                "custom_mask is too small for the longest request: "
+                f"got {custom_mask.numel()} elements, need at least "
+                f"{q_len * max_seq_len}"
+            )
+        cmask_k = custom_mask.view(torch.int8).view(-1)
+        if cmask_off is not None:
+            if (
+                cmask_off.dtype != torch.int32
+                or cmask_off.device != query.device
+                or cmask_off.ndim != 1
+                or cmask_off.numel() != B
+                or not cmask_off.is_contiguous()
+            ):
+                raise ValueError(
+                    "cmask_off must be a contiguous 1-D torch.int32 tensor on "
+                    f"{query.device} with exactly {B} entries"
+                )
+            cmask_off_k = cmask_off
+        elif B == 1:
+            cmask_off_k = _get_zero_cmask_off_tensor(query.device)
+        else:
+            excl = torch.cumsum(seq_lens, dim=0, dtype=torch.int32) - seq_lens.to(
+                torch.int32
+            )
+            cmask_off_k = (q_len * excl).to(torch.int32)
+    else:
+        if cmask_off is not None:
+            raise ValueError("cmask_off requires custom_mask")
+        if q_dtype == torch.float8_e4m3fn:
+            cmask_k, cmask_off_k = _get_dummy_tree_mask_tensors(query.device, B)
 
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
@@ -620,6 +741,7 @@ def tokenspeed_mla_decode(
         causal_mask=causal_mask,
         num_heads=H,
         seq_len_q=q_len,
+        tree_mask_mode=custom_mask is not None,
         cp_world=cp_world,
         use_pdl=enable_pdl,
         return_lse=return_lse,
@@ -645,6 +767,10 @@ def tokenspeed_mla_decode(
         c_latent_k,
         c_rope_k,
         page_table_k,
+    ]
+    if is_fp8:
+        call_args += [cmask_k, cmask_off_k]
+    call_args += [
         o_k,
         lse_real,
         workspace_bytes,

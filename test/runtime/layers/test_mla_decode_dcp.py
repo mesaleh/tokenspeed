@@ -32,8 +32,17 @@ the merge weight is far from 0.5, which makes the (log2) LSE scaling load-bearin
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+TEST_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(TEST_ROOT))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=600, suite="runtime-1gpu")
 
 _HAS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 pytestmark = pytest.mark.skipif(
@@ -57,6 +66,8 @@ def _paged(key_rows, dtype):
     """Pack [n, D] key rows into a [pages, PAGE, D] cache + [1, pages] block table."""
     n = key_rows.shape[0]
     pages = (n + PAGE - 1) // PAGE
+    pages_per_tile = 128 // PAGE
+    pages = ((pages + pages_per_tile - 1) // pages_per_tile) * pages_per_tile
     cache = torch.zeros(pages, PAGE, D, device="cuda", dtype=dtype)
     cache.view(-1, D)[:n] = key_rows
     bt = torch.arange(pages, device="cuda", dtype=torch.int32).view(1, pages)
@@ -240,3 +251,7 @@ def test_dcp_requires_causal_seqs():
 
     with pytest.raises(ValueError, match="causal_seqs"):
         _decode(query, cache, bt, L, ws, dtype, cp_world=2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v", "-s"]))
