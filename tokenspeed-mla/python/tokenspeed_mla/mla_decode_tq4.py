@@ -50,6 +50,9 @@ from .utils import get_max_active_clusters, get_num_sm
 _M128_QK_TILER = (128, 128)
 _M128_PV_TILER = (128, 256)
 _M128_CLUSTER = (2, 1, 1)
+_M64_QK_TILER = (64, 128)
+_M64_PV_TILER = (64, 256)
+_M64_CLUSTER = (1, 1, 1)
 
 
 @functools.cache
@@ -67,15 +70,20 @@ def _get_compiled_tq4_m128_control(
     use_codebook: bool,
     use_pdl: bool,
     return_lse: bool,
+    use_m64: bool = False,
 ) -> Callable:
-    """Compile one explicit M=128 packed control specialization."""
+    """Compile one explicit packed control specialization."""
+
+    qk_tiler = _M64_QK_TILER if use_m64 else _M128_QK_TILER
+    pv_tiler = _M64_PV_TILER if use_m64 else _M128_PV_TILER
+    cluster = _M64_CLUSTER if use_m64 else _M128_CLUSTER
 
     kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
-        mma_qk_tiler_mn=_M128_QK_TILER,
-        mma_pv_tiler_mn=_M128_PV_TILER,
-        max_active_clusters=get_max_active_clusters(_M128_CLUSTER[0]),
+        mma_qk_tiler_mn=qk_tiler,
+        mma_pv_tiler_mn=pv_tiler,
+        max_active_clusters=get_max_active_clusters(cluster[0]),
         page_size=page_size,
         skip_correction_threshold=0.0,
         is_persistent=is_persistent,
@@ -285,8 +293,9 @@ def _tokenspeed_mla_decode_tq4_m128_control(
     kv_nope_codebook: Optional[torch.Tensor] = None,
     fp8_rope: bool = False,
     return_lse: bool = False,
+    _use_m64: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run the no-shadow packed reader through the forced M=128 control."""
+    """Run the no-shadow packed reader through an explicit control tiler."""
 
     shape, packed, rope = validate_tq4_decode_inputs(
         query,
@@ -311,25 +320,27 @@ def _tokenspeed_mla_decode_tq4_m128_control(
     mask, offsets = _tree_mask_args(
         query, seq_lens, max_seq_len, custom_mask, cmask_off
     )
+    qk_tiler = _M64_QK_TILER if _use_m64 else _M128_QK_TILER
+    cluster = _M64_CLUSTER if _use_m64 else _M128_CLUSTER
     fold = get_mla_decode_fold_sq_factor(
-        shape.num_heads, shape.query_length, _M128_QK_TILER[0]
+        shape.num_heads, shape.query_length, qk_tiler[0]
     )
     heads_eff = shape.num_heads * fold
     q_len_eff = shape.query_length // fold
-    tile_count = (max_seq_len + _M128_QK_TILER[1] - 1) // _M128_QK_TILER[1]
-    required_pages = tile_count * (_M128_QK_TILER[1] // shape.page_size)
+    tile_count = (max_seq_len + qk_tiler[1] - 1) // qk_tiler[1]
+    required_pages = tile_count * (qk_tiler[1] // shape.page_size)
     if block_tables.shape[1] < required_pages:
         raise ValueError(
-            f"M=128 TQ4 control needs {required_pages} page columns, "
+            f"TQ4 control needs {required_pages} page columns, "
             f"got {block_tables.shape[1]}"
         )
     split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
         shape.batch_size,
         q_len_eff,
         max_seq_len,
-        _M128_QK_TILER,
+        qk_tiler,
         get_num_sm(query.device),
-        _M128_CLUSTER[0],
+        cluster[0],
     )
     if split_kv_override is not None:
         split_kv = split_kv_override
@@ -383,6 +394,7 @@ def _tokenspeed_mla_decode_tq4_m128_control(
         use_codebook=kv_nope_codebook is not None,
         use_pdl=enable_pdl,
         return_lse=return_lse,
+        use_m64=_use_m64,
     )
 
     import tvm_ffi
@@ -410,3 +422,9 @@ def _tokenspeed_mla_decode_tq4_m128_control(
             kv_nope_codebook,
         )
     return (output, lse) if return_lse else output
+
+
+def _tokenspeed_mla_decode_tq4_m64_control(*args, **kwargs):
+    """Run the private serial M=64 correctness specialization."""
+    kwargs["_use_m64"] = True
+    return _tokenspeed_mla_decode_tq4_m128_control(*args, **kwargs)

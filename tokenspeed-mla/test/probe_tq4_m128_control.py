@@ -8,7 +8,10 @@ import json
 import torch
 
 from tokenspeed_mla.mla_decode import tokenspeed_mla_decode
-from tokenspeed_mla.mla_decode_tq4 import _tokenspeed_mla_decode_tq4_m128_control
+from tokenspeed_mla.mla_decode_tq4 import (
+    _tokenspeed_mla_decode_tq4_m128_control,
+    _tokenspeed_mla_decode_tq4_m64_control,
+)
 from tokenspeed_mla.tq4_contract import dequantize_tq4_reference
 
 
@@ -118,7 +121,17 @@ def _run_case(
         qk_rope_head_dim=64,
         **common,
     )
-    packed_output, packed_lse = _tokenspeed_mla_decode_tq4_m128_control(
+    packed_m128_output, packed_m128_lse = _tokenspeed_mla_decode_tq4_m128_control(
+        kv_nope_packed=case["packed"],
+        kv_nope_scale=case["scales"],
+        kv_rope=case["rope_storage"],
+        centroids=case["centroids"],
+        kv_nope_codebook=case["codebook"],
+        fp8_rope=case["fp8_rope"],
+        split_kv_override=1,
+        **common,
+    )
+    packed_m64_output, packed_m64_lse = _tokenspeed_mla_decode_tq4_m64_control(
         kv_nope_packed=case["packed"],
         kv_nope_scale=case["scales"],
         kv_rope=case["rope_storage"],
@@ -129,8 +142,13 @@ def _run_case(
         **common,
     )
     torch.cuda.synchronize()
-    output_error = (dense_output.float() - packed_output.float()).abs()
-    lse_error = (dense_lse - packed_lse).abs()
+    m128_output_error = (dense_output.float() - packed_m128_output.float()).abs()
+    m128_lse_error = (dense_lse - packed_m128_lse).abs()
+    m64_output_error = (dense_output.float() - packed_m64_output.float()).abs()
+    m64_lse_error = (dense_lse - packed_m64_lse).abs()
+    packed_cross_error = (
+        packed_m128_output.float() - packed_m64_output.float()
+    ).abs()
     result = {
         "q_len": q_len,
         "tree_mask": tree_mask,
@@ -138,17 +156,29 @@ def _run_case(
         "use_codebook": use_codebook,
         "fp8_rope": fp8_rope,
         "enable_pdl": enable_pdl,
-        "output_max_abs": float(output_error.max()),
-        "output_mean_abs": float(output_error.mean()),
-        "lse_max_abs": float(lse_error.max()),
+        "m128_output_max_abs": float(m128_output_error.max()),
+        "m128_output_mean_abs": float(m128_output_error.mean()),
+        "m128_lse_max_abs": float(m128_lse_error.max()),
+        "m64_output_max_abs": float(m64_output_error.max()),
+        "m64_output_mean_abs": float(m64_output_error.mean()),
+        "m64_lse_max_abs": float(m64_lse_error.max()),
+        "packed_cross_max_abs": float(packed_cross_error.max()),
         "finite": bool(
-            torch.isfinite(packed_output.float()).all()
-            and torch.isfinite(packed_lse).all()
+            torch.isfinite(packed_m128_output.float()).all()
+            and torch.isfinite(packed_m128_lse).all()
+            and torch.isfinite(packed_m64_output.float()).all()
+            and torch.isfinite(packed_m64_lse).all()
         ),
     }
     if not result["finite"]:
         raise AssertionError(f"non-finite packed control output: {result}")
-    if result["output_max_abs"] > 0.125 or result["lse_max_abs"] > 0.125:
+    if (
+        result["m128_output_max_abs"] > 0.125
+        or result["m128_lse_max_abs"] > 0.125
+        or result["m64_output_max_abs"] > 0.125
+        or result["m64_lse_max_abs"] > 0.125
+        or result["packed_cross_max_abs"] > 0.125
+    ):
         raise AssertionError(f"packed control drift exceeds component gate: {result}")
     return result
 
@@ -170,9 +200,17 @@ def main() -> None:
         _run_case(
             5,
             True,
-            heads=16,
+            heads=8,
             use_codebook=True,
             fp8_rope=True,
+            enable_pdl=True,
+        ),
+        _run_case(
+            1,
+            False,
+            heads=16,
+            use_codebook=False,
+            fp8_rope=False,
             enable_pdl=True,
         ),
     ]
