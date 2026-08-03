@@ -1,0 +1,20 @@
+{
+  "image_digest": "gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:v0516-stock-sync-gb200-prod@sha256:052c4d3ae33c0183e45d3c4d663acf1f393398662e34f70a6c1586392ab47a95",
+  "record_type": "ts-c58-r-source-identity",
+  "schema_version": 1,
+  "source_commit": "2f378dad7b0591b97dc7f3b682636068b0783c55",
+  "source_hashes": {
+    "tokenspeed-mla/python/tokenspeed_mla/mla_decode.py": "486ae159e59738181c2877073d33afced64020aaaaf7a1bb6cc8e5f6997088ad",
+    "tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py": "8eaf030b5d37c9031aef417514946bdf7ae4763b60dcf0761ef84060a1d4563a",
+    "tokenspeed-mla/python/tokenspeed_mla/mla_decode_tq4.py": "ab2d8793d60e74eca9a746d9b8ad848c8fcee5ed4996954bf7b2e632dd2f5e45",
+    "tokenspeed-mla/python/tokenspeed_mla/tq4_contract.py": "48d7d01eb46bfab48e37901dff9abe3e8b3d9575fa3e12d77ea44c7f138da70f",
+    "tokenspeed-mla/python/tokenspeed_mla/tq4_cutedsl.py": "8cb9354f9f82d59ab10999e933005b7cd3cd90f2721cfcc54f9d84ab7fd4aa18",
+    "tokenspeed-mla/test/probe_tq4_m128_control.py": "a1d6ede9bbae8bd07bc80966542482bff4f3682cf41e5c38cdf7f7ecb6cce5fd",
+    "tokenspeed-mla/test/ts_c58_r/barrier_litmus.py": "7e4414c10dd280f825c34448e1769df2b3c0617a485a8bd04e5ee786c84c7ed8",
+    "tokenspeed-mla/test/ts_c58_r/inspect_barrier_source.py": "6850c4e1afef10a26822ca19a5688b2cca95463643167161f99681ccd2650d89",
+    "tokenspeed-mla/test/ts_c58_r/probe_tq4_m128_sanitizer.py": "5ec60c25487f6c394f193658225ba216cf747d911b1380643048ad60197a0d5b",
+    "tokenspeed-mla/test/ts_c58_r/test_evidence_tools.py": "4132c9ec341a913b02bcbf52a4c6f11de50e013761f7532ec72cddbab105eb6d",
+    "tokenspeed-mla/test/ts_c58_r/test_unaligned_handoff_source.py": "8dd28cb741f8e5d5b1e09ae4bf941111a729095cf9cfb86ed6f3cce594330f90",
+    "tokenspeed-mla/test/test_tq4_contract.py": "74240bea976115ef0f88370eb3ca98b268c8c5a197d9e975a8483c65843e36d3"
+  }
+}
