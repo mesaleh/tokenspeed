@@ -38,6 +38,7 @@ def semantic_role(inventory: dict, barrier_id: int, count: int) -> tuple[str, li
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arm", choices=("m128", "dense"), required=True)
     parser.add_argument("--provenance", type=Path, required=True)
     parser.add_argument("--thread-map", type=Path, required=True)
     parser.add_argument("--synccheck-seal", type=Path, required=True)
@@ -72,10 +73,14 @@ def main() -> int:
     require(
         synccheck_seal.get("record_type") == "ts-c58-r-execution-seal"
         and synccheck_seal.get("status") == "pass"
-        and synccheck_seal.get("cell_id") == "accepted-target-synccheck-map"
+        and synccheck_seal.get("cell_id")
+        == {
+            "m128": "accepted-target-synccheck-map",
+            "dense": "dense-control-synccheck",
+        }[args.arm]
         and synccheck_seal.get("sanitizer_tool") == "synccheck"
         and synccheck_seal.get("actual_outcome") == "diagnosed_sync_error",
-        "accepted synccheck execution seal differs",
+        "selected-arm synccheck execution seal differs",
     )
     require(
         synccheck_seal.get("source_commit") == provenance.get("source_commit")
@@ -104,7 +109,8 @@ def main() -> int:
     )
     require(
         manifest.get("record_type") == "ts-c58-r-disassembly-manifest"
-        and manifest.get("status") == "pass",
+        and manifest.get("status") == "pass"
+        and manifest.get("arm") == args.arm,
         "disassembly manifest differs",
     )
     require(
@@ -187,6 +193,7 @@ def main() -> int:
         "schema_version": 1,
         "record_type": "ts-c58-r-pc-mapping",
         "status": "pass",
+        "arm": args.arm,
         "source_commit": provenance["source_commit"],
         "source_identity_sha256": provenance["source_identity_sha256"],
         "image_digest": provenance["image_digest"],

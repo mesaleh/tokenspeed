@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and seal PTX plus SM100 SASS for the accepted TS-C58-R oracle."""
+"""Capture and seal PTX plus SM100 SASS for one accepted TS-C58-R oracle."""
 
 from __future__ import annotations
 
@@ -85,6 +85,7 @@ def main() -> int:
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--identity", type=Path, required=True)
     parser.add_argument("--provenance", type=Path, required=True)
+    parser.add_argument("--arm", choices=("m128", "dense"), required=True)
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--oracle-seal", type=Path, required=True)
     parser.add_argument("--ptx", type=Path, required=True)
@@ -118,10 +119,14 @@ def main() -> int:
 
     oracle, oracle_raw = load_json(args.oracle)
     oracle_seal, oracle_seal_raw = load_json(args.oracle_seal)
+    oracle_cell = {
+        "m128": "accepted-target-unsanitized",
+        "dense": "dense-control-unsanitized",
+    }[args.arm]
     require(
         oracle.get("record_type") == "ts-c58-r-decode-oracle"
         and oracle.get("status") == "pass"
-        and oracle.get("arm") == "m128"
+        and oracle.get("arm") == args.arm
         and oracle.get("mode") == "unsanitized",
         "accepted unsanitized oracle differs",
     )
@@ -140,7 +145,7 @@ def main() -> int:
     require(
         oracle_seal.get("record_type") == "ts-c58-r-execution-seal"
         and oracle_seal.get("status") == "pass"
-        and oracle_seal.get("cell_id") == "accepted-target-unsanitized"
+        and oracle_seal.get("cell_id") == oracle_cell
         and oracle_seal.get("actual_outcome") == "clean"
         and oracle_seal.get("sanitizer_tool") is None,
         "accepted oracle execution seal differs",
@@ -171,8 +176,13 @@ def main() -> int:
     ptx_barriers = parse_ptx_barriers(ptx_text)
     require(any(row["barrier_id"] == 1 and row["count"] == 288 for row in ptx_barriers),
             "PTX ID-1/count-288 barrier is absent")
-    require(any(row["barrier_id"] == 6 and row["count"] == 128 for row in ptx_barriers),
-            "PTX ID-6/count-128 barrier is absent")
+    ptx_has_tq4_barrier = any(
+        row["barrier_id"] == 6 and row["count"] == 128 for row in ptx_barriers
+    )
+    require(
+        ptx_has_tq4_barrier == (args.arm == "m128"),
+        "PTX ID-6/count-128 presence differs from the selected arm",
+    )
 
     nvdisasm = args.nvdisasm.resolve()
     require(nvdisasm.is_file() and nvdisasm.is_absolute(), "nvdisasm path differs")
@@ -189,8 +199,13 @@ def main() -> int:
     sass_barriers = parse_sass_barriers(disassembly_text)
     require(any(row["barrier_id"] == 1 and row["count"] == 288 for row in sass_barriers),
             "SASS ID-1/count-288 barrier is absent")
-    require(any(row["barrier_id"] == 6 and row["count"] == 128 for row in sass_barriers),
-            "SASS ID-6/count-128 barrier is absent")
+    sass_has_tq4_barrier = any(
+        row["barrier_id"] == 6 and row["count"] == 128 for row in sass_barriers
+    )
+    require(
+        sass_has_tq4_barrier == (args.arm == "m128"),
+        "SASS ID-6/count-128 presence differs from the selected arm",
+    )
     functions = sorted(set(FUNCTION.findall(disassembly_text)))
     require(len(functions) == 1, "disassembly function set is not singular")
     write_exclusive(args.disassembly, completed.stdout)
@@ -199,6 +214,7 @@ def main() -> int:
         "schema_version": 1,
         "record_type": "ts-c58-r-disassembly-manifest",
         "status": "pass",
+        "arm": args.arm,
         "source_commit": identity["source_commit"],
         "source_identity_sha256": identity_sha256,
         "image_digest": provenance["image_digest"],
