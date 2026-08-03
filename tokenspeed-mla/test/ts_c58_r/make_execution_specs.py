@@ -35,9 +35,24 @@ def main() -> int:
     probe = tool_root / "probe_tq4_m128_sanitizer.py"
     litmus = tool_root / "barrier_litmus.py"
 
+    def exact_environment(cell: str) -> list[str]:
+        dump_dir = evidence_root / "compiler-artifacts" / cell
+        cache_dir = evidence_root / "compiler-cache" / cell
+        return [
+            "/usr/bin/env",
+            f"CUTE_DSL_CACHE_DIR={cache_dir}",
+            f"CUTE_DSL_DUMP_DIR={dump_dir}",
+            "CUTE_DSL_KEEP=ir,ptx,cubin",
+            f"CUTE_EXPERIMENTAL_DSL_CACHE_DIR={cache_dir}",
+            f"CUTE_EXPERIMENTAL_DSL_DUMP_DIR={dump_dir}",
+            "CUTE_EXPERIMENTAL_DSL_KEEP=ir,ptx,cubin",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "TORCH_EXTENSIONS_DIR=/workspace/torch-extensions",
+        ]
+
     def probe_command(cell: str, arm: str, mode: str, *, expected: str | None = None) -> list[str]:
         output = evidence_root / cell / "result.json"
-        command = [
+        command = exact_environment(cell) + [
             sys.executable, str(probe),
             "--source-root", str(source_root),
             "--identity", str(identity_path),
@@ -52,7 +67,7 @@ def main() -> int:
         return command
 
     def litmus_command(cell: str, litmus_cell: str | None) -> list[str]:
-        command = [
+        command = exact_environment(cell) + [
             sys.executable, str(litmus),
             "--device-index", str(args.device_index),
             "--target-uuid", target_uuid,
@@ -109,6 +124,7 @@ def main() -> int:
         requirements=result_requirements(
             "ts-c58-r-decode-oracle", arm="m128", mode="unsanitized",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
+            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             wrapper_sha256=sha256_file(probe),
         ),
     )
@@ -121,6 +137,7 @@ def main() -> int:
             "ts-c58-r-decode-oracle", arm="m128", mode="racecheck",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
             hashes_match_unsanitized=True,
+            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             wrapper_sha256=sha256_file(probe),
         ),
     )
@@ -135,6 +152,7 @@ def main() -> int:
             "ts-c58-r-decode-oracle", arm="m128", mode="synccheck",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
             hashes_match_unsanitized=True,
+            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             wrapper_sha256=sha256_file(probe),
         ),
     )
@@ -145,6 +163,7 @@ def main() -> int:
         requirements=result_requirements(
             "ts-c58-r-decode-oracle", arm="dense", mode="unsanitized",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
+            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             wrapper_sha256=sha256_file(probe),
         ),
     )
@@ -159,6 +178,7 @@ def main() -> int:
             "ts-c58-r-decode-oracle", arm="dense", mode="synccheck",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
             hashes_match_unsanitized=True,
+            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             wrapper_sha256=sha256_file(probe),
         ),
     )

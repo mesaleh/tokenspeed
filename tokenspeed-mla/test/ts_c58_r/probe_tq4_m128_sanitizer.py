@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -51,6 +52,33 @@ def tensor_digest(tensor: torch.Tensor) -> dict[str, Any]:
         "nbytes": len(raw),
         "finite": bool(torch.isfinite(value.float()).all()),
     }
+
+
+def compiler_artifacts() -> tuple[Path, Path, str, list[dict[str, Any]]]:
+    dump_raw = os.environ.get("CUTE_DSL_DUMP_DIR", "")
+    cache_raw = os.environ.get("CUTE_DSL_CACHE_DIR", "")
+    keep = os.environ.get("CUTE_DSL_KEEP", "")
+    dump_dir = Path(dump_raw)
+    cache_dir = Path(cache_raw)
+    require(dump_dir.is_absolute() and cache_dir.is_absolute(),
+            "compiler artifact/cache directories are not absolute")
+    require(keep == "ir,ptx,cubin", "compiler artifact keep contract differs")
+    entries = []
+    for path in sorted(item for item in dump_dir.rglob("*") if item.is_file()):
+        relative = path.relative_to(dump_dir).as_posix()
+        entries.append(
+            {
+                "path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "suffix": path.suffix,
+            }
+        )
+    require(entries, "compiler artifact inventory is empty")
+    suffixes = {entry["suffix"] for entry in entries}
+    require(".ptx" in suffixes and ".cubin" in suffixes,
+            "compiler PTX/CUBIN artifacts are absent")
+    return dump_dir, cache_dir, keep, entries
 
 
 def main() -> int:
@@ -148,6 +176,7 @@ def main() -> int:
             }
         )
 
+    dump_dir, cache_dir, keep, artifacts = compiler_artifacts()
     value: dict[str, Any] = {
         "schema_version": 1,
         "record_type": "ts-c58-r-decode-oracle",
@@ -164,6 +193,11 @@ def main() -> int:
         "target_uuid": target_uuid,
         "device_name": torch.cuda.get_device_name(),
         "compute_capability": list(torch.cuda.get_device_capability()),
+        "compiler_dump_dir": str(dump_dir),
+        "compiler_cache_dir": str(cache_dir),
+        "compiler_keep": keep,
+        "compiler_artifacts_present": True,
+        "compiler_artifacts": artifacts,
         "cases": results,
     }
     if args.expected is not None:
@@ -173,7 +207,8 @@ def main() -> int:
             for key in (
                 "status", "record_type", "arm", "source_commit", "source_identity_sha256",
                 "builder_sha256", "wrapper_sha256", "device_index", "device_uuid",
-                "target_uuid", "compute_capability", "cases",
+                "target_uuid", "compute_capability", "compiler_keep",
+                "compiler_artifacts_present", "compiler_artifacts", "cases",
             )
         }
         actual_comparable = {
