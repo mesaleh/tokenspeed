@@ -24,6 +24,7 @@ TOOL_FILES = (
     "seal_gpu_recovery.py",
     "seal_synccheck_exception.py",
     "inspect_barrier_source.py",
+    "analyze_r1_results.py",
     "analyze_split_site_results.py",
     "barrier_litmus.py",
     "barrier_split_site_litmus.py",
@@ -35,6 +36,7 @@ TOOL_FILES = (
     "make_provenance.py",
     "parse_synccheck_report.py",
     "make_execution_specs.py",
+    "make_r1_specs.py",
     "make_split_site_specs.py",
     "resolve_cuda_ordinal.py",
     "analyze_b1965.py",
@@ -102,6 +104,7 @@ def main() -> int:
             "execution spec suite identity differs")
     expected_generator = {
         None: "make_execution_specs.py",
+        "r1-repair": "make_r1_specs.py",
         "split-site-discriminator": "make_split_site_specs.py",
     }.get(suite.get("campaign"))
     require(expected_generator is not None, "execution spec campaign differs")

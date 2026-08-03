@@ -62,7 +62,15 @@ Fixed rules:
 - `inspect_barrier_source.py`: records barrier/warp/call-site source geometry.
 - `capture_disassembly.py`: for an explicit M128 or dense arm, binds its accepted
   oracle PTX/CUBIN, exact oracle execution seal, `nvdisasm` binary/version,
-  arm-specific named-barrier operands, and the resulting SASS.
+  arm-specific named-barrier operands, aligned/unaligned PTX flavor, and the
+  resulting SASS. It can select the sole oracle-bound PTX/CUBIN pair from an
+  exact compiler-artifact root.
+- `make_r1_specs.py`: predeclares the two candidate oracles, two formal
+  disassemblies, M128 racecheck, and matched M128/dense synccheck cells.
+- `analyze_r1_results.py`: requires the full seven-cell execution set, all
+  sanitizer recovery seals, exact accepted output/LSE hashes, three explicit
+  unaligned ID-1/count-288 sites per arm, and preserved M128 ID-6 sites before
+  it can select the R1 candidate.
 - `map_barrier_pc.py`: requires a complete synccheck thread map and maps its
   exact, execution-sealed report PC for the explicit M128 or dense arm through
   SASS operands and PTX candidates to one source-level named-barrier role.
@@ -89,3 +97,12 @@ predicted branch is aligned diagnosed plus unaligned clean. Both diagnosed
 selects a one-PC or replacement protocol; both clean rules out static-site
 splitting alone; unaligned-only diagnosis is a counter-hypothesis. No branch
 edits the accepted kernel until the analyzer result is reviewed.
+
+For the selected R1 repair, the fixed order is: candidate identity and complete
+spec suite; M128 and dense unsanitized oracles; formal PTX/SASS capture for both
+arms; M128 racecheck; M128 synccheck; dense synccheck; machine analysis. Both
+candidate oracles must match the accepted output/LSE case hashes exactly. PTX
+must contain exactly three explicit unaligned `barrier.sync` ID-1/count-288
+sites for each arm; M128 must retain exactly six ID-6/count-128 sites and dense
+must retain none. All sanitizer cells must be clean and have zero-delta recovery
+seals. This correctness decision makes no performance or memory claim.

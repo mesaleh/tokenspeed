@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and seal PTX plus SM100 SASS for one accepted TS-C58-R oracle."""
+"""Capture and seal PTX plus SM100 SASS for one TS-C58-R oracle."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import re
 import subprocess
 
 from evidence_common import (
+    EvidenceError,
+    canonical_uuid,
     load_json,
     require,
     sha256_bytes,
@@ -27,7 +29,8 @@ SASS_BARRIER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 PTX_BARRIER = re.compile(
-    r"^\s*bar\.sync\s+(0x[0-9a-f]+|[0-9]+),\s*"
+    r"^\s*(bar(?:rier)?\.sync)(\.aligned)?\s+"
+    r"(0x[0-9a-f]+|[0-9]+),\s*"
     r"(0x[0-9a-f]+|[0-9]+)\s*;\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -78,12 +81,16 @@ def parse_ptx_barriers(text: str) -> list[dict]:
     for line_number, line in enumerate(lines, start=1):
         match = PTX_BARRIER.fullmatch(line)
         if match:
+            instruction = match.group(1).lower()
+            aligned_suffix = match.group(2) is not None
             result.append(
                 {
                     "line": line_number,
                     "text": line.strip(),
-                    "barrier_id": parse_number(match.group(1)),
-                    "count": parse_number(match.group(2)),
+                    "instruction": instruction + (".aligned" if aligned_suffix else ""),
+                    "aligned": instruction == "bar.sync" or aligned_suffix,
+                    "barrier_id": parse_number(match.group(3)),
+                    "count": parse_number(match.group(4)),
                 }
             )
     return result
@@ -102,16 +109,42 @@ def require_artifact(oracle: dict, path: Path, suffix: str) -> dict:
     return expected
 
 
+def select_artifact(oracle: dict, artifact_root: Path, suffix: str) -> Path:
+    matches = [
+        item for item in oracle.get("compiler_artifacts", [])
+        if isinstance(item, dict) and item.get("suffix") == suffix
+    ]
+    require(len(matches) == 1, f"oracle {suffix} artifact is absent or ambiguous")
+    relative = matches[0].get("path")
+    require(
+        isinstance(relative, str)
+        and relative
+        and not relative.startswith("/")
+        and ".." not in Path(relative).parts,
+        f"oracle {suffix} path is unsafe",
+    )
+    path = (artifact_root / relative).resolve()
+    try:
+        path.relative_to(artifact_root)
+    except ValueError as exc:
+        raise EvidenceError(f"oracle {suffix} path escapes artifact root") from exc
+    require(path.is_file(), f"oracle {suffix} artifact is absent")
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--identity", type=Path, required=True)
     parser.add_argument("--provenance", type=Path, required=True)
+    parser.add_argument("--target-uuid", required=True)
+    parser.add_argument("--device-index", type=int, required=True)
     parser.add_argument("--arm", choices=("m128", "dense"), required=True)
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--oracle-seal", type=Path, required=True)
-    parser.add_argument("--ptx", type=Path, required=True)
-    parser.add_argument("--cubin", type=Path, required=True)
+    parser.add_argument("--ptx", type=Path)
+    parser.add_argument("--cubin", type=Path)
+    parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--nvdisasm", type=Path, required=True)
     parser.add_argument("--disassembly", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -133,6 +166,11 @@ def main() -> int:
         provenance.get("source_commit") == identity["source_commit"]
         and provenance.get("source_identity_sha256") == identity_sha256,
         "provenance source differs",
+    )
+    require(
+        provenance.get("target_uuid") == canonical_uuid(args.target_uuid)
+        and provenance.get("device_index") == args.device_index,
+        "provenance CUDA target differs",
     )
     require(
         provenance.get("tool_hashes", {}).get(Path(__file__).name) == sha256_file(Path(__file__)),
@@ -188,8 +226,25 @@ def main() -> int:
         "oracle execution seal tool identity differs",
     )
 
-    ptx = args.ptx.resolve()
-    cubin = args.cubin.resolve()
+    if args.artifact_root is None:
+        require(args.ptx is not None and args.cubin is not None,
+                "explicit PTX and CUBIN paths are required")
+        ptx = args.ptx.resolve()
+        cubin = args.cubin.resolve()
+    else:
+        require(args.ptx is None and args.cubin is None,
+                "artifact root cannot be combined with explicit artifacts")
+        artifact_root = args.artifact_root.resolve()
+        require(artifact_root.is_dir(), "artifact root is absent")
+        compiler_dump_dir = oracle.get("compiler_dump_dir")
+        require(
+            isinstance(compiler_dump_dir, str)
+            and Path(compiler_dump_dir).is_absolute()
+            and Path(compiler_dump_dir).resolve() == artifact_root,
+            "oracle compiler dump root differs",
+        )
+        ptx = select_artifact(oracle, artifact_root, ".ptx")
+        cubin = select_artifact(oracle, artifact_root, ".cubin")
     require(ptx.is_file() and cubin.is_file(), "compiler artifacts are absent")
     require_artifact(oracle, ptx, ".ptx")
     require_artifact(oracle, cubin, ".cubin")

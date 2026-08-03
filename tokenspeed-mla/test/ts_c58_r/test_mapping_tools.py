@@ -84,11 +84,19 @@ class MappingToolTests(unittest.TestCase):
                  "barrier_id": 6, "count": 128},
             ],
         )
-        ptx = "\n\tbar.sync \t6, 128;\n\tbar.sync \t0x1, 0x120;\n"
+        ptx = (
+            "\n\tbar.sync \t6, 128;\n"
+            "\tbarrier.sync.aligned 2, 64;\n"
+            "\tbarrier.sync 0x1, 0x120;\n"
+        )
         self.assertEqual(
-            [(row["line"], row["barrier_id"], row["count"])
+            [(row["line"], row["instruction"], row["aligned"], row["barrier_id"], row["count"])
              for row in parse_ptx_barriers(ptx)],
-            [(2, 6, 128), (3, 1, 288)],
+            [
+                (2, "bar.sync", True, 6, 128),
+                (3, "barrier.sync.aligned", True, 2, 64),
+                (4, "barrier.sync", False, 1, 288),
+            ],
         )
 
     def test_sass_operands_map_uniquely_to_source_contract(self):
