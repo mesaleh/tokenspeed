@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from capture_disassembly import parse_sass_barriers
+from capture_disassembly import parse_sass_function_barriers
 from evidence_common import load_json, require, sha256_bytes, sha256_file, write_json_exclusive
 
 
@@ -152,13 +152,18 @@ def main() -> int:
     offset = thread_map.get("pc_offset_hex")
     require(isinstance(offset, str) and offset.startswith("0x"), "synccheck PC syntax differs")
     address = int(offset, 16)
-    barriers = parse_sass_barriers(disassembly_text)
-    at_pc = [row for row in barriers if int(row["address_hex"], 16) == address]
+    barriers = parse_sass_function_barriers(disassembly_text)
+    at_pc = [
+        row for row in barriers
+        if row["function"] == symbol and int(row["address_hex"], 16) == address
+    ]
     require(len(at_pc) == 1, "synccheck PC is not one exact named SASS barrier")
     mapped = at_pc[0]
     matching_sass = [
         row["address_hex"] for row in barriers
-        if row["barrier_id"] == mapped["barrier_id"] and row["count"] == mapped["count"]
+        if row["function"] == symbol
+        and row["barrier_id"] == mapped["barrier_id"]
+        and row["count"] == mapped["count"]
     ]
     matching_ptx = [
         row for row in manifest.get("ptx_named_barriers", [])

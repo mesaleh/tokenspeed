@@ -50,6 +50,28 @@ def parse_sass_barriers(text: str) -> list[dict]:
     ]
 
 
+def parse_sass_function_barriers(text: str) -> list[dict]:
+    current_function = None
+    result = []
+    for line in text.splitlines():
+        function_match = FUNCTION.fullmatch(line)
+        if function_match is not None:
+            current_function = function_match.group(1)
+        barrier_match = SASS_BARRIER.fullmatch(line)
+        if barrier_match is not None:
+            address, instruction, barrier_id, count = barrier_match.groups()
+            result.append(
+                {
+                    "function": current_function,
+                    "address_hex": f"0x{address.lower()}",
+                    "instruction": instruction.upper(),
+                    "barrier_id": int(barrier_id, 16),
+                    "count": int(count, 16),
+                }
+            )
+    return result
+
+
 def parse_ptx_barriers(text: str) -> list[dict]:
     lines = text.splitlines()
     result = []
@@ -196,7 +218,11 @@ def main() -> int:
     require(completed.stderr == b"", "nvdisasm stderr is not empty")
     require(bool(completed.stdout), "nvdisasm output is empty")
     disassembly_text = completed.stdout.decode("utf-8")
-    sass_barriers = parse_sass_barriers(disassembly_text)
+    sass_barriers = parse_sass_function_barriers(disassembly_text)
+    require(
+        sass_barriers and all(row["function"] is not None for row in sass_barriers),
+        "SASS named barriers are not function scoped",
+    )
     require(any(row["barrier_id"] == 1 and row["count"] == 288 for row in sass_barriers),
             "SASS ID-1/count-288 barrier is absent")
     sass_has_tq4_barrier = any(
@@ -207,7 +233,7 @@ def main() -> int:
         "SASS ID-6/count-128 presence differs from the selected arm",
     )
     functions = sorted(set(FUNCTION.findall(disassembly_text)))
-    require(len(functions) == 1, "disassembly function set is not singular")
+    require(bool(functions), "disassembly function set is empty")
     write_exclusive(args.disassembly, completed.stdout)
 
     value = {

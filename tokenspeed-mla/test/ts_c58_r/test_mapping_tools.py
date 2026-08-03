@@ -9,7 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from capture_disassembly import parse_ptx_barriers, parse_sass_barriers  # noqa: E402
+from capture_disassembly import (  # noqa: E402
+    parse_ptx_barriers,
+    parse_sass_barriers,
+    parse_sass_function_barriers,
+)
 from evidence_common import EvidenceError, sha256_bytes  # noqa: E402
 from map_barrier_pc import semantic_role  # noqa: E402
 
@@ -100,6 +104,41 @@ class MappingToolTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(EvidenceError, "does not map uniquely"):
             semantic_role(inventory, 1, 128)
+
+    def test_sass_barriers_are_scoped_to_each_cuda_function(self):
+        sass = """
+        .global reduction_kernel
+        /*ca60*/ BAR.SYNC.DEFER_BLOCKING 0x2, 0x40 ;
+        .global split_kv_kernel
+        /*ca60*/ BAR.SYNC.DEFER_BLOCKING 0x1, 0x120 ;
+        /*cb00*/ BAR.SYNC.DEFER_BLOCKING 0x1, 0x120 ;
+        """
+        self.assertEqual(
+            parse_sass_function_barriers(sass),
+            [
+                {
+                    "function": "reduction_kernel",
+                    "address_hex": "0xca60",
+                    "instruction": "BAR.SYNC.DEFER_BLOCKING",
+                    "barrier_id": 2,
+                    "count": 64,
+                },
+                {
+                    "function": "split_kv_kernel",
+                    "address_hex": "0xca60",
+                    "instruction": "BAR.SYNC.DEFER_BLOCKING",
+                    "barrier_id": 1,
+                    "count": 288,
+                },
+                {
+                    "function": "split_kv_kernel",
+                    "address_hex": "0xcb00",
+                    "instruction": "BAR.SYNC.DEFER_BLOCKING",
+                    "barrier_id": 1,
+                    "count": 288,
+                },
+            ],
+        )
 
 
 if __name__ == "__main__":
