@@ -16,6 +16,7 @@ import torch
 
 from evidence_common import (
     canonical_uuid,
+    compiler_semantic_contract,
     load_json,
     require,
     sha256_bytes,
@@ -177,6 +178,7 @@ def main() -> int:
         )
 
     dump_dir, cache_dir, keep, artifacts = compiler_artifacts()
+    semantic_contract = compiler_semantic_contract(dump_dir, artifacts)
     value: dict[str, Any] = {
         "schema_version": 1,
         "record_type": "ts-c58-r-decode-oracle",
@@ -198,6 +200,7 @@ def main() -> int:
         "compiler_keep": keep,
         "compiler_artifacts_present": True,
         "compiler_artifacts": artifacts,
+        "compiler_semantic_contract": semantic_contract,
         "cases": results,
     }
     if args.expected is not None:
@@ -208,7 +211,7 @@ def main() -> int:
                 "status", "record_type", "arm", "source_commit", "source_identity_sha256",
                 "builder_sha256", "wrapper_sha256", "device_index", "device_uuid",
                 "target_uuid", "compute_capability", "compiler_keep",
-                "compiler_artifacts_present", "compiler_artifacts", "cases",
+                "compiler_artifacts_present", "compiler_semantic_contract", "cases",
             )
         }
         actual_comparable = {
@@ -219,6 +222,7 @@ def main() -> int:
         require(expected_comparable == actual_comparable, "sanitized output differs from oracle")
         value["expected_sha256"] = sha256_bytes(expected_raw)
         value["hashes_match_unsanitized"] = True
+        value["compiler_semantic_contract_matches_unsanitized"] = True
     write_json_exclusive(args.output, value)
     print(json.dumps(value, sort_keys=True))
     return 0

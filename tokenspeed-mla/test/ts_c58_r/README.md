@@ -37,7 +37,10 @@ Fixed rules:
 - `capture_gpu_health.py` and `seal_gpu_recovery.py`: type strict, monotonic,
   and best-effort health fields and enclose the exact execution timestamps.
 - `probe_tq4_m128_sanitizer.py`: isolates either dense FP8 or native TQ4 M128;
-  sanitizer runs must reproduce their same-GPU unsanitized oracle.
+  sanitizer runs must reproduce their same-GPU unsanitized output/LSE oracle,
+  stable compiler IR, artifact layout, and complete PTX named-barrier signature.
+  Raw PTX/CUBIN hashes remain recorded, but are not required to match because
+  identical stable MLIR can produce register-allocation-only backend variants.
 - `probe_m128_synccheck_map.py`: runs one predeclared M128 mapping launch,
   catches only the expected sanitizer-induced launch failure, and preserves a
   byte-identical compiler-artifact inventory without assuming an error count.

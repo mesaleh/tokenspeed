@@ -216,6 +216,7 @@ def main() -> int:
                 arm=arm,
                 mode=mode,
                 hashes_match_unsanitized=True,
+                compiler_semantic_contract_matches_unsanitized=True,
                 compiler_artifacts_present=True,
                 compiler_keep="ir,ptx,cubin",
                 wrapper_sha256=sha256_file(probe),

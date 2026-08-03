@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import sys
 from pathlib import Path
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -13,7 +14,12 @@ from analyze_r1_results import (  # noqa: E402
     require_disassembly,
     require_zero_recovery,
 )
-from evidence_common import EvidenceError, sha256_bytes  # noqa: E402
+from evidence_common import (  # noqa: E402
+    EvidenceError,
+    compiler_semantic_contract,
+    sha256_bytes,
+    sha256_file,
+)
 
 
 def disassembly_fixture(arm: str) -> dict:
@@ -46,6 +52,75 @@ def disassembly_fixture(arm: str) -> dict:
 
 
 class R1ToolTests(unittest.TestCase):
+    @staticmethod
+    def _artifact_inventory(root: Path) -> list[dict]:
+        return [
+            {
+                "path": path.name,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "suffix": path.suffix,
+            }
+            for path in sorted(root.iterdir())
+        ]
+
+    def test_compiler_contract_tolerates_register_allocation_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            for directory, register, cubin in (
+                (first, "%r1", b"first-cubin"),
+                (second, "%r99", b"second-cubin"),
+            ):
+                (directory / "kernel.mlir").write_text("stable-ir\n", encoding="utf-8")
+                (directory / "kernel.ptx").write_text(
+                    ".version 8.7\n"
+                    f"mov.u32 {register}, %tid.x;\n"
+                    "barrier.sync 1, 288;\n"
+                    "barrier.sync.aligned 6, 128;\n",
+                    encoding="utf-8",
+                )
+                (directory / "kernel.cubin").write_bytes(cubin)
+            first_artifacts = self._artifact_inventory(first)
+            second_artifacts = self._artifact_inventory(second)
+            self.assertNotEqual(first_artifacts, second_artifacts)
+            self.assertEqual(
+                compiler_semantic_contract(first, first_artifacts),
+                compiler_semantic_contract(second, second_artifacts),
+            )
+
+    def test_compiler_contract_rejects_ir_or_barrier_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline"
+            barrier_drift = root / "barrier-drift"
+            ir_drift = root / "ir-drift"
+            for directory, ir, barrier in (
+                (baseline, "stable-ir\n", "barrier.sync 1, 288;\n"),
+                (barrier_drift, "stable-ir\n", "barrier.sync.aligned 1, 288;\n"),
+                (ir_drift, "changed-ir\n", "barrier.sync 1, 288;\n"),
+            ):
+                directory.mkdir()
+                (directory / "kernel.mlir").write_text(ir, encoding="utf-8")
+                (directory / "kernel.ptx").write_text(barrier, encoding="utf-8")
+                (directory / "kernel.cubin").write_bytes(b"cubin")
+            baseline_contract = compiler_semantic_contract(
+                baseline, self._artifact_inventory(baseline)
+            )
+            self.assertNotEqual(
+                baseline_contract,
+                compiler_semantic_contract(
+                    barrier_drift, self._artifact_inventory(barrier_drift)
+                ),
+            )
+            self.assertNotEqual(
+                baseline_contract,
+                compiler_semantic_contract(ir_drift, self._artifact_inventory(ir_drift)),
+            )
+
     def test_candidate_cannot_substitute_for_pinned_accepted_baseline(self) -> None:
         candidate_identity = {
             "record_type": "ts-c58-r-source-identity",

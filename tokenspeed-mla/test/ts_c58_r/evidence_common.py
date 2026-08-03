@@ -20,6 +20,12 @@ PHYSICAL_UUID = re.compile(
     re.IGNORECASE,
 )
 IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+PTX_NAMED_BARRIER = re.compile(
+    r"^\s*(bar(?:rier)?\.sync)(\.aligned)?\s+"
+    r"(0x[0-9a-f]+|[0-9]+),\s*"
+    r"(0x[0-9a-f]+|[0-9]+)\s*;\s*$",
+    re.IGNORECASE,
+)
 
 
 class EvidenceError(RuntimeError):
@@ -44,6 +50,90 @@ def sha256_file(path: Path) -> str:
         return sha256_bytes(path.read_bytes())
     except OSError as exc:
         raise EvidenceError(f"cannot hash {path}: {exc}") from exc
+
+
+def compiler_semantic_contract(
+    artifact_root: Path, artifacts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Bind stable compiler IR and named-barrier semantics, not register allocation."""
+    require(artifact_root.is_absolute(), "compiler artifact root is not absolute")
+    artifact_root = artifact_root.resolve()
+    require(isinstance(artifacts, list) and artifacts, "compiler artifact inventory is empty")
+    layout: list[dict[str, str]] = []
+    stable_ir: list[dict[str, Any]] = []
+    ptx_named_barriers: list[dict[str, Any]] = []
+    suffix_counts: dict[str, int] = {}
+    for entry in artifacts:
+        require(
+            isinstance(entry, dict)
+            and set(entry) == {"path", "size_bytes", "sha256", "suffix"},
+            "compiler artifact entry differs",
+        )
+        relative = entry["path"]
+        suffix = entry["suffix"]
+        require(
+            isinstance(relative, str)
+            and relative
+            and not relative.startswith("/")
+            and ".." not in Path(relative).parts,
+            "compiler artifact path is unsafe",
+        )
+        require(isinstance(suffix, str) and suffix == Path(relative).suffix,
+                "compiler artifact suffix differs")
+        require(
+            isinstance(entry["size_bytes"], int)
+            and not isinstance(entry["size_bytes"], bool)
+            and entry["size_bytes"] > 0
+            and isinstance(entry["sha256"], str)
+            and SHA256.fullmatch(entry["sha256"]) is not None,
+            "compiler artifact size or hash differs",
+        )
+        path = (artifact_root / relative).resolve()
+        try:
+            path.relative_to(artifact_root)
+        except ValueError as exc:
+            raise EvidenceError("compiler artifact escapes its root") from exc
+        require(path.is_file(), "compiler artifact is absent")
+        require(path.stat().st_size == entry["size_bytes"],
+                "compiler artifact size does not match inventory")
+        require(sha256_file(path) == entry["sha256"],
+                "compiler artifact hash does not match inventory")
+        layout.append({"path": relative, "suffix": suffix})
+        suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+        if suffix == ".mlir":
+            stable_ir.append(dict(entry))
+        elif suffix == ".ptx":
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise EvidenceError(f"cannot read compiler PTX: {exc}") from exc
+            for line in text.splitlines():
+                match = PTX_NAMED_BARRIER.fullmatch(line)
+                if match is None:
+                    continue
+                instruction = match.group(1).lower()
+                aligned_suffix = match.group(2) is not None
+                ptx_named_barriers.append(
+                    {
+                        "path": relative,
+                        "ordinal": len(ptx_named_barriers),
+                        "instruction": instruction + (
+                            ".aligned" if aligned_suffix else ""
+                        ),
+                        "aligned": instruction == "bar.sync" or aligned_suffix,
+                        "barrier_id": int(match.group(3), 0),
+                        "count": int(match.group(4), 0),
+                    }
+                )
+    require(suffix_counts.get(".ptx") == 1, "compiler PTX count differs")
+    require(suffix_counts.get(".cubin") == 1, "compiler CUBIN count differs")
+    require(bool(stable_ir), "stable compiler IR is absent")
+    require(bool(ptx_named_barriers), "compiler PTX named barriers are absent")
+    return {
+        "artifact_layout": layout,
+        "stable_ir": stable_ir,
+        "ptx_named_barriers": ptx_named_barriers,
+    }
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
