@@ -114,6 +114,16 @@ _P_COR_METADATA_FIELDS = 4
 
 
 @cute.jit
+def named_barrier_sync_unaligned(barrier_id: Int32, num_threads: Int32):
+    """Synchronize a named-barrier subset from divergent CTA control flow."""
+    nvvm.barrier_cta_sync(
+        barrier_id.ir_value(),
+        thread_count=num_threads.ir_value(),
+        aligned=False,
+    )
+
+
+@cute.jit
 def tcgen05_mma_ws_f8f6f4_one(
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
@@ -1923,7 +1933,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
 
             # Now wait for TMEM allocation and broadcast pointer
-            tmem.wait_for_alloc()
+            named_barrier_sync_unaligned(
+                self.tmem_ptr_sync_bar.barrier_id,
+                self.tmem_ptr_sync_bar.num_threads,
+            )
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -2021,7 +2034,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_o_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_o_stage
             )
-            tmem.wait_for_alloc()
+            named_barrier_sync_unaligned(
+                self.tmem_ptr_sync_bar.barrier_id,
+                self.tmem_ptr_sync_bar.num_threads,
+            )
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
@@ -2097,7 +2113,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Consumer, self.mma_o_stage
             )
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            named_barrier_sync_unaligned(
+                self.tmem_ptr_sync_bar.barrier_id,
+                self.tmem_ptr_sync_bar.num_threads,
+            )
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
