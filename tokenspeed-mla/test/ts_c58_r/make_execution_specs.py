@@ -280,11 +280,23 @@ def main() -> int:
         "dense-control-synccheck",
         command=dense_probe_command("dense-control-synccheck"),
         tool="synccheck", timeout=120,
-        outcomes=["clean", "diagnosed_sync_error"],
-        patterns=[r"Divergent thread\(s\) in block"], result=True,
+        outcomes=["diagnosed_sync_error"],
+        patterns=[
+            r"Divergent thread\(s\) in block",
+            r"\+0xca60",
+            r"ERROR SUMMARY: [1-9][0-9]* errors",
+        ],
+        result=True,
         requirements=result_requirements(
             "ts-c58-r-dense-synccheck-control",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
+            caught_cuda_error=True,
+            caught_error_type="CUDADialectError",
+            caught_error_qualified_type=(
+                "cutlass.cutlass_dsl.tvm_ffi_provider.CUDADialectError"
+            ),
+            caught_error_code=719,
+            outputs_match_unsanitized=None,
             artifacts_match_unsanitized=True,
             compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
             expected_sha256=sha256_bytes(dense_raw),

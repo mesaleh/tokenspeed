@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 
 import torch
+from cutlass.cutlass_dsl.tvm_ffi_provider import CUDADialectError
 
 from evidence_common import (
     canonical_uuid,
@@ -117,7 +118,7 @@ def main() -> int:
     case = make_case(1, False, heads=8, use_codebook=False, fp8_rope=False)
     output = None
     lse = None
-    caught: torch.AcceleratorError | None = None
+    caught: torch.AcceleratorError | CUDADialectError | None = None
     try:
         output, lse = tokenspeed_mla_decode(
             query=case["query"],
@@ -134,13 +135,22 @@ def main() -> int:
             qk_rope_head_dim=64,
         )
         torch.cuda.synchronize()
-    except torch.AcceleratorError as exc:
+    except (torch.AcceleratorError, CUDADialectError) as exc:
         caught = exc
 
     error_message = None if caught is None else str(caught)
     if caught is not None:
-        require("CUDA error: unspecified launch failure" in error_message,
-                "CUDA failure class differs")
+        if isinstance(caught, CUDADialectError):
+            require(
+                caught.error_code == 719
+                and caught.raw_tvm_ffi_message == "CUDA Error Code: 719",
+                "CUTLASS CUDA launch-failure code differs",
+            )
+        else:
+            require(
+                "CUDA error: unspecified launch failure" in error_message,
+                "PyTorch CUDA failure signature differs",
+            )
         output_digest = None
         lse_digest = None
         outputs_match = None
@@ -187,6 +197,12 @@ def main() -> int:
         "expected_seal_sha256": sha256_bytes(expected_seal_raw),
         "caught_cuda_error": caught is not None,
         "caught_error_type": None if caught is None else type(caught).__name__,
+        "caught_error_qualified_type": (
+            None
+            if caught is None
+            else f"{type(caught).__module__}.{type(caught).__qualname__}"
+        ),
+        "caught_error_code": getattr(caught, "error_code", None),
         "caught_error_message_sha256": (
             None if error_message is None else sha256_bytes(error_message.encode("utf-8"))
         ),
