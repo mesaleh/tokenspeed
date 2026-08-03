@@ -16,6 +16,7 @@ TOOL_FILES = (
     "evidence_common.py",
     "probe_tq4_m128_sanitizer.py",
     "probe_m128_synccheck_map.py",
+    "probe_dense_synccheck_control.py",
     "run_compute_sanitizer.py",
     "seal_sanitizer_result.py",
     "capture_gpu_health.py",

@@ -44,7 +44,8 @@ def main() -> int:
         require(
             execution.get("record_type") == "ts-c58-r-execution-seal"
             and execution.get("status") == "pass"
-            and execution.get("cell_id") == "accepted-target-synccheck-map"
+            and execution.get("cell_id")
+            in {"accepted-target-synccheck-map", "dense-control-synccheck"}
             and execution.get("sanitizer_tool") == "synccheck"
             and execution.get("actual_outcome") == "diagnosed_sync_error"
             and execution.get("report_sha256") == sha256_bytes(raw),

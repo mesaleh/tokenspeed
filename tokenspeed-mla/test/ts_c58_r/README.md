@@ -14,8 +14,9 @@ Fixed rules:
   diagnosis branch) into the pod's source volume; never copy the worktree's
   `.git` indirection file because it names a host-only path;
 - generate the execution spec suite before running a command;
-- pass the previously sealed accepted M128 oracle and execution seal as
-  explicit read-only inputs when generating a mapping suite;
+- pass the previously sealed accepted M128 and dense oracles plus their
+  execution seals as explicit read-only inputs when generating a mapping
+  suite;
 - wrap every sanitizer phase in machine health snapshots and bind its execution
   seal into the recovery seal;
 - export evidence after every phase;
@@ -40,6 +41,9 @@ Fixed rules:
 - `probe_m128_synccheck_map.py`: runs one predeclared M128 mapping launch,
   catches only the expected sanitizer-induced launch failure, and preserves a
   byte-identical compiler-artifact inventory without assuming an error count.
+- `probe_dense_synccheck_control.py`: runs the matched dense control and seals
+  either clean oracle-matching output or the reviewed sanitizer-error branch,
+  always with byte-identical dense compiler artifacts.
 - `barrier_litmus.py`: compiles explicit `barrier.sync.aligned` and unaligned
   `barrier.sync` cells; every run must match the prepared extension hash.
 - `inspect_barrier_source.py`: records barrier/warp/call-site source geometry.

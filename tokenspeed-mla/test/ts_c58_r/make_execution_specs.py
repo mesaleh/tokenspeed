@@ -19,6 +19,8 @@ def main() -> int:
     parser.add_argument("--device-index", type=int, required=True)
     parser.add_argument("--accepted-oracle", type=Path, required=True)
     parser.add_argument("--accepted-oracle-seal", type=Path, required=True)
+    parser.add_argument("--dense-oracle", type=Path, required=True)
+    parser.add_argument("--dense-oracle-seal", type=Path, required=True)
     parser.add_argument("--evidence-root", type=Path, required=True)
     parser.add_argument("--spec-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -34,6 +36,8 @@ def main() -> int:
     require(0 <= args.device_index < 4, "CUDA ordinal differs")
     accepted_oracle = args.accepted_oracle.resolve()
     accepted_oracle_seal = args.accepted_oracle_seal.resolve()
+    dense_oracle = args.dense_oracle.resolve()
+    dense_oracle_seal = args.dense_oracle_seal.resolve()
     oracle, oracle_raw = load_json(accepted_oracle)
     oracle_seal, oracle_seal_raw = load_json(accepted_oracle_seal)
     require(
@@ -60,16 +64,51 @@ def main() -> int:
         and oracle_seal.get("result_sha256") == sha256_bytes(oracle_raw),
         "accepted oracle execution seal differs",
     )
+    dense, dense_raw = load_json(dense_oracle)
+    dense_seal, dense_seal_raw = load_json(dense_oracle_seal)
+    require(
+        dense.get("record_type") == "ts-c58-r-decode-oracle"
+        and dense.get("status") == "pass"
+        and dense.get("arm") == "dense"
+        and dense.get("mode") == "unsanitized"
+        and dense.get("compiler_artifacts_present") is True
+        and dense.get("compiler_keep") == "ir,ptx,cubin"
+        and dense.get("source_commit") == identity["source_commit"]
+        and dense.get("source_identity_sha256") == identity_hash
+        and dense.get("target_uuid") == target_uuid
+        and dense.get("device_index") == args.device_index,
+        "accepted dense oracle differs",
+    )
+    require(
+        dense_seal.get("record_type") == "ts-c58-r-execution-seal"
+        and dense_seal.get("status") == "pass"
+        and dense_seal.get("cell_id") == "dense-control-unsanitized"
+        and dense_seal.get("actual_outcome") == "clean"
+        and dense_seal.get("sanitizer_tool") is None
+        and dense_seal.get("source_commit") == identity["source_commit"]
+        and dense_seal.get("source_identity_sha256") == identity_hash
+        and dense_seal.get("target_uuid") == target_uuid
+        and dense_seal.get("device_index") == args.device_index
+        and dense_seal.get("result_sha256") == sha256_bytes(dense_raw),
+        "accepted dense execution seal differs",
+    )
     evidence_root = args.evidence_root.resolve()
     tool_root = Path(__file__).resolve().parent
     probe = tool_root / "probe_tq4_m128_sanitizer.py"
     map_probe = tool_root / "probe_m128_synccheck_map.py"
+    dense_probe = tool_root / "probe_dense_synccheck_control.py"
     litmus = tool_root / "barrier_litmus.py"
     require(
         oracle_seal.get("runner_sha256") == sha256_file(tool_root / "run_compute_sanitizer.py")
         and oracle_seal.get("sealer_sha256")
         == sha256_file(tool_root / "seal_sanitizer_result.py"),
         "accepted oracle execution seal tool identity differs",
+    )
+    require(
+        dense_seal.get("runner_sha256") == sha256_file(tool_root / "run_compute_sanitizer.py")
+        and dense_seal.get("sealer_sha256")
+        == sha256_file(tool_root / "seal_sanitizer_result.py"),
+        "accepted dense execution seal tool identity differs",
     )
 
     def exact_environment(cell: str) -> list[str]:
@@ -128,6 +167,18 @@ def main() -> int:
             "--target-uuid", target_uuid,
             "--expected", str(accepted_oracle),
             "--expected-seal", str(accepted_oracle_seal),
+            "--output", str(evidence_root / cell / "result.json"),
+        ]
+
+    def dense_probe_command(cell: str) -> list[str]:
+        return exact_environment(cell) + [
+            sys.executable, str(dense_probe),
+            "--source-root", str(source_root),
+            "--identity", str(identity_path),
+            "--device-index", str(args.device_index),
+            "--target-uuid", target_uuid,
+            "--expected", str(dense_oracle),
+            "--expected-seal", str(dense_oracle_seal),
             "--output", str(evidence_root / cell / "result.json"),
         ]
 
@@ -227,17 +278,18 @@ def main() -> int:
     )
     add(
         "dense-control-synccheck",
-        command=probe_command("dense-control-synccheck", "dense", "synccheck",
-                              expected="dense-control-unsanitized"),
+        command=dense_probe_command("dense-control-synccheck"),
         tool="synccheck", timeout=120,
         outcomes=["clean", "diagnosed_sync_error"],
         patterns=[r"Divergent thread\(s\) in block"], result=True,
         requirements=result_requirements(
-            "ts-c58-r-decode-oracle", arm="dense", mode="synccheck",
+            "ts-c58-r-dense-synccheck-control",
             source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
-            hashes_match_unsanitized=True,
+            artifacts_match_unsanitized=True,
             compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
-            wrapper_sha256=sha256_file(probe),
+            expected_sha256=sha256_bytes(dense_raw),
+            expected_seal_sha256=sha256_bytes(dense_seal_raw),
+            wrapper_sha256=sha256_file(dense_probe),
         ),
     )
     litmus_cells = {
@@ -296,6 +348,8 @@ def main() -> int:
         "spec_sha256s": spec_hashes,
         "accepted_oracle_sha256": sha256_bytes(oracle_raw),
         "accepted_oracle_seal_sha256": sha256_bytes(oracle_seal_raw),
+        "dense_oracle_sha256": sha256_bytes(dense_raw),
+        "dense_oracle_seal_sha256": sha256_bytes(dense_seal_raw),
         "generator_sha256": sha256_file(Path(__file__).resolve()),
     }
     write_json_exclusive(args.output, manifest)
