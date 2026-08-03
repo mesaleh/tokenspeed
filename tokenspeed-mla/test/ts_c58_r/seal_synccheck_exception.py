@@ -19,7 +19,7 @@ EXPECTED_LITMUS = {
 }
 COUNT_CELL = "unaligned-wrong-count-synccheck"
 REQUIRED_RECOVERY_PHASES = {
-    "accepted-target-synccheck",
+    "accepted-target-synccheck-map",
     "dense-control-synccheck",
     "aligned-full-synccheck",
     "unaligned-partial-synccheck",
@@ -61,7 +61,7 @@ def main() -> int:
     target, target_raw = load_json(args.target_synccheck_seal)
     require(target.get("record_type") == "ts-c58-r-execution-seal", "target seal type differs")
     require(target.get("status") == "pass" and target.get("sanitizer_tool") == "synccheck"
-            and target.get("cell_id") == "accepted-target-synccheck"
+            and target.get("cell_id") == "accepted-target-synccheck-map"
             and target.get("actual_outcome") == "diagnosed_sync_error", "target sync finding differs")
     require(target.get("source_commit") == provenance["source_commit"], "target source differs")
     require(target.get("source_identity_sha256") == provenance["source_identity_sha256"]
@@ -155,7 +155,7 @@ def main() -> int:
     require(set(recovery_paths) == REQUIRED_RECOVERY_PHASES, "recovery phase set differs")
     recovery_hashes = {}
     execution_hash_by_phase = {
-        "accepted-target-synccheck": sha256_bytes(target_raw),
+        "accepted-target-synccheck-map": sha256_bytes(target_raw),
         "dense-control-synccheck": sha256_bytes(dense_raw),
     }
     execution_hash_by_phase.update(

@@ -15,6 +15,7 @@ from evidence_common import canonical_uuid, load_json, require, sha256_bytes, sh
 TOOL_FILES = (
     "evidence_common.py",
     "probe_tq4_m128_sanitizer.py",
+    "probe_m128_synccheck_map.py",
     "run_compute_sanitizer.py",
     "seal_sanitizer_result.py",
     "capture_gpu_health.py",

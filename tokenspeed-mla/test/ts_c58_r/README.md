@@ -14,6 +14,8 @@ Fixed rules:
   diagnosis branch) into the pod's source volume; never copy the worktree's
   `.git` indirection file because it names a host-only path;
 - generate the execution spec suite before running a command;
+- pass the previously sealed accepted M128 oracle and execution seal as
+  explicit read-only inputs when generating a mapping suite;
 - wrap every sanitizer phase in machine health snapshots and bind its execution
   seal into the recovery seal;
 - export evidence after every phase;
@@ -35,6 +37,9 @@ Fixed rules:
   and best-effort health fields and enclose the exact execution timestamps.
 - `probe_tq4_m128_sanitizer.py`: isolates either dense FP8 or native TQ4 M128;
   sanitizer runs must reproduce their same-GPU unsanitized oracle.
+- `probe_m128_synccheck_map.py`: runs one predeclared M128 mapping launch,
+  catches only the expected sanitizer-induced launch failure, and preserves a
+  byte-identical compiler-artifact inventory without assuming an error count.
 - `barrier_litmus.py`: compiles explicit `barrier.sync.aligned` and unaligned
   `barrier.sync` cells; every run must match the prepared extension hash.
 - `inspect_barrier_source.py`: records barrier/warp/call-site source geometry.
@@ -52,7 +57,8 @@ Fixed rules:
   or the reviewed exception but deliberately makes no performance decision.
 
 The accepted target order is: source inventory; pre-health and provenance;
-unsanitized M128; racecheck; accepted synccheck with full report; recovery;
+unsanitized M128; racecheck; count-independent mapping synccheck with a full
+single-PC report and byte-identical compiler artifacts; recovery;
 dense unsanitized and synccheck; recovery; prepared litmus build; valid aligned
 and unaligned cells; invalid aligned partial; recovery; wrong-count cell last;
 recovery; mapping/proof decision. A result is not branch evidence until its

@@ -72,7 +72,7 @@ def main() -> int:
     require(
         synccheck_seal.get("record_type") == "ts-c58-r-execution-seal"
         and synccheck_seal.get("status") == "pass"
-        and synccheck_seal.get("cell_id") == "accepted-target-synccheck"
+        and synccheck_seal.get("cell_id") == "accepted-target-synccheck-map"
         and synccheck_seal.get("sanitizer_tool") == "synccheck"
         and synccheck_seal.get("actual_outcome") == "diagnosed_sync_error",
         "accepted synccheck execution seal differs",
@@ -85,6 +85,10 @@ def main() -> int:
         and synccheck_seal.get("device_index") == provenance.get("device_index")
         and synccheck_seal.get("report_sha256") == thread_map.get("report_sha256"),
         "thread map is not bound to the accepted synccheck report",
+    )
+    require(
+        thread_map.get("execution_seal_sha256") == sha256_bytes(synccheck_seal_raw),
+        "thread map does not bind the accepted synccheck execution seal",
     )
     require(
         synccheck_seal.get("runner_sha256")
@@ -159,10 +163,21 @@ def main() -> int:
         inventory, mapped["barrier_id"], mapped["count"]
     )
 
-    thread_x = [row[0] for row in thread_map.get("threads", [])]
+    threads = thread_map.get("threads")
+    require(
+        isinstance(threads, list)
+        and all(
+            isinstance(row, list)
+            and len(row) == 6
+            and all(isinstance(item, int) and not isinstance(item, bool) for item in row)
+            for row in threads
+        ),
+        "synccheck thread rows differ",
+    )
+    thread_x = [row[0] for row in threads]
     require(
         len(thread_x) == thread_map.get("error_count")
-        and len(set(thread_x)) == len(thread_x),
+        and thread_x,
         "complete synccheck thread geometry differs",
     )
     intended_set = set(range(intended_threads[0], intended_threads[1] + 1))
@@ -192,6 +207,7 @@ def main() -> int:
         "reported_thread_x_min": min(thread_x),
         "reported_thread_x_max": max(thread_x),
         "reported_thread_count": len(thread_x),
+        "reported_block_count": len({tuple(row[3:]) for row in threads}),
         "reported_threads_are_intended_subset": True,
         "provenance_sha256": sha256_bytes(provenance_raw),
         "thread_map_sha256": sha256_bytes(thread_map_raw),

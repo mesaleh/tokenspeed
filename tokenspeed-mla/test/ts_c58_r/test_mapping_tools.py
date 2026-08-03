@@ -1,17 +1,67 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
-from pathlib import Path
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from capture_disassembly import parse_ptx_barriers, parse_sass_barriers  # noqa: E402
-from evidence_common import EvidenceError  # noqa: E402
+from evidence_common import EvidenceError, sha256_bytes  # noqa: E402
 from map_barrier_pc import semantic_role  # noqa: E402
 
 
 class MappingToolTests(unittest.TestCase):
+    def test_thread_map_derives_complete_count_from_execution_seal(self):
+        tool_root = Path(__file__).resolve().parent
+        report = (
+            "========= Barrier error detected. Divergent thread(s) in block.\n"
+            "=========     at kernel_name+0x15520\n"
+            "=========     by thread (128,0,0) in block (0,0,0)\n"
+            "========= Barrier error detected. Divergent thread(s) in block.\n"
+            "=========     at kernel_name+0x15520\n"
+            "=========     by thread (128,0,0) in block (1,0,0)\n"
+            "========= ERROR SUMMARY: 2 errors\n"
+        )
+        report_raw = report.encode("utf-8")
+        seal = {
+            "record_type": "ts-c58-r-execution-seal",
+            "status": "pass",
+            "cell_id": "accepted-target-synccheck-map",
+            "sanitizer_tool": "synccheck",
+            "actual_outcome": "diagnosed_sync_error",
+            "report_sha256": sha256_bytes(report_raw),
+            "tool_summary": {"error_summaries": [2]},
+        }
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            report_path = directory / "report.log"
+            seal_path = directory / "seal.json"
+            output_path = directory / "thread-map.json"
+            report_path.write_bytes(report_raw)
+            seal_path.write_text(json.dumps(seal), encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(tool_root / "parse_synccheck_report.py"),
+                    "--report", str(report_path),
+                    "--execution-seal", str(seal_path),
+                    "--require-complete",
+                    "--output", str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["error_count"], 2)
+            self.assertTrue(result["complete"])
+            self.assertFalse(result["thread_x_contiguous"])
+            self.assertEqual(result["execution_seal_sha256"], sha256_bytes(seal_path.read_bytes()))
+
     def test_named_barrier_parsers_preserve_exact_operands_and_locations(self):
         sass = """
         /*15520*/ BAR.SYNC.DEFER_BLOCKING 0x1, 0x120 ;

@@ -17,6 +17,8 @@ def main() -> int:
     parser.add_argument("--identity", type=Path, required=True)
     parser.add_argument("--target-uuid", required=True)
     parser.add_argument("--device-index", type=int, required=True)
+    parser.add_argument("--accepted-oracle", type=Path, required=True)
+    parser.add_argument("--accepted-oracle-seal", type=Path, required=True)
     parser.add_argument("--evidence-root", type=Path, required=True)
     parser.add_argument("--spec-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -30,10 +32,45 @@ def main() -> int:
     identity_hash = sha256_bytes(identity_raw)
     target_uuid = canonical_uuid(args.target_uuid)
     require(0 <= args.device_index < 4, "CUDA ordinal differs")
+    accepted_oracle = args.accepted_oracle.resolve()
+    accepted_oracle_seal = args.accepted_oracle_seal.resolve()
+    oracle, oracle_raw = load_json(accepted_oracle)
+    oracle_seal, oracle_seal_raw = load_json(accepted_oracle_seal)
+    require(
+        oracle.get("record_type") == "ts-c58-r-decode-oracle"
+        and oracle.get("status") == "pass"
+        and oracle.get("arm") == "m128"
+        and oracle.get("mode") == "unsanitized"
+        and oracle.get("source_commit") == identity["source_commit"]
+        and oracle.get("source_identity_sha256") == identity_hash
+        and oracle.get("target_uuid") == target_uuid
+        and oracle.get("device_index") == args.device_index,
+        "accepted oracle differs",
+    )
+    require(
+        oracle_seal.get("record_type") == "ts-c58-r-execution-seal"
+        and oracle_seal.get("status") == "pass"
+        and oracle_seal.get("cell_id") == "accepted-target-unsanitized"
+        and oracle_seal.get("actual_outcome") == "clean"
+        and oracle_seal.get("sanitizer_tool") is None
+        and oracle_seal.get("source_commit") == identity["source_commit"]
+        and oracle_seal.get("source_identity_sha256") == identity_hash
+        and oracle_seal.get("target_uuid") == target_uuid
+        and oracle_seal.get("device_index") == args.device_index
+        and oracle_seal.get("result_sha256") == sha256_bytes(oracle_raw),
+        "accepted oracle execution seal differs",
+    )
     evidence_root = args.evidence_root.resolve()
     tool_root = Path(__file__).resolve().parent
     probe = tool_root / "probe_tq4_m128_sanitizer.py"
+    map_probe = tool_root / "probe_m128_synccheck_map.py"
     litmus = tool_root / "barrier_litmus.py"
+    require(
+        oracle_seal.get("runner_sha256") == sha256_file(tool_root / "run_compute_sanitizer.py")
+        and oracle_seal.get("sealer_sha256")
+        == sha256_file(tool_root / "seal_sanitizer_result.py"),
+        "accepted oracle execution seal tool identity differs",
+    )
 
     def exact_environment(cell: str) -> list[str]:
         dump_dir = evidence_root / "compiler-artifacts" / cell
@@ -81,6 +118,18 @@ def main() -> int:
             ])
         command.extend(["--output", str(evidence_root / cell / "result.json")])
         return command
+
+    def map_probe_command(cell: str) -> list[str]:
+        return exact_environment(cell) + [
+            sys.executable, str(map_probe),
+            "--source-root", str(source_root),
+            "--identity", str(identity_path),
+            "--device-index", str(args.device_index),
+            "--target-uuid", target_uuid,
+            "--expected", str(accepted_oracle),
+            "--expected-seal", str(accepted_oracle_seal),
+            "--output", str(evidence_root / cell / "result.json"),
+        ]
 
     def result_requirements(record_type: str, **extra) -> dict:
         return {
@@ -142,18 +191,27 @@ def main() -> int:
         ),
     )
     add(
-        "accepted-target-synccheck",
-        command=probe_command("accepted-target-synccheck", "m128", "synccheck",
-                              expected="accepted-target-unsanitized"),
+        "accepted-target-synccheck-map",
+        command=map_probe_command("accepted-target-synccheck-map"),
         tool="synccheck", timeout=120, outcomes=["diagnosed_sync_error"],
-        patterns=[r"Divergent thread\(s\) in block", r"ERROR SUMMARY: 160 errors"],
+        patterns=[
+            r"Divergent thread\(s\) in block",
+            r"\+0x15520",
+            r"ERROR SUMMARY: [1-9][0-9]* errors",
+        ],
         result=True,
         requirements=result_requirements(
-            "ts-c58-r-decode-oracle", arm="m128", mode="synccheck",
-            source_commit=identity["source_commit"], source_identity_sha256=identity_hash,
-            hashes_match_unsanitized=True,
-            compiler_artifacts_present=True, compiler_keep="ir,ptx,cubin",
-            wrapper_sha256=sha256_file(probe),
+            "ts-c58-r-synccheck-map-probe",
+            source_commit=identity["source_commit"],
+            source_identity_sha256=identity_hash,
+            caught_cuda_error=True,
+            caught_error_type="AcceleratorError",
+            artifacts_match_unsanitized=True,
+            compiler_artifacts_present=True,
+            compiler_keep="ir,ptx,cubin",
+            expected_sha256=sha256_bytes(oracle_raw),
+            expected_seal_sha256=sha256_bytes(oracle_seal_raw),
+            wrapper_sha256=sha256_file(map_probe),
         ),
     )
     add(
@@ -236,6 +294,8 @@ def main() -> int:
         "evidence_root": str(evidence_root),
         "spec_root": str(args.spec_root.resolve()),
         "spec_sha256s": spec_hashes,
+        "accepted_oracle_sha256": sha256_bytes(oracle_raw),
+        "accepted_oracle_seal_sha256": sha256_bytes(oracle_seal_raw),
         "generator_sha256": sha256_file(Path(__file__).resolve()),
     }
     write_json_exclusive(args.output, manifest)
