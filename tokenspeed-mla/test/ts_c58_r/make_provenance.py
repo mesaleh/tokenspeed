@@ -51,7 +51,6 @@ def main() -> int:
     parser.add_argument("--container-name", default="experiment")
     parser.add_argument("--pod-name-file", type=Path, required=True)
     parser.add_argument("--pod-uid-file", type=Path, required=True)
-    parser.add_argument("--node-name-file", type=Path, required=True)
     parser.add_argument("--namespace", default="workload")
     parser.add_argument("--target-uuid", required=True)
     parser.add_argument("--device-index", type=int, required=True)
@@ -97,7 +96,8 @@ def main() -> int:
     pod, pod_raw = load_json(args.pod_record)
     pod_name = required_text(args.pod_name_file, "pod name")
     pod_uid = required_text(args.pod_uid_file, "pod UID")
-    node_name = required_text(args.node_name_file, "node name")
+    node_name = os.environ.get("NODE_NAME", "").strip()
+    require(bool(node_name), "Downward API node name is empty")
     metadata = pod.get("metadata", {})
     require(metadata.get("name") == pod_name and metadata.get("uid") == pod_uid
             and metadata.get("namespace") == args.namespace, "pod record identity differs")
