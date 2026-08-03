@@ -31,7 +31,7 @@ def by_uuid(rows: list[dict]) -> dict[str, dict]:
 
 def healthy(row: dict, label: str) -> None:
     require(row.get("ecc_uncorrected_volatile") == 0, f"{label} volatile uncorrected ECC differs")
-    require(row.get("pending_remapped_rows") == 0, f"{label} pending remapped rows differ")
+    require(row.get("pending_remapped_rows") is False, f"{label} pending remapped rows differ")
     require(row.get("recovery_action") == "None", f"{label} recovery action differs")
     require(str(row.get("fabric_state", "")).strip().endswith("Completed"),
             f"{label} fabric state differs")
@@ -84,7 +84,7 @@ def main() -> int:
     current = by_uuid(after["gpus"])
     require(set(prior) == set(current), "allocated GPU set changed")
     require(execution.get("target_uuid") in prior, "execution target is outside allocated GPUs")
-    deltas: dict[str, dict[str, int]] = {}
+    deltas: dict[str, dict[str, int | None]] = {}
     for uuid in sorted(prior):
         old = prior[uuid]
         new = current[uuid]
@@ -96,11 +96,16 @@ def main() -> int:
         for field in MONOTONIC:
             old_value = old.get(field)
             new_value = new.get(field)
-            require(isinstance(old_value, int) and not isinstance(old_value, bool)
-                    and isinstance(new_value, int) and not isinstance(new_value, bool),
-                    f"{uuid} monotonic field is not integral: {field}")
-            require(new_value >= old_value, f"{uuid} monotonic field decreased: {field}")
-            gpu_deltas[field] = new_value - old_value
+            if old_value is None or new_value is None:
+                require(old_value is None and new_value is None,
+                        f"{uuid} monotonic field availability changed: {field}")
+                gpu_deltas[field] = None
+            else:
+                require(isinstance(old_value, int) and not isinstance(old_value, bool)
+                        and isinstance(new_value, int) and not isinstance(new_value, bool),
+                        f"{uuid} monotonic field is not integral: {field}")
+                require(new_value >= old_value, f"{uuid} monotonic field decreased: {field}")
+                gpu_deltas[field] = new_value - old_value
         deltas[uuid] = gpu_deltas
 
     before_xid = before.get("xid_events", {})

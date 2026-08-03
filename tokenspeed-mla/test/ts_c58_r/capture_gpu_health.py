@@ -50,6 +50,17 @@ def integer(value: str, field: str) -> int:
     return result
 
 
+def optional_integer(value: str, field: str) -> int | None:
+    if value == "[N/A]":
+        return None
+    return integer(value, field)
+
+
+def yes_no(value: str, field: str) -> bool:
+    require(value in {"Yes", "No"}, f"non-boolean GPU field {field}: {value!r}")
+    return value == "Yes"
+
+
 def parse_gpus(raw: str) -> list[dict]:
     rows = []
     for line in raw.strip().splitlines():
@@ -67,9 +78,9 @@ def parse_gpus(raw: str) -> list[dict]:
             "ecc_uncorrected_volatile": integer(fields[8], "uncorrected volatile ECC"),
             "ecc_corrected_aggregate": integer(fields[9], "corrected aggregate ECC"),
             "ecc_uncorrected_aggregate": integer(fields[10], "uncorrected aggregate ECC"),
-            "retired_pages_single_bit": integer(fields[11], "single-bit retired pages"),
-            "retired_pages_double_bit": integer(fields[12], "double-bit retired pages"),
-            "pending_remapped_rows": integer(fields[13], "pending remapped rows"),
+            "retired_pages_single_bit": optional_integer(fields[11], "single-bit retired pages"),
+            "retired_pages_double_bit": optional_integer(fields[12], "double-bit retired pages"),
+            "pending_remapped_rows": yes_no(fields[13], "pending remapped rows"),
             "recovery_action": fields[14],
             "fabric_state": fields[15],
             "fabric_status": fields[16],

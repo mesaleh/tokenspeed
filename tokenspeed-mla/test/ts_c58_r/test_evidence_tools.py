@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evidence_common import EvidenceError, sha256_file, validate_execution_spec  # noqa: E402
+from capture_gpu_health import parse_gpus  # noqa: E402
 from seal_gpu_recovery import by_uuid, healthy  # noqa: E402
 from seal_sanitizer_result import classify  # noqa: E402
 
@@ -120,15 +121,26 @@ def gpu_row(index: int):
         "ecc_uncorrected_volatile": 0,
         "ecc_corrected_aggregate": 1,
         "ecc_uncorrected_aggregate": 0,
-        "retired_pages_single_bit": 0,
-        "retired_pages_double_bit": 0,
-        "pending_remapped_rows": 0,
+        "retired_pages_single_bit": None,
+        "retired_pages_double_bit": None,
+        "pending_remapped_rows": False,
         "recovery_action": "None",
         "fabric_state": "state  Completed",
         "fabric_status": "status Success",
     }
 
 class HealthToolTests(unittest.TestCase):
+    def test_health_parser_types_gb200_unavailable_and_boolean_fields(self):
+        row = (
+            "{index}, GPU-aaaaaaaa-bbbb-cccc-dddd-{index:012d}, NVIDIA GB200, 10.0, "
+            "570.158.01, 1200, 4000, 0, 0, 0, 0, [N/A], [N/A], No, None, "
+            "state  Completed, status Success"
+        )
+        rows = parse_gpus("\n".join(row.format(index=index) for index in range(4)))
+        self.assertIsNone(rows[0]["retired_pages_single_bit"])
+        self.assertIsNone(rows[0]["retired_pages_double_bit"])
+        self.assertIs(rows[0]["pending_remapped_rows"], False)
+
     def test_health_predicates_allow_monotonic_evidence_but_reject_degradation(self):
         rows = [gpu_row(index) for index in range(4)]
         self.assertEqual(len(by_uuid(rows)), 4)
