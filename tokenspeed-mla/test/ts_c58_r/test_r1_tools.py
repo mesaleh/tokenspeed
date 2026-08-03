@@ -7,7 +7,12 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from analyze_r1_results import require_disassembly, require_zero_recovery  # noqa: E402
+from analyze_r1_results import (  # noqa: E402
+    require_accepted_identity,
+    require_baseline,
+    require_disassembly,
+    require_zero_recovery,
+)
 from evidence_common import EvidenceError, sha256_bytes  # noqa: E402
 
 
@@ -41,6 +46,51 @@ def disassembly_fixture(arm: str) -> dict:
 
 
 class R1ToolTests(unittest.TestCase):
+    def test_candidate_cannot_substitute_for_pinned_accepted_baseline(self) -> None:
+        candidate_identity = {
+            "record_type": "ts-c58-r-source-identity",
+            "schema_version": 1,
+            "source_commit": "2f378dad7b0591b97dc7f3b682636068b0783c55",
+        }
+        candidate_identity_raw = b'{"source_commit":"candidate"}\n'
+        with self.assertRaisesRegex(EvidenceError, "pinned baseline"):
+            require_accepted_identity(
+                candidate_identity,
+                candidate_identity_raw,
+                candidate_identity["source_commit"],
+            )
+
+        candidate_oracle = {
+            "record_type": "ts-c58-r-decode-oracle",
+            "status": "pass",
+            "arm": "m128",
+            "mode": "unsanitized",
+            "source_commit": candidate_identity["source_commit"],
+            "source_identity_sha256": "c" * 64,
+        }
+        candidate_raw = b'{"candidate":true}\n'
+        candidate_seal = {
+            "record_type": "ts-c58-r-execution-seal",
+            "status": "pass",
+            "cell_id": "accepted-target-unsanitized",
+            "actual_outcome": "clean",
+            "sanitizer_tool": None,
+            "source_commit": candidate_identity["source_commit"],
+            "source_identity_sha256": "c" * 64,
+            "result_sha256": sha256_bytes(candidate_raw),
+        }
+        with self.assertRaisesRegex(EvidenceError, "baseline bytes differ"):
+            require_baseline(
+                candidate_oracle,
+                candidate_raw,
+                candidate_seal,
+                b'{"candidate-seal":true}\n',
+                "c" * 64,
+                candidate_identity["source_commit"],
+                "m128",
+                "accepted-target-unsanitized",
+            )
+
     def test_disassembly_requires_three_explicit_unaligned_handoff_sites(self) -> None:
         summary = require_disassembly(disassembly_fixture("m128"), "m128")
         self.assertEqual(summary["ptx_handoff_sites"], 3)
@@ -89,13 +139,24 @@ class R1ToolTests(unittest.TestCase):
             "status": "pass",
             "phase_id": "accepted-target-synccheck",
             "execution_seal_sha256": sha256_bytes(execution_raw),
+            "capture_sha256": "a" * 64,
+            "sealer_sha256": "b" * 64,
+            "gpu_uuids": [
+                f"GPU-{index:08X}-0000-0000-0000-000000000000"
+                for index in range(4)
+            ],
             "monotonic_deltas": {
                 f"GPU-{index:08X}-0000-0000-0000-000000000000": copy.deepcopy(gpu)
                 for index in range(4)
             },
         }
         require_zero_recovery(
-            recovery, execution_raw, "accepted-target-synccheck"
+            recovery,
+            execution_raw,
+            "accepted-target-synccheck",
+            target_uuid="GPU-00000000-0000-0000-0000-000000000000",
+            capture_sha256="a" * 64,
+            sealer_sha256="b" * 64,
         )
         changed = copy.deepcopy(recovery)
         next(iter(changed["monotonic_deltas"].values()))[
@@ -103,7 +164,24 @@ class R1ToolTests(unittest.TestCase):
         ] = 1
         with self.assertRaisesRegex(EvidenceError, "counter increased"):
             require_zero_recovery(
-                changed, execution_raw, "accepted-target-synccheck"
+                changed,
+                execution_raw,
+                "accepted-target-synccheck",
+                target_uuid="GPU-00000000-0000-0000-0000-000000000000",
+                capture_sha256="a" * 64,
+                sealer_sha256="b" * 64,
+            )
+
+        wrong_tool = copy.deepcopy(recovery)
+        wrong_tool["sealer_sha256"] = "d" * 64
+        with self.assertRaisesRegex(EvidenceError, "tool or target identity"):
+            require_zero_recovery(
+                wrong_tool,
+                execution_raw,
+                "accepted-target-synccheck",
+                target_uuid="GPU-00000000-0000-0000-0000-000000000000",
+                capture_sha256="a" * 64,
+                sealer_sha256="b" * 64,
             )
 
 

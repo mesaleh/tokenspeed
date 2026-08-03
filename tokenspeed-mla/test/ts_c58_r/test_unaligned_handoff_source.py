@@ -76,6 +76,13 @@ class UnalignedHandoffSourceTest(unittest.TestCase):
         )
         self.assertIsInstance(keywords["aligned"], ast.Constant)
         self.assertIs(keywords["aligned"].value, False)
+        all_nvvm_syncs = [
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and dotted_name(node.func) == "nvvm.barrier_cta_sync"
+        ]
+        self.assertEqual(len(all_nvvm_syncs), 1)
 
     def test_only_three_tmem_handoff_calls_are_replaced(self) -> None:
         helper_calls = [
@@ -100,6 +107,30 @@ class UnalignedHandoffSourceTest(unittest.TestCase):
             and dotted_name(node.func) == "tmem.wait_for_alloc"
         ]
         self.assertEqual(allocator_waits, [])
+
+        direct_handoff_waits = [
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and (dotted_name(node.func) or "").startswith(
+                "self.tmem_ptr_sync_bar."
+            )
+        ]
+        self.assertEqual(direct_handoff_waits, [])
+
+        aligned_id1_syncs = [
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and dotted_name(node.func) == "pipeline.sync"
+            and any(
+                keyword.arg == "barrier_id"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == 1
+                for keyword in node.keywords
+            )
+        ]
+        self.assertEqual(aligned_id1_syncs, [])
 
         conversion_waits = [
             node
