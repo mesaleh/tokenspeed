@@ -46,6 +46,19 @@ Fixed rules:
   compiler artifacts.
 - `barrier_litmus.py`: compiles explicit `barrier.sync.aligned` and unaligned
   `barrier.sync` cells; every run must match the prepared extension hash.
+- `barrier_split_site_litmus.py`: compiles single-site 288-thread controls and
+  participant-identical 128+128+32 split-site cells. Every run binds both the
+  prepared extension and the formal disassembly result.
+- `capture_split_site_disassembly.py`: fails unless the single-site kernels
+  have one ID-8/count-288 barrier PC each and the split kernels have three
+  distinct ID-8/count-288 PCs each.
+- `make_split_site_specs.py`: predeclares the split-site build, disassembly,
+  four unsanitized controls, and four synccheck cells. The two split
+  synccheck cells deliberately seal either clean or diagnosed-sync-error so a
+  falsified prediction remains attributable evidence.
+- `analyze_split_site_results.py`: requires the complete ten-cell execution
+  set plus execution-bound recovery seals for every sanitizer cell, then
+  selects exactly one repair/diagnostic branch.
 - `inspect_barrier_source.py`: records barrier/warp/call-site source geometry.
 - `capture_disassembly.py`: for an explicit M128 or dense arm, binds its accepted
   oracle PTX/CUBIN, exact oracle execution seal, `nvdisasm` binary/version,
@@ -67,3 +80,12 @@ dense unsanitized and synccheck; recovery; prepared litmus build; valid aligned
 and unaligned cells; invalid aligned partial; recovery; wrong-count cell last;
 recovery; mapping/proof decision. A result is not branch evidence until its
 execution and recovery seals both pass.
+
+For the follow-up split-site discriminator, the fixed order is: prepare;
+formal disassembly; all four unsanitized cells; aligned and unaligned
+single-site synccheck controls with recovery after each; aligned and unaligned
+split-site synccheck cells with recovery after each; machine analysis. The
+predicted branch is aligned diagnosed plus unaligned clean. Both diagnosed
+selects a one-PC or replacement protocol; both clean rules out static-site
+splitting alone; unaligned-only diagnosis is a counter-hypothesis. No branch
+edits the accepted kernel until the analyzer result is reviewed.

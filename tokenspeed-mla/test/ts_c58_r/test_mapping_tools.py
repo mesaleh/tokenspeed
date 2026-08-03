@@ -16,6 +16,10 @@ from capture_disassembly import (  # noqa: E402
 )
 from evidence_common import EvidenceError, sha256_bytes  # noqa: E402
 from map_barrier_pc import semantic_role  # noqa: E402
+from capture_split_site_disassembly import (  # noqa: E402
+    parse_function_barriers,
+    select_kernels,
+)
 
 
 class MappingToolTests(unittest.TestCase):
@@ -139,6 +143,54 @@ class MappingToolTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_split_site_disassembly_requires_one_one_three_three_sites(self):
+        sass = """
+        Function : _Z18aligned_single_288Pi
+        /*0050*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : _Z20unaligned_single_288Pi
+        /*0060*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : _Z17aligned_split_288Pi
+        /*0070*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*0090*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*00b0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : _Z19unaligned_split_288Pi
+        /*0080*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*00a0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*00c0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        """
+        selected = select_kernels(parse_function_barriers(sass))
+        self.assertEqual(selected["aligned_single_288"]["expected_sites"], 1)
+        self.assertEqual(len(selected["aligned_split_288"]["barriers"]), 3)
+        self.assertEqual(
+            [row["address_hex"] for row in selected["unaligned_split_288"]["barriers"]],
+            ["0x0080", "0x00a0", "0x00c0"],
+        )
+
+        merged = sass.replace(
+            "        /*00b0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;\n",
+            "",
+        )
+        with self.assertRaisesRegex(EvidenceError, "barrier-site count differs"):
+            select_kernels(parse_function_barriers(merged))
+
+    def test_split_site_disassembly_rejects_wrong_barrier_operands(self):
+        sass = """
+        Function : aligned_single_288
+        /*0050*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : unaligned_single_288
+        /*0060*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : aligned_split_288
+        /*0070*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*0090*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*00b0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        Function : unaligned_split_288
+        /*0080*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        /*00a0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x100 ;
+        /*00c0*/ BAR.SYNC.DEFER_BLOCKING 0x8, 0x120 ;
+        """
+        with self.assertRaisesRegex(EvidenceError, "barrier operands differ"):
+            select_kernels(parse_function_barriers(sass))
 
 
 if __name__ == "__main__":

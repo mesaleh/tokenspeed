@@ -235,6 +235,13 @@ def validate_execution_spec(spec: dict[str, Any], identity_sha256: str) -> dict[
             or (
                 spec["cell_id"] == "dense-control-synccheck"
                 and set(outcomes) == {"clean", "diagnosed_sync_error"}
+            )
+            or (
+                spec["cell_id"] in {
+                    "aligned-split-synccheck",
+                    "unaligned-split-synccheck",
+                }
+                and set(outcomes) == {"clean", "diagnosed_sync_error"}
             ),
             "multi-outcome set is not a reviewed diagnostic contract",
         )

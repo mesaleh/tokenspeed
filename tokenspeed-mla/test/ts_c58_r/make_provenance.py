@@ -24,13 +24,18 @@ TOOL_FILES = (
     "seal_gpu_recovery.py",
     "seal_synccheck_exception.py",
     "inspect_barrier_source.py",
+    "analyze_split_site_results.py",
     "barrier_litmus.py",
+    "barrier_split_site_litmus.py",
+    "capture_split_site_disassembly.py",
     "capture_disassembly.py",
     "map_barrier_pc.py",
     "test_mapping_tools.py",
+    "test_split_site_tools.py",
     "make_provenance.py",
     "parse_synccheck_report.py",
     "make_execution_specs.py",
+    "make_split_site_specs.py",
     "resolve_cuda_ordinal.py",
     "analyze_b1965.py",
 )
@@ -95,9 +100,16 @@ def main() -> int:
             and suite.get("target_uuid") == target_uuid
             and suite.get("device_index") == args.device_index,
             "execution spec suite identity differs")
-    require(suite.get("generator_sha256") == sha256_file(
-        Path(__file__).resolve().with_name("make_execution_specs.py")
-    ), "execution spec generator differs")
+    expected_generator = {
+        None: "make_execution_specs.py",
+        "split-site-discriminator": "make_split_site_specs.py",
+    }.get(suite.get("campaign"))
+    require(expected_generator is not None, "execution spec campaign differs")
+    require(
+        suite.get("generator_sha256")
+        == sha256_file(Path(__file__).resolve().with_name(expected_generator)),
+        "execution spec generator differs",
+    )
     pod, pod_raw = load_json(args.pod_record)
     pod_name = required_text(args.pod_name_file, "pod name")
     pod_uid = required_text(args.pod_uid_file, "pod UID")
