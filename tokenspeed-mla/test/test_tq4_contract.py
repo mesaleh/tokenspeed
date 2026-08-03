@@ -1,5 +1,6 @@
 """CPU contract tests for the native TurboQuant-4 MLA ABI."""
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -185,3 +186,57 @@ def test_tq4_mutable_global_loads_follow_raw_pipeline_wait():
     centroid = body.index("common_params.mTQCentroids")
 
     assert wait < centroid < page_table < codebook_pointer < codebook_load
+
+
+def test_public_tq4_api_is_exact_m128_alias():
+    package_dir = Path(__file__).parents[1] / "python" / "tokenspeed_mla"
+    module_tree = ast.parse(
+        (package_dir / "mla_decode_tq4.py").read_text(encoding="utf-8")
+    )
+    aliases = {
+        target.id: node.value.id
+        for node in module_tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance((target := node.targets[0]), ast.Name)
+        and isinstance(node.value, ast.Name)
+    }
+    assert aliases["tokenspeed_mla_decode_tq4"] == (
+        "_tokenspeed_mla_decode_tq4_m128_control"
+    )
+
+
+def test_package_exports_public_tq4_api_with_unavailable_fallback():
+    package_dir = Path(__file__).parents[1] / "python" / "tokenspeed_mla"
+    init_source = (package_dir / "__init__.py").read_text(encoding="utf-8")
+    init_tree = ast.parse(init_source)
+
+    imported = {
+        alias.name
+        for node in ast.walk(init_tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "tokenspeed_mla.mla_decode_tq4"
+        for alias in node.names
+    }
+    fallback_targets = {
+        target.id
+        for node in ast.walk(init_tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "_unavailable"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    exported = next(
+        ast.literal_eval(node.value)
+        for node in init_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in node.targets
+        )
+    )
+
+    assert "tokenspeed_mla_decode_tq4" in imported
+    assert "tokenspeed_mla_decode_tq4" in fallback_targets
+    assert "tokenspeed_mla_decode_tq4" in exported

@@ -18,11 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private production-base correctness control for native packed TQ4 MLA.
+"""Native packed TQ4 MLA decode on the reviewed M=128 reader.
 
-This module intentionally does not export a serving API.  It forces the
-accepted M=128/two-CTA reader while the M=64/one-CTA correction-warp reader is
-implemented in the current TokenSpeed kernel.  No dense cache is reconstructed.
+The public serving entry point is an exact alias of the accepted M=128/two-CTA
+control.  Keeping the alias direct ensures that promotion changes no launch,
+validation, compilation, or kernel semantics.  The M=64/one-CTA specialization
+remains a private correctness control.  No dense cache is reconstructed.
 """
 
 from __future__ import annotations
@@ -428,3 +429,11 @@ def _tokenspeed_mla_decode_tq4_m64_control(*args, **kwargs):
     """Run the private serial M=64 correctness specialization."""
     kwargs["_use_m64"] = True
     return _tokenspeed_mla_decode_tq4_m128_control(*args, **kwargs)
+
+
+# Serving must execute the exact R1-v4-reviewed M=128 implementation.  A direct
+# alias preserves its signature and avoids another Python frame in the decode
+# hot path while leaving the M64 diagnostic unavailable through the public API.
+tokenspeed_mla_decode_tq4 = _tokenspeed_mla_decode_tq4_m128_control
+
+__all__ = ["tokenspeed_mla_decode_tq4"]
