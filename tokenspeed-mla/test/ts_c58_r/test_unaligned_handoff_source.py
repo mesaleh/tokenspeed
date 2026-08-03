@@ -27,6 +27,23 @@ def dotted_name(node: ast.AST) -> str | None:
     return ".".join(reversed(parts))
 
 
+def int32_ir_value_argument(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return None
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "ir_value":
+        return None
+    conversion = node.func.value
+    if (
+        not isinstance(conversion, ast.Call)
+        or dotted_name(conversion.func) != "Int32"
+        or len(conversion.args) != 1
+        or conversion.keywords
+        or not isinstance(conversion.args[0], ast.Name)
+    ):
+        return None
+    return conversion.args[0].id
+
+
 class UnalignedHandoffSourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -51,10 +68,12 @@ class UnalignedHandoffSourceTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         call = calls[0]
         self.assertEqual(len(call.args), 1)
-        self.assertEqual(dotted_name(call.args[0].func), "barrier_id.ir_value")
+        self.assertEqual(int32_ir_value_argument(call.args[0]), "barrier_id")
         keywords = {item.arg: item.value for item in call.keywords}
         self.assertEqual(set(keywords), {"thread_count", "aligned"})
-        self.assertEqual(dotted_name(keywords["thread_count"].func), "num_threads.ir_value")
+        self.assertEqual(
+            int32_ir_value_argument(keywords["thread_count"]), "num_threads"
+        )
         self.assertIsInstance(keywords["aligned"], ast.Constant)
         self.assertIs(keywords["aligned"].value, False)
 

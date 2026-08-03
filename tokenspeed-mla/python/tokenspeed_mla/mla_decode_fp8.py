@@ -117,8 +117,8 @@ _P_COR_METADATA_FIELDS = 4
 def named_barrier_sync_unaligned(barrier_id: Int32, num_threads: Int32):
     """Synchronize a named-barrier subset from divergent CTA control flow."""
     nvvm.barrier_cta_sync(
-        barrier_id.ir_value(),
-        thread_count=num_threads.ir_value(),
+        Int32(barrier_id).ir_value(),
+        thread_count=Int32(num_threads).ir_value(),
         aligned=False,
     )
 
