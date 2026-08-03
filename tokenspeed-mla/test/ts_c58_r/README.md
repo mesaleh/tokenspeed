@@ -38,6 +38,12 @@ Fixed rules:
 - `barrier_litmus.py`: compiles explicit `barrier.sync.aligned` and unaligned
   `barrier.sync` cells; every run must match the prepared extension hash.
 - `inspect_barrier_source.py`: records barrier/warp/call-site source geometry.
+- `capture_disassembly.py`: binds the accepted oracle PTX/CUBIN, exact
+  oracle execution seal, `nvdisasm` binary/version, named-barrier operands,
+  and the resulting SASS.
+- `map_barrier_pc.py`: requires a complete synccheck thread map and maps its
+  exact, execution-sealed report PC through SASS operands and PTX candidates
+  to one source-level named-barrier role.
 - `seal_synccheck_exception.py`: can seal only the fully mapped, reviewed,
   contract-conformant tool-limitation branch with all litmus/recovery evidence.
 - `make_provenance.py`: binds source, tools, pod UID/node, runtime image ID,

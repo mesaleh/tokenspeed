@@ -93,8 +93,17 @@ def main() -> int:
     proof, proof_raw = load_json(args.control_proof)
     require(mapping.get("record_type") == "ts-c58-r-pc-mapping" and mapping.get("status") == "pass",
             "PC mapping differs")
+    require(mapping.get("target_synccheck_seal_sha256") == sha256_bytes(target_raw),
+            "PC mapping does not bind the target synccheck seal")
+    require(mapping.get("synccheck_report_sha256") == target.get("report_sha256"),
+            "PC mapping does not bind the target synccheck report")
+    require(mapping.get("tool_sha256") == provenance.get("tool_hashes", {}).get("map_barrier_pc.py"),
+            "PC mapping tool identity differs")
     require(inventory.get("record_type") == "ts-c58-r-barrier-source-inventory"
             and inventory.get("status") == "pass", "source inventory differs")
+    require(inventory.get("tool_sha256")
+            == provenance.get("tool_hashes", {}).get("inspect_barrier_source.py"),
+            "source inventory tool identity differs")
     require(proof.get("record_type") == "ts-c58-r-control-proof"
             and proof.get("status") == "pass" and proof.get("contract_conformant") is True,
             "contract-conformance proof differs")
@@ -171,6 +180,10 @@ def main() -> int:
 
     require(args.disassembly.is_file() and args.disassembly.stat().st_size > 0,
             "disassembly evidence is absent")
+    require(mapping.get("disassembly_sha256") == sha256_file(args.disassembly),
+            "PC mapping does not bind the supplied disassembly")
+    require(mapping.get("source_inventory_sha256") == sha256_bytes(inventory_raw),
+            "PC mapping does not bind the source inventory")
     require(args.reviewer_log.is_file() and args.reviewer_log.stat().st_size > 0,
             "reviewer log is absent")
     require(bool(args.reviewer_session.strip()), "reviewer session is empty")

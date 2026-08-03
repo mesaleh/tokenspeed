@@ -23,6 +23,8 @@ TOOL_FILES = (
     "seal_synccheck_exception.py",
     "inspect_barrier_source.py",
     "barrier_litmus.py",
+    "capture_disassembly.py",
+    "map_barrier_pc.py",
     "make_provenance.py",
     "parse_synccheck_report.py",
     "make_execution_specs.py",
