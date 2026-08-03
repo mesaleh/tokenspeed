@@ -26,6 +26,13 @@ PTX_NAMED_BARRIER = re.compile(
     r"(0x[0-9a-f]+|[0-9]+)\s*;\s*$",
     re.IGNORECASE,
 )
+SASS_NAMED_BARRIER = re.compile(
+    r"^\s*/\*([0-9a-f]+)\*/\s+"
+    r"(?:@[!A-Z0-9.]+\s+)?(BAR\.SYNC(?:\.[A-Z_]+)*)\s+"
+    r"0x([0-9a-f]+),\s*0x([0-9a-f]+)\s*;",
+    re.IGNORECASE,
+)
+SASS_FUNCTION = re.compile(r"^\s*\.global\s+(\S+)\s*$")
 
 
 class EvidenceError(RuntimeError):
@@ -133,6 +140,75 @@ def compiler_semantic_contract(
         "artifact_layout": layout,
         "stable_ir": stable_ir,
         "ptx_named_barriers": ptx_named_barriers,
+    }
+
+
+def compiler_sass_contract(
+    artifact_root: Path,
+    artifacts: list[dict[str, Any]],
+    nvdisasm: Path,
+) -> dict[str, Any]:
+    """Bind normalized named-barrier SASS while tolerating address/register drift."""
+    compiler_semantic_contract(artifact_root, artifacts)
+    artifact_root = artifact_root.resolve()
+    cubins = [entry for entry in artifacts if entry.get("suffix") == ".cubin"]
+    require(len(cubins) == 1, "compiler CUBIN count differs")
+    cubin = (artifact_root / cubins[0]["path"]).resolve()
+    try:
+        cubin.relative_to(artifact_root)
+    except ValueError as exc:
+        raise EvidenceError("compiler CUBIN escapes its root") from exc
+
+    nvdisasm = nvdisasm.resolve()
+    require(nvdisasm.is_absolute() and nvdisasm.is_file(), "nvdisasm path differs")
+    version = subprocess.run(
+        [str(nvdisasm), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    require(bool(version), "nvdisasm version is empty")
+    completed = subprocess.run(
+        [str(nvdisasm), "--print-line-info-ptx", "--print-code", str(cubin)],
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    require(completed.returncode == 0, "nvdisasm failed")
+    require(completed.stderr == b"", "nvdisasm stderr is not empty")
+    require(bool(completed.stdout), "nvdisasm output is empty")
+    try:
+        text = completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EvidenceError("nvdisasm output is not UTF-8") from exc
+
+    current_function = None
+    barriers: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        function_match = SASS_FUNCTION.fullmatch(line)
+        if function_match is not None:
+            current_function = function_match.group(1)
+        barrier_match = SASS_NAMED_BARRIER.fullmatch(line)
+        if barrier_match is None:
+            continue
+        require(current_function is not None, "SASS named barrier is not function scoped")
+        _, instruction, barrier_id, count = barrier_match.groups()
+        barriers.append(
+            {
+                "ordinal": len(barriers),
+                "function": current_function,
+                "instruction": instruction.upper(),
+                "barrier_id": int(barrier_id, 16),
+                "count": int(count, 16),
+            }
+        )
+    require(bool(barriers), "SASS named barriers are absent")
+    return {
+        "nvdisasm_path": str(nvdisasm),
+        "nvdisasm_sha256": sha256_file(nvdisasm),
+        "nvdisasm_version": version,
+        "named_barriers": barriers,
     }
 
 

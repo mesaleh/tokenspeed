@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyze_r1_results import (  # noqa: E402
+    require_sanitizer_oracle,
     require_accepted_identity,
     require_baseline,
     require_disassembly,
@@ -16,6 +17,7 @@ from analyze_r1_results import (  # noqa: E402
 )
 from evidence_common import (  # noqa: E402
     EvidenceError,
+    compiler_sass_contract,
     compiler_semantic_contract,
     sha256_bytes,
     sha256_file,
@@ -37,7 +39,15 @@ def disassembly_fixture(arm: str) -> dict:
         for _ in range(3)
     ]
     if arm == "m128":
-        ptx.extend({"barrier_id": 6, "count": 128} for _ in range(6))
+        ptx.extend(
+            {
+                "instruction": "bar.sync",
+                "aligned": True,
+                "barrier_id": 6,
+                "count": 128,
+            }
+            for _ in range(6)
+        )
         sass.extend({"barrier_id": 6, "count": 128} for _ in range(6))
     return {
         "record_type": "ts-c58-r-disassembly-manifest",
@@ -63,6 +73,24 @@ class R1ToolTests(unittest.TestCase):
             }
             for path in sorted(root.iterdir())
         ]
+
+    @staticmethod
+    def _fake_nvdisasm(root: Path) -> Path:
+        path = root / "nvdisasm"
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "if '--version' in sys.argv:\n"
+            "    print('fake nvdisasm 1.0')\n"
+            "else:\n"
+            "    raw = pathlib.Path(sys.argv[-1]).read_bytes()\n"
+            "    count = '0x100' if b'sass-drift' in raw else '0x120'\n"
+            "    print('.global kernel')\n"
+            "    print('/*0000*/ BAR.SYNC.DEFER_BLOCKING 0x1, ' + count + ';')\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
 
     def test_compiler_contract_tolerates_register_allocation_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -90,6 +118,11 @@ class R1ToolTests(unittest.TestCase):
             self.assertEqual(
                 compiler_semantic_contract(first, first_artifacts),
                 compiler_semantic_contract(second, second_artifacts),
+            )
+            nvdisasm = self._fake_nvdisasm(root)
+            self.assertEqual(
+                compiler_sass_contract(first, first_artifacts, nvdisasm),
+                compiler_sass_contract(second, second_artifacts, nvdisasm),
             )
 
     def test_compiler_contract_rejects_ir_or_barrier_drift(self) -> None:
@@ -120,6 +153,78 @@ class R1ToolTests(unittest.TestCase):
                 baseline_contract,
                 compiler_semantic_contract(ir_drift, self._artifact_inventory(ir_drift)),
             )
+
+    def test_compiler_sass_contract_rejects_named_barrier_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline"
+            drift = root / "drift"
+            for directory, cubin in ((baseline, b"cubin"), (drift, b"sass-drift")):
+                directory.mkdir()
+                (directory / "kernel.mlir").write_text("stable-ir\n", encoding="utf-8")
+                (directory / "kernel.ptx").write_text(
+                    "barrier.sync 1, 288;\n", encoding="utf-8"
+                )
+                (directory / "kernel.cubin").write_bytes(cubin)
+            nvdisasm = self._fake_nvdisasm(root)
+            self.assertNotEqual(
+                compiler_sass_contract(
+                    baseline, self._artifact_inventory(baseline), nvdisasm
+                ),
+                compiler_sass_contract(drift, self._artifact_inventory(drift), nvdisasm),
+            )
+
+    def test_sanitizer_oracle_binds_exact_candidate_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "kernel.mlir").write_text("stable-ir\n", encoding="utf-8")
+            (root / "kernel.ptx").write_text(
+                "barrier.sync 1, 288;\n", encoding="utf-8"
+            )
+            (root / "kernel.cubin").write_bytes(b"cubin")
+            artifacts = self._artifact_inventory(root)
+            semantic_contract = compiler_semantic_contract(root, artifacts)
+            candidate = {
+                "cases": [{"case_id": "case"}],
+                "compiler_semantic_contract": semantic_contract,
+            }
+            candidate_raw = b'{"candidate":true}\n'
+            result = {
+                "record_type": "ts-c58-r-decode-oracle",
+                "status": "pass",
+                "arm": "m128",
+                "mode": "synccheck",
+                "expected_sha256": sha256_bytes(candidate_raw),
+                "hashes_match_unsanitized": True,
+                "compiler_semantic_contract_matches_unsanitized": True,
+                "cases": candidate["cases"],
+                "compiler_semantic_contract": semantic_contract,
+                "compiler_dump_dir": str(root),
+                "compiler_artifacts": artifacts,
+            }
+            result_raw = b'{"result":true}\n'
+            execution = {"result_sha256": sha256_bytes(result_raw)}
+            require_sanitizer_oracle(
+                result,
+                result_raw,
+                execution,
+                candidate,
+                candidate_raw,
+                arm="m128",
+                mode="synccheck",
+            )
+            wrong = copy.deepcopy(result)
+            wrong["expected_sha256"] = "0" * 64
+            with self.assertRaisesRegex(EvidenceError, "oracle binding differs"):
+                require_sanitizer_oracle(
+                    wrong,
+                    result_raw,
+                    execution,
+                    candidate,
+                    candidate_raw,
+                    arm="m128",
+                    mode="synccheck",
+                )
 
     def test_candidate_cannot_substitute_for_pinned_accepted_baseline(self) -> None:
         candidate_identity = {
@@ -192,6 +297,11 @@ class R1ToolTests(unittest.TestCase):
         missing_tq4["sass_named_barriers"].pop()
         with self.assertRaisesRegex(EvidenceError, "SASS TQ4-site count"):
             require_disassembly(missing_tq4, "m128")
+
+        unaligned_tq4 = disassembly_fixture("m128")
+        unaligned_tq4["ptx_named_barriers"][-1]["aligned"] = False
+        with self.assertRaisesRegex(EvidenceError, "TQ4 barrier is not aligned"):
+            require_disassembly(unaligned_tq4, "m128")
 
         dense_with_tq4 = disassembly_fixture("dense")
         dense_with_tq4["ptx_named_barriers"].append(

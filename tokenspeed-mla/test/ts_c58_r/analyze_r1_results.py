@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 
 from evidence_common import (
+    compiler_sass_contract,
+    compiler_semantic_contract,
     load_json,
     require,
     sha256_bytes,
@@ -172,6 +174,10 @@ def require_disassembly(manifest: dict, arm: str) -> dict[str, object]:
     expected_tq4_sites = 6 if arm == "m128" else 0
     require(len(ptx_tq4) == expected_tq4_sites, f"{arm} PTX TQ4-site count differs")
     require(len(sass_tq4) == expected_tq4_sites, f"{arm} SASS TQ4-site count differs")
+    require(
+        all(row.get("aligned") is True for row in ptx_tq4),
+        f"{arm} PTX TQ4 barrier is not aligned",
+    )
     return {
         "ptx_handoff_sites": len(ptx_handoff),
         "sass_handoff_sites": len(sass_handoff),
@@ -181,6 +187,66 @@ def require_disassembly(manifest: dict, arm: str) -> dict[str, object]:
         "cubin_sha256": manifest.get("cubin_sha256"),
         "disassembly_sha256": manifest.get("disassembly_sha256"),
     }
+
+
+def require_sanitizer_oracle(
+    result: dict,
+    result_raw: bytes,
+    execution_seal: dict,
+    candidate: dict,
+    candidate_raw: bytes,
+    *,
+    arm: str,
+    mode: str,
+) -> None:
+    require(
+        execution_seal.get("result_sha256") == sha256_bytes(result_raw),
+        f"{arm} {mode} result is not execution-bound",
+    )
+    require(
+        result.get("record_type") == "ts-c58-r-decode-oracle"
+        and result.get("status") == "pass"
+        and result.get("arm") == arm
+        and result.get("mode") == mode
+        and result.get("expected_sha256") == sha256_bytes(candidate_raw)
+        and result.get("hashes_match_unsanitized") is True
+        and result.get("compiler_semantic_contract_matches_unsanitized") is True,
+        f"{arm} {mode} oracle binding differs",
+    )
+    require(
+        result.get("cases") == candidate.get("cases")
+        and result.get("compiler_semantic_contract")
+        == candidate.get("compiler_semantic_contract"),
+        f"{arm} {mode} oracle content differs",
+    )
+    artifact_root = result.get("compiler_dump_dir")
+    artifacts = result.get("compiler_artifacts")
+    require(
+        isinstance(artifact_root, str)
+        and Path(artifact_root).is_absolute()
+        and isinstance(artifacts, list),
+        f"{arm} {mode} compiler evidence differs",
+    )
+    require(
+        compiler_semantic_contract(Path(artifact_root), artifacts)
+        == result.get("compiler_semantic_contract"),
+        f"{arm} {mode} compiler semantic contract is not artifact-bound",
+    )
+
+
+def normalized_formal_sass(manifest: dict) -> list[dict]:
+    rows = manifest.get("sass_named_barriers")
+    require(isinstance(rows, list) and rows, "formal SASS named barriers differ")
+    return [
+        {
+            "ordinal": ordinal,
+            "function": row.get("function"),
+            "instruction": row.get("instruction"),
+            "barrier_id": row.get("barrier_id"),
+            "count": row.get("count"),
+        }
+        for ordinal, row in enumerate(rows)
+    ]
 
 
 def require_zero_recovery(
@@ -361,6 +427,47 @@ def main() -> int:
         "candidate dense oracle is not execution-bound",
     )
 
+    sanitizer_results: dict[str, tuple[dict, bytes]] = {}
+    for cell, arm, mode, candidate, candidate_raw in (
+        (
+            "accepted-target-racecheck",
+            "m128",
+            "racecheck",
+            candidate_m128,
+            candidate_m128_raw,
+        ),
+        (
+            "accepted-target-synccheck",
+            "m128",
+            "synccheck",
+            candidate_m128,
+            candidate_m128_raw,
+        ),
+        (
+            "dense-control-synccheck",
+            "dense",
+            "synccheck",
+            candidate_dense,
+            candidate_dense_raw,
+        ),
+    ):
+        result_path = execution[cell][0].get("result_path")
+        require(
+            isinstance(result_path, str) and Path(result_path).is_absolute(),
+            f"{cell} result path differs",
+        )
+        result, result_raw = load_json(Path(result_path))
+        require_sanitizer_oracle(
+            result,
+            result_raw,
+            execution[cell][0],
+            candidate,
+            candidate_raw,
+            arm=arm,
+            mode=mode,
+        )
+        sanitizer_results[cell] = (result, result_raw)
+
     recoveries = load_seals(
         args.recovery_seal, "ts-c58-r-gpu-recovery-seal", "phase_id"
     )
@@ -391,6 +498,63 @@ def main() -> int:
         "m128": require_disassembly(m128_disassembly, "m128"),
         "dense": require_disassembly(dense_disassembly, "dense"),
     }
+    require(
+        m128_disassembly.get("nvdisasm_path") == dense_disassembly.get("nvdisasm_path")
+        and m128_disassembly.get("nvdisasm_sha256")
+        == dense_disassembly.get("nvdisasm_sha256")
+        and m128_disassembly.get("nvdisasm_version")
+        == dense_disassembly.get("nvdisasm_version"),
+        "formal nvdisasm identity differs between arms",
+    )
+    nvdisasm_path = m128_disassembly.get("nvdisasm_path")
+    require(
+        isinstance(nvdisasm_path, str) and Path(nvdisasm_path).is_absolute(),
+        "formal nvdisasm path differs",
+    )
+
+    candidate_sass = {}
+    for arm, candidate, manifest in (
+        ("m128", candidate_m128, m128_disassembly),
+        ("dense", candidate_dense, dense_disassembly),
+    ):
+        require(
+            compiler_semantic_contract(
+                Path(candidate["compiler_dump_dir"]),
+                candidate["compiler_artifacts"],
+            )
+            == candidate.get("compiler_semantic_contract"),
+            f"{arm} candidate compiler semantic contract is not artifact-bound",
+        )
+        contract = compiler_sass_contract(
+            Path(candidate["compiler_dump_dir"]),
+            candidate["compiler_artifacts"],
+            Path(nvdisasm_path),
+        )
+        require(
+            contract["nvdisasm_sha256"] == manifest.get("nvdisasm_sha256")
+            and contract["nvdisasm_version"] == manifest.get("nvdisasm_version")
+            and contract["named_barriers"] == normalized_formal_sass(manifest),
+            f"{arm} candidate SASS contract differs from formal disassembly",
+        )
+        candidate_sass[arm] = contract
+
+    sanitizer_sass_matches = {}
+    for cell, arm in (
+        ("accepted-target-racecheck", "m128"),
+        ("accepted-target-synccheck", "m128"),
+        ("dense-control-synccheck", "dense"),
+    ):
+        result = sanitizer_results[cell][0]
+        contract = compiler_sass_contract(
+            Path(result["compiler_dump_dir"]),
+            result["compiler_artifacts"],
+            Path(nvdisasm_path),
+        )
+        require(
+            contract == candidate_sass[arm],
+            f"{cell} SASS named-barrier contract differs from candidate",
+        )
+        sanitizer_sass_matches[cell] = True
 
     value = {
         "schema_version": 1,
@@ -414,11 +578,15 @@ def main() -> int:
         "execution_seal_sha256s": {
             cell: sha256_bytes(execution[cell][1]) for cell in CELLS
         },
+        "sanitizer_result_sha256s": {
+            cell: sha256_bytes(raw) for cell, (_, raw) in sanitizer_results.items()
+        },
         "recovery_seal_sha256s": {
             cell: sha256_bytes(recoveries[cell][1]) for cell in sorted(recoveries)
         },
         "disassembly": disassembly_summary,
         "output_lse_hashes_match_accepted": {"m128": True, "dense": True},
+        "sanitizer_sass_named_barriers_match_candidate": sanitizer_sass_matches,
         "tool_sha256": sha256_file(Path(__file__).resolve()),
     }
     write_json_exclusive(args.output, value)

@@ -73,7 +73,10 @@ Fixed rules:
 - `analyze_r1_results.py`: requires the full seven-cell execution set, all
   sanitizer recovery seals, exact accepted output/LSE hashes, three explicit
   unaligned ID-1/count-288 sites per arm, and preserved M128 ID-6 sites before
-  it can select the R1 candidate.
+  it can select the R1 candidate. It content-binds every sanitizer result to
+  the exact candidate-oracle bytes, requires all M128 ID-6 sites to remain
+  aligned, and compares normalized named-barrier SASS for every backend CUBIN
+  variant to the formal candidate disassembly.
 - `map_barrier_pc.py`: requires a complete synccheck thread map and maps its
   exact, execution-sealed report PC for the explicit M128 or dense arm through
   SASS operands and PTX candidates to one source-level named-barrier role.
