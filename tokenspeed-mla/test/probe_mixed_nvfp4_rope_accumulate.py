@@ -42,8 +42,8 @@ from typing import Any
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
+import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -193,12 +193,8 @@ def mixed_accumulate_kernel(
     thr_mma = mixed_mma.get_slice(mma_tile_coord_v)
     t_cg_a = thr_mma.partition_A(g_a_mkl)
     t_cg_b = thr_mma.partition_B(g_b_nkl)
-    a_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape
-    )
-    b_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape
-    )
+    a_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape)
+    b_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape)
     t_as_a, t_ag_a = cpasync.tma_partition(
         tma_atom_a,
         cta_coord_vmnk[2],
@@ -323,9 +319,7 @@ def mixed_accumulate_kernel(
         cute.slice_(sfa_layout, (None, None, None, 0)),
     )
     t_sfa = cute.make_tensor(sfa_tmem_ptr, t_sfa_layout)
-    sfb_tmem_ptr = cute.recast_ptr(
-        tmem_ptr + sfa_cols, dtype=SF_DTYPE
-    )
+    sfb_tmem_ptr = cute.recast_ptr(tmem_ptr + sfa_cols, dtype=SF_DTYPE)
     t_sfb_layout = blockscaled_utils.make_tmem_layout_sfb(
         mixed_mma,
         MIXED_TILER_MNK,
@@ -334,9 +328,7 @@ def mixed_accumulate_kernel(
     )
     t_sfb = cute.make_tensor(sfb_tmem_ptr, t_sfb_layout)
 
-    if cutlass.const_expr(
-        os.environ.get("TQ_N8_S0_POISON_SCALE_PADDING") == "1"
-    ):
+    if cutlass.const_expr(os.environ.get("TQ_N8_S0_POISON_SCALE_PADDING") == "1"):
         # Validation-only negative control: poison the entire aligned scale
         # scratch before overwriting the exact live footprint below. An exact
         # oracle pass then proves MMA does not consume alignment padding.
@@ -352,9 +344,7 @@ def mixed_accumulate_kernel(
         padding_coords = cute.make_identity_tensor(scale_padding.shape)
         padding_reg_layout = padding_thr.partition_S(padding_coords)
         padding_dst = padding_thr.partition_D(scale_padding)
-        padding_regs = cute.make_fragment_like(
-            padding_reg_layout, cutlass.Float32
-        )
+        padding_regs = cute.make_fragment_like(padding_reg_layout, cutlass.Float32)
         poison_word = cutlass.Uint32(0x80808080).bitcast(cutlass.Float32)
         for element in cutlass.range_constexpr(cute.size(padding_regs)):
             padding_regs[element] = poison_word
@@ -375,16 +365,12 @@ def mixed_accumulate_kernel(
     scale_init_store_atom = cute.make_copy_atom(
         tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), cutlass.Float32
     )
-    scale_init_store = tcgen05.make_tmem_copy(
-        scale_init_store_atom, scale_init_tile
-    )
+    scale_init_store = tcgen05.make_tmem_copy(scale_init_store_atom, scale_init_tile)
     scale_init_thr = scale_init_store.get_slice(tidx)
     scale_init_coords = cute.make_identity_tensor((OBSERVED_M, LIVE_SCALE_COLS))
     scale_init_reg_layout = scale_init_thr.partition_S(scale_init_coords)
     scale_init_dst = scale_init_thr.partition_D(scale_init_tile)
-    scale_init_regs = cute.make_fragment_like(
-        scale_init_reg_layout, cutlass.Float32
-    )
+    scale_init_regs = cute.make_fragment_like(scale_init_reg_layout, cutlass.Float32)
     unity_word = cutlass.Uint32(0x7F7F7F7F).bitcast(cutlass.Float32)
     for element in cutlass.range_constexpr(cute.size(scale_init_regs)):
         scale_init_regs[element] = unity_word
@@ -430,12 +416,8 @@ def mixed_accumulate_kernel(
         for latent_tile in cutlass.range_constexpr(LATENT_K_TILES):
             tma_barriers.wait(latent_tile, 0)
             for k_block in cutlass.range(mixed_k_blocks, unroll_full=True):
-                mixed_mma.set(
-                    tcgen05.Field.SFA, t_sfa[None, None, k_block].iterator
-                )
-                mixed_mma.set(
-                    tcgen05.Field.SFB, t_sfb[None, None, k_block].iterator
-                )
+                mixed_mma.set(tcgen05.Field.SFA, t_sfa[None, None, k_block].iterator)
+                mixed_mma.set(tcgen05.Field.SFB, t_sfb[None, None, k_block].iterator)
                 cute.gemm(
                     mixed_mma,
                     acc,
@@ -495,8 +477,8 @@ def mixed_accumulate_kernel(
     cute.arch.fence_view_async_tmem_load()
     for element in cutlass.range_constexpr(cute.size(store_registers)):
         token = t_store_coords[element][1]
-        store_registers[element] = (
-            score_registers[element] * token_scale[token].to(cutlass.Float32)
+        store_registers[element] = score_registers[element] * token_scale[token].to(
+            cutlass.Float32
         )
     cute.copy(tmem_store, store_registers, t_tmem_store)
     cute.arch.fence_view_async_tmem_store()
@@ -570,21 +552,15 @@ def mixed_accumulate_probe(
     mixed_mma, rope_mma = make_tiled_mmas()
     g_mixed_a = cute.make_tensor(
         mixed_a_ptr,
-        cute.make_ordered_layout(
-            (OBSERVED_M, LATENT_K, 1), order=(1, 0, 2)
-        ),
+        cute.make_ordered_layout((OBSERVED_M, LATENT_K, 1), order=(1, 0, 2)),
     )
     g_mixed_b = cute.make_tensor(
         mixed_b_ptr,
-        cute.make_ordered_layout(
-            (128, LATENT_K, 1), order=(1, 0, 2)
-        ),
+        cute.make_ordered_layout((128, LATENT_K, 1), order=(1, 0, 2)),
     )
     g_rope_a = cute.make_tensor(
         rope_a_ptr,
-        cute.make_ordered_layout(
-            (OBSERVED_M, ROPE_TILER_MNK[2], 1), order=(1, 0, 2)
-        ),
+        cute.make_ordered_layout((OBSERVED_M, ROPE_TILER_MNK[2], 1), order=(1, 0, 2)),
     )
     g_rope_b = cute.make_tensor(
         rope_b_ptr,
@@ -820,9 +796,7 @@ def _synthetic_main() -> None:
     latent_ids = torch.arange(LATENT_K, device="cuda", dtype=torch.int64)
     query_value_full = (
         (
-            (all_rows[:, None] + 1)
-            * (latent_ids[None, :] + 3)
-            * 17
+            (all_rows[:, None] + 1) * (latent_ids[None, :] + 3) * 17
             + all_rows[:, None] * 37
             + latent_ids[None, :] * 19
         )
@@ -831,9 +805,7 @@ def _synthetic_main() -> None:
     query_value = query_value_full
     key_value = (
         (
-            (token_ids[:, None] + 1)
-            * (latent_ids[None, :] + 5)
-            * 23
+            (token_ids[:, None] + 1) * (latent_ids[None, :] + 5) * 23
             + token_ids[:, None] * 41
             + latent_ids[None, :] * 29
         )
@@ -902,9 +874,9 @@ def _synthetic_main() -> None:
         raise AssertionError("latent oracle does not distinguish all output rows")
     if torch.unique(latent_expected.T, dim=0).shape[0] != 128:
         raise AssertionError("latent oracle does not distinguish all output tokens")
-    token_expected = (
-        latent_expected * token_scale.float().view(1, 128)
-    ).view_as(output)
+    token_expected = (latent_expected * token_scale.float().view(1, 128)).view_as(
+        output
+    )
     for _ in range(4):
         token_expected = token_expected + 32.0
 
@@ -957,9 +929,7 @@ def _synthetic_main() -> None:
         torch.cuda.synchronize()
         samples_ns.append(max(elapsed_ns.cpu().tolist()))
 
-    acc_cols, sfa_cols, sfb_cols, total_cols, allocated_cols = (
-        metadata.cpu().tolist()
-    )
+    acc_cols, sfa_cols, sfb_cols, total_cols, allocated_cols = metadata.cpu().tolist()
     print(
         "PASS mixed_fp8_query_fp4_key=True same_score_tile_serialization=True "
         "cta_group=1 ownership_case=full_period_row_token_k_tma_unpack "
@@ -1084,9 +1054,7 @@ def _to_cute_tensor(source: torch.Tensor, dtype: Any):
 
 def _prepare_query(surface: dict[str, Any], control: str) -> tuple[Any, Any]:
     q_latent = torch.zeros((OBSERVED_M, LATENT_K, 1), dtype=torch.float32)
-    q_rope = torch.zeros(
-        (OBSERVED_M, ROPE_TILER_MNK[2], 1), dtype=torch.float32
-    )
+    q_rope = torch.zeros((OBSERVED_M, ROPE_TILER_MNK[2], 1), dtype=torch.float32)
     q_latent[:VALID_HEADS, :, 0] = surface["q_rot_fp8"].to(torch.float32)
     q_rope[:VALID_HEADS, :64, 0] = surface["q_rope_fp8"].to(torch.float32)
     if control == "m_rows":
@@ -1105,15 +1073,11 @@ def _prepare_key_tile(
 ) -> tuple[Any, torch.Tensor, Any]:
     raw_key = torch.zeros((TILE_TOKENS, LATENT_K, 1), dtype=torch.float32)
     token_scale = torch.ones(TILE_TOKENS, dtype=torch.bfloat16)
-    key_rope = torch.zeros(
-        (TILE_TOKENS, ROPE_TILER_MNK[2], 1), dtype=torch.float32
-    )
+    key_rope = torch.zeros((TILE_TOKENS, ROPE_TILER_MNK[2], 1), dtype=torch.float32)
     stop = start + valid
     raw_key[:valid, :, 0] = layer["raw_key_e2m1"][start:stop].to(torch.float32)
     token_scale[:valid] = layer["token_scale_bf16"][start:stop]
-    key_rope[:valid, :64, 0] = layer["key_rope_fp8"][start:stop].to(
-        torch.float32
-    )
+    key_rope[:valid, :64, 0] = layer["key_rope_fp8"][start:stop].to(torch.float32)
     if control == "n_columns" and valid < TILE_TOKENS:
         raw_key[valid:, :, 0] = 2.0
         token_scale[valid:] = torch.tensor(1.5, dtype=torch.bfloat16)
@@ -1145,9 +1109,7 @@ def _run_surface(
     elapsed_ns = torch.empty(1, device="cuda", dtype=torch.int64)
     for start in range(0, key_count, TILE_TOKENS):
         valid = min(TILE_TOKENS, key_count - start)
-        key, token_scale, key_rope = _prepare_key_tile(
-            layer, start, valid, control
-        )
+        key, token_scale, key_rope = _prepare_key_tile(layer, start, valid, control)
         compiled(
             q_latent.iterator,
             key.iterator,
@@ -1167,9 +1129,7 @@ def _run_surface(
         result[:, start : start + valid] = tile
     expected_metadata = [128, 8, 8, 256, 512]
     if metadata.cpu().tolist() != expected_metadata:
-        raise RuntimeError(
-            f"kernel metadata differs: {metadata.cpu().tolist()}"
-        )
+        raise RuntimeError(f"kernel metadata differs: {metadata.cpu().tolist()}")
     return result
 
 
@@ -1225,9 +1185,7 @@ def _run_native_campaign(
                     "applicable": applicable,
                     "byte_identical": byte_identical,
                 }
-            if not all(
-                result["byte_identical"] for result in control_results.values()
-            ):
+            if not all(result["byte_identical"] for result in control_results.values()):
                 raise RuntimeError(
                     f"padding control changed valid scores for "
                     f"{layer['layer']}:{surface['label']}: {control_results}"
@@ -1293,9 +1251,7 @@ def _run_native_campaign(
         "score_stream_sha256": metadata_value["score_stream_sha256"],
         "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
     }
-    _atomic_bytes(
-        run_identity_path, _canonical_json_bytes(run_identity) + b"\n"
-    )
+    _atomic_bytes(run_identity_path, _canonical_json_bytes(run_identity) + b"\n")
     print(
         "PASS native_rounding_scores=True "
         f"surfaces={len(surfaces_metadata)} "

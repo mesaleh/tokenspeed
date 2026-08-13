@@ -16,14 +16,12 @@ from __future__ import annotations
 import argparse
 from functools import lru_cache
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
+import torch
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.experimental import primitives as prims
-
 
 _ROWS = 16
 _K = 128
@@ -83,9 +81,7 @@ def kernel(
         within_row = flat % (_PADDED_ROW_BYTES // 2)
         group = within_row // 8
         byte = within_row % 8
-        smem[row * _PADDED_ROW_BYTES + group * 16 + 8 + byte] = cutlass.Int8(
-            POISON
-        )
+        smem[row * _PADDED_ROW_BYTES + group * 16 + 8 + byte] = cutlass.Int8(POISON)
     prims.barrier_cta_sync(0)
 
     lane = tidx % _WARP_SIZE
@@ -159,9 +155,7 @@ def _packed_source(codes: torch.Tensor) -> torch.Tensor:
 
 
 def _expected(codes: torch.Tensor) -> torch.Tensor:
-    expected = torch.empty(
-        (_GROUPS, _WARP_SIZE, _WORDS_PER_LANE), dtype=torch.uint32
-    )
+    expected = torch.empty((_GROUPS, _WARP_SIZE, _WORDS_PER_LANE), dtype=torch.uint32)
     for group in range(_GROUPS):
         for lane in range(_WARP_SIZE):
             output_row = lane // 4
