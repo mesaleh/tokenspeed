@@ -264,6 +264,23 @@ def make_host_pattern(
         * scale_factors
     ).to(torch.bfloat16)
 
+    if scale_case < 0:
+        warp_maxima = token_scale.float().view(base.TILES, 4, 32).amax(dim=-1)
+        active_tiles = [tile for tile in range(base.TILES) if tile != base.MASKED_TILE]
+        for tile_index in active_tiles:
+            if not torch.equal(
+                warp_maxima[tile_index],
+                warp_maxima[tile_index, :1].expand(4),
+            ):
+                raise AssertionError(
+                    f"carrier diagnostic lacks a four-warp max tie: tile={tile_index}"
+                )
+        print(
+            "PASS_A8_FOUR_WARP_MAX_TIES "
+            f"tiles={','.join(str(tile) for tile in active_tiles)}",
+            flush=True,
+        )
+
     if scale_case >= 0:
         # Extreme carrier tests isolate scale/P state from the value path so
         # native E4M3 conversion cannot overflow and self-certify NaNs.
