@@ -31,6 +31,9 @@ ARM_CONFIGS = {
 FROZEN_KERNEL_REGION_SHA256 = (
     "426748da54be0e3c9df405005f911273311dd039dc5755d4b43447a64811f3a1"
 )
+FROZEN_BASE_FILE_SHA256 = (
+    "43e76da94fd6bafbd9e98225f97c85723cba15ab42eb10a67b312b7f73d7d8ce"
+)
 SCORED_NODES = 100
 SCORED_WINDOWS = 30
 SCORED_WARMUP_WINDOWS = 24
@@ -90,9 +93,15 @@ COMPLETE_OUTPUT_FIELDS = {
 }
 
 
-def assert_frozen_kernel_region() -> str:
+def assert_frozen_base_source() -> tuple[str, str]:
     source_path = Path(base.__file__)
     raw = source_path.read_bytes()
+    file_digest = hashlib.sha256(raw).hexdigest()
+    if file_digest != FROZEN_BASE_FILE_SHA256:
+        raise AssertionError(
+            f"A4 base/oracle file drifted: {file_digest} != "
+            f"{FROZEN_BASE_FILE_SHA256}"
+        )
     marker = b"\ndef fake("
     if marker not in raw:
         raise AssertionError("cannot locate frozen kernel/host boundary")
@@ -103,7 +112,7 @@ def assert_frozen_kernel_region() -> str:
             f"A4 kernel region drifted: {digest} != "
             f"{FROZEN_KERNEL_REGION_SHA256}"
         )
-    return digest
+    return file_digest, digest
 
 
 def williams_orders(windows: int) -> list[tuple[str, ...]]:
@@ -528,14 +537,24 @@ def verify_pool(
     matrix_export: bool,
     overlap_setup: int,
 ) -> None:
-    checked = set(COMPLETE_OUTPUT_FIELDS)
-    if matrix_export:
-        checked.add("matrix")
+    checked: set[str] = set()
     expected_fields = set(COMPLETE_OUTPUT_FIELDS)
     if matrix_export:
         expected_fields.add("matrix")
-    if checked != expected_fields:
-        raise AssertionError("complete-state verifier coverage drifted")
+
+    def exact(name: str, actual: torch.Tensor, oracle: torch.Tensor) -> None:
+        require_exact(name, actual, oracle)
+        checked.add(name)
+
+    def close(
+        name: str,
+        actual: torch.Tensor,
+        oracle: torch.Tensor,
+        rtol: float,
+        atol: float,
+    ) -> None:
+        require_close(name, actual, oracle, rtol, atol)
+        checked.add(name)
 
     layout = expected_layout(arm, overlap_setup)
     layout_output = materialize_output(outputs, "layout")
@@ -549,11 +568,11 @@ def verify_pool(
     normalized_output = materialize_output(outputs, "normalized")
     bf16_output = materialize_output(outputs, "bf16")
     carrier_output = materialize_output(outputs, "carrier")
-    require_exact("layout", layout_output, layout)
-    require_exact("p", p_output, expected[0])  # type: ignore[arg-type]
-    require_exact("max", max_output, expected[1])  # type: ignore[arg-type]
-    require_close("sum", sum_output, expected[2], 2.0e-6, 2.0e-5)  # type: ignore[arg-type]
-    require_exact("owner", owner_output, expected[3])  # type: ignore[arg-type]
+    exact("layout", layout_output, layout)
+    exact("p", p_output, expected[0])  # type: ignore[arg-type]
+    exact("max", max_output, expected[1])  # type: ignore[arg-type]
+    close("sum", sum_output, expected[2], 2.0e-6, 2.0e-5)  # type: ignore[arg-type]
+    exact("owner", owner_output, expected[3])  # type: ignore[arg-type]
     require_close(
         "correction-state",
         correction_output[..., :2],
@@ -568,12 +587,14 @@ def verify_pool(
         2.0e-6,
         2.0e-5,
     )
-    require_exact("flags", flags_output, expected[7])  # type: ignore[arg-type]
+    checked.add("correction")
+    exact("flags", flags_output, expected[7])  # type: ignore[arg-type]
     if matrix_export:
         matrix_expected = expand_expected(expected[4], matrix_output.shape[0])  # type: ignore[arg-type]
         matrix_bound = expand_expected(expected[9], matrix_output.shape[0])  # type: ignore[arg-type]
         if not ((matrix_output - matrix_expected).abs() <= matrix_bound).all():
             raise AssertionError("matrix output exceeds error bound")
+        checked.add("matrix")
     normalized_expected = expand_expected(
         expected[8], normalized_output.shape[0]  # type: ignore[arg-type]
     )
@@ -584,12 +605,19 @@ def verify_pool(
         (normalized_output - normalized_expected).abs() <= normalized_bound
     ).all():
         raise AssertionError("normalized output exceeds error bound")
+    checked.add("normalized")
     if not torch.equal(
         bf16_output.view(torch.int16),
         normalized_output.to(torch.bfloat16).view(torch.int16),
     ):
         raise AssertionError("BF16 epilogue differs from normalized output")
-    require_exact("carrier", carrier_output, expected[5])  # type: ignore[arg-type]
+    checked.add("bf16")
+    exact("carrier", carrier_output, expected[5])  # type: ignore[arg-type]
+    if checked != expected_fields:
+        raise AssertionError(
+            f"complete-state verifier coverage drifted: "
+            f"checked={sorted(checked)} expected={sorted(expected_fields)}"
+        )
 
 
 def poison_outputs(outputs: dict[str, object], matrix_export: bool) -> None:
@@ -707,12 +735,19 @@ def build_runtime(
     def make_cute_nodes(source_node: torch.Tensor, dtype):
         cute_nodes = []
         backings = []
+        source_cuda = source_node.cuda().contiguous()
         for _ in range(args.nodes):
             cute_tensor, backing = base.cutlass_torch.cute_tensor_like(
                 source_node,
                 dtype,
                 is_dynamic_layout=True,
                 assumed_align=16,
+            )
+            cute_tensor = base.cutlass_torch.convert_cute_tensor(
+                source_cuda,
+                cute_tensor,
+                dtype,
+                is_dynamic_layout=True,
             )
             cute_nodes.append(cute_tensor)
             backings.append(backing)
@@ -923,13 +958,18 @@ def main() -> None:
         or args.clusters not in (128, 512)
         or args.matrix_export
         or args.graph_replays
+        or args.overlap_setup != 1
+        or args.scale_case != -1
+        or args.pv_sfa_exp
+        or args.pv_sfb_exp
     ):
         parser.error(
             "scored timing requires nodes100, warmup24, windows30, "
-            "clusters128/512, no matrix export, and no graph-replay loop"
+            "clusters128/512, overlap-setup1, the default scale case, "
+            "unity PV scales, no matrix export, and no graph-replay loop"
         )
 
-    kernel_digest = assert_frozen_kernel_region()
+    base_digest, kernel_digest = assert_frozen_base_source()
     assert_scale_case_coverage()
     selected = ARMS if args.arm == "all" else (args.arm,)
     compiled = {
@@ -955,7 +995,8 @@ def main() -> None:
     if args.compile_only:
         print(
             "PASS_A8_COMPILE_ONLY "
-            f"kernel_sha256={kernel_digest} clusters={args.clusters} "
+            f"base_sha256={base_digest} kernel_sha256={kernel_digest} "
+            f"clusters={args.clusters} "
             f"arms={','.join(selected)}",
             flush=True,
         )
@@ -1109,12 +1150,18 @@ def main() -> None:
     result = {
         "status": "PASS_A8_TIMING_SCORED" if scored else "PASS_A8_TIMING_REHEARSAL",
         "scored": scored,
+        "base_source_sha256": base_digest,
         "kernel_region_sha256": kernel_digest,
         "clusters": args.clusters,
         "nodes": args.nodes,
         "windows": args.windows,
         "warmup_windows": args.warmup_windows,
         "scale_case": args.scale_case,
+        "overlap_setup": args.overlap_setup,
+        "pv_sfa_exp": args.pv_sfa_exp,
+        "pv_sfb_exp": args.pv_sfb_exp,
+        "matrix_export": args.matrix_export,
+        "graph_replays": args.graph_replays,
         "generated_audit": generated_audit,
         "summary": summary,
         "ratios": ratios,
