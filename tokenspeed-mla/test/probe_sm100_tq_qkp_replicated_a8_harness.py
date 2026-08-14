@@ -733,21 +733,30 @@ def build_runtime(
     }
 
     def make_cute_nodes(source_node: torch.Tensor, dtype):
-        cute_nodes = []
-        backings = []
         source_cuda = source_node.cuda().contiguous()
-        for _ in range(args.nodes):
-            cute_tensor, backing = base.cutlass_torch.cute_tensor_like(
-                source_node,
-                dtype,
-                is_dynamic_layout=True,
+        template_cute, template_backing = base.cutlass_torch.cute_tensor_like(
+            source_node,
+            dtype,
+            is_dynamic_layout=True,
+            assumed_align=16,
+        )
+        template_cute = base.cutlass_torch.convert_cute_tensor(
+            source_cuda,
+            template_cute,
+            dtype,
+            is_dynamic_layout=True,
+        )
+        cute_nodes = [template_cute]
+        backings = [template_backing]
+        for _ in range(1, args.nodes):
+            backing = template_backing.clone()
+            cute_tensor = base.cutlass_torch.from_dlpack(
+                backing,
                 assumed_align=16,
             )
-            cute_tensor = base.cutlass_torch.convert_cute_tensor(
-                source_cuda,
-                cute_tensor,
-                dtype,
-                is_dynamic_layout=True,
+            cute_tensor.element_type = dtype
+            cute_tensor = cute_tensor.mark_layout_dynamic(
+                leading_dim=base.cutlass_torch.get_leading_dim(backing)
             )
             cute_nodes.append(cute_tensor)
             backings.append(backing)
