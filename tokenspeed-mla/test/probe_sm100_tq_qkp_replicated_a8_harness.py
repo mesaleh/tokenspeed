@@ -37,6 +37,7 @@ FROZEN_BASE_FILE_SHA256 = (
 SCORED_NODES = 100
 SCORED_WINDOWS = 30
 SCORED_WARMUP_WINDOWS = 24
+VERIFY_NODE_CHUNK = 4
 SUPPORTED_TIMING_WINDOWS = (6, SCORED_WINDOWS)
 T_CRITICAL_95 = {
     6: 2.570581836,
@@ -530,6 +531,26 @@ def require_close(
         raise AssertionError(f"bounded verification failed: {name} max={error}")
 
 
+def require_bounded_by_node(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    bound: torch.Tensor,
+) -> None:
+    for begin in range(0, actual.shape[0], VERIFY_NODE_CHUNK):
+        end = min(begin + VERIFY_NODE_CHUNK, actual.shape[0])
+        count = end - begin
+        expected_chunk = expand_expected(expected, count)
+        bound_chunk = expand_expected(bound, count)
+        delta = (actual[begin:end] - expected_chunk).abs()
+        if not (delta <= bound_chunk).all():
+            excess = (delta - bound_chunk).max().item()
+            raise AssertionError(
+                f"{name} output exceeds error bound: nodes={begin}:{end} "
+                f"max_excess={excess}"
+            )
+
+
 def verify_pool(
     arm: str,
     outputs: dict[str, object],
@@ -590,27 +611,30 @@ def verify_pool(
     checked.add("correction")
     exact("flags", flags_output, expected[7])  # type: ignore[arg-type]
     if matrix_export:
-        matrix_expected = expand_expected(expected[4], matrix_output.shape[0])  # type: ignore[arg-type]
-        matrix_bound = expand_expected(expected[9], matrix_output.shape[0])  # type: ignore[arg-type]
-        if not ((matrix_output - matrix_expected).abs() <= matrix_bound).all():
-            raise AssertionError("matrix output exceeds error bound")
+        require_bounded_by_node(
+            "matrix",
+            matrix_output,
+            expected[4],  # type: ignore[arg-type]
+            expected[9],  # type: ignore[arg-type]
+        )
         checked.add("matrix")
-    normalized_expected = expand_expected(
-        expected[8], normalized_output.shape[0]  # type: ignore[arg-type]
+    require_bounded_by_node(
+        "normalized",
+        normalized_output,
+        expected[8],  # type: ignore[arg-type]
+        expected[10],  # type: ignore[arg-type]
     )
-    normalized_bound = expand_expected(
-        expected[10], normalized_output.shape[0]  # type: ignore[arg-type]
-    )
-    if not (
-        (normalized_output - normalized_expected).abs() <= normalized_bound
-    ).all():
-        raise AssertionError("normalized output exceeds error bound")
     checked.add("normalized")
-    if not torch.equal(
-        bf16_output.view(torch.int16),
-        normalized_output.to(torch.bfloat16).view(torch.int16),
-    ):
-        raise AssertionError("BF16 epilogue differs from normalized output")
+    for begin in range(0, bf16_output.shape[0], VERIFY_NODE_CHUNK):
+        end = min(begin + VERIFY_NODE_CHUNK, bf16_output.shape[0])
+        if not torch.equal(
+            bf16_output[begin:end].view(torch.int16),
+            normalized_output[begin:end].to(torch.bfloat16).view(torch.int16),
+        ):
+            raise AssertionError(
+                f"BF16 epilogue differs from normalized output: "
+                f"nodes={begin}:{end}"
+            )
     checked.add("bf16")
     exact("carrier", carrier_output, expected[5])  # type: ignore[arg-type]
     if checked != expected_fields:
