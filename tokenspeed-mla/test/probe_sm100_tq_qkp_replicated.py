@@ -18,25 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Falsify the C1 replicated-local mixed-QK-to-P path on SM100.
+"""Falsify the C1 genuine two-CTA mixed-QK-to-P path on SM100.
 
 This is deliberately one step narrower than a complete attention reader.  It
-uses the accepted 384-thread/two-CTA resource envelope, produces one M128 x
-N128 score stage in each CTA's local TMEM, and assigns exactly 64 row owners
-per CTA.  Rank 0
-owns score rows 0..63 through CTA-local threads 0..63; rank 1 owns rows 64..127
-through threads 64..127.  Each owner performs two N64 max passes followed by
-two N64 exp/sum/E4M3 passes and writes its M64 x K128 result into the exact
-two-stage transposed-P SMEM operand used by the planned V(TMEM) x P(SMEM) MMA.
+uses the accepted 384-thread/two-CTA resource envelope and one cooperative
+group-two M128 x N128 QK/RoPE instruction stream.  Each CTA receives 64 score
+rows.  Its two N64 column halves live in paired lane groups, which exchange
+their FP32 max and sum before publishing a local M64 x K128 result into the
+exact two-stage transposed-P SMEM operand used by the planned
+V(TMEM) x P(SMEM) MMA.
 
 Five tiles force the single score stage and both P stages to wrap.  The probe
 exports the SMEM operand through its logical layout for an independent host
-oracle.  It establishes the first producer/owner composition and register
-feasibility only: each CTA deliberately loads its own Q/K/RoPE copy, and the
-probe does not issue PV MMA or make a traffic or endpoint-latency claim.
+oracle.  It establishes cooperative producer/owner composition and register
+feasibility only.  The probe does not issue PV MMA or make an endpoint-latency
+claim.
 """
 
 import argparse
+import statistics
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -73,7 +73,7 @@ SF_VEC_SIZE = 32
 SF_DTYPE = cutlass.Float8E8M0FNU
 MIXED_B_SMEM_DTYPE = cutlass.Int8
 VP_TILER_MNK = (128, 64, 128)
-LIVE_SCALE_COLS = 16
+LIVE_SCALE_COLS = 20
 SCALE_OFFSET = 64
 SCORE_OFFSET = 128
 TMEM_ALLOC_COLS = 512
@@ -81,11 +81,12 @@ SOFTMAX_SCALE_LOG2 = 0.015625
 
 Q_SMEM_BYTES = 128 * LATENT_K
 Q_ROPE_SMEM_BYTES = 128 * ROPE_K
-# S1 deliberately uses the reviewed legal two-stage K composition variant.
+# Preserve S1's reviewed legal two-stage K composition capacity.
 K_SMEM_BYTES = 128 * MIXED_TILER_MNK[2] * LATENT_K_TILES
 K_ROPE_SMEM_BYTES = 128 * ROPE_K
 V_SMEM_BYTES = 2 * 16 * 1024
 P_SMEM_BYTES = P_STAGES * 8 * 1024
+SOFTMAX_EXCHANGE_BYTES = 2 * SCORE_ROWS * 4
 SMEM_PAYLOAD_BYTES = (
     Q_SMEM_BYTES
     + Q_ROPE_SMEM_BYTES
@@ -93,6 +94,7 @@ SMEM_PAYLOAD_BYTES = (
     + K_ROPE_SMEM_BYTES
     + V_SMEM_BYTES
     + P_SMEM_BYTES
+    + SOFTMAX_EXCHANGE_BYTES
 )
 
 
@@ -101,6 +103,9 @@ class SharedStorage:
     init_mbar: cutlass.Int64
     tma_mbar: cute.struct.MemRange[cutlass.Int64, TILES * (LATENT_K_TILES + 1)]
     mma_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    softmax_max_exchange: cute.struct.MemRange[cutlass.Float32, SCORE_ROWS]
+    softmax_sum_exchange: cute.struct.MemRange[cutlass.Float32, SCORE_ROWS]
+    tmem_dealloc_mbar: cutlass.Int64
     tmem_holding_buf: cutlass.Int32
 
 
@@ -112,7 +117,7 @@ def make_mmas():
         OperandMajorMode.K,
         SF_DTYPE,
         SF_VEC_SIZE,
-        tcgen05.CtaGroup.ONE,
+        tcgen05.CtaGroup.TWO,
         MIXED_TILER_MNK[:2],
     )
     rope = sm100_utils.make_trivial_tiled_mma(
@@ -120,7 +125,7 @@ def make_mmas():
         OperandMajorMode.K,
         OperandMajorMode.K,
         cutlass.Float32,
-        tcgen05.CtaGroup.ONE,
+        tcgen05.CtaGroup.TWO,
         ROPE_TILER_MNK[:2],
     )
     vp = sm100_utils.make_trivial_tiled_mma(
@@ -164,14 +169,21 @@ def ownership_kernel(
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    cta_global, _, _ = cute.arch.block_idx()
     cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    cluster_index = cute.arch.make_warp_uniform(cta_global // CLUSTER_SHAPE_MNK[0])
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
+    softmax_max_exchange = cute.make_tensor(
+        storage.softmax_max_exchange.data_ptr(), cute.make_layout(SCORE_ROWS)
+    )
+    softmax_sum_exchange = cute.make_tensor(
+        storage.softmax_sum_exchange.data_ptr(), cute.make_layout(SCORE_ROWS)
+    )
 
-    # The two-stage S1 variant spends the reviewed extra 32 KiB on K so the
-    # first producer/owner composition is not confounded by K-stage overwrite
-    # timing.  Q/K/RoPE use the exact accepted mixed-MMA SMEM layouts.
+    # Preserve the reviewed extra 32 KiB K stage so the ownership comparison is
+    # not confounded by K-stage overwrite timing.
     q_smem = smem.allocate_tensor(
         cutlass.Float8E4M3FN,
         mixed_a_layout.outer,
@@ -209,10 +221,10 @@ def ownership_kernel(
         swizzle=p_layout.inner,
     )
 
-    # S1 intentionally gives each physical CTA a complete local one-CTA MMA
-    # and TMA view.  Multicast is the next independently falsifiable gate.
-    mma_tile_coord_v = cutlass.Int32(0)
-    cta_coord_vmnk = cta_layout_vmnk.get_flat_coord(cutlass.Int32(0))
+    # The group-two slice assigns each physical CTA its generated M64 operand
+    # partition; the elected rank-0 warp later issues the cooperative MMA.
+    mma_tile_coord_v = cta_rank
+    cta_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank)
     g_a_mkl = cute.local_tile(
         tma_tensor_a,
         cute.slice_(MIXED_TILER_MNK, (None, 0, None)),
@@ -269,10 +281,10 @@ def ownership_kernel(
         cute.group_modes(k_rope_smem, 0, 3),
         cute.group_modes(t_cg_rope_b, 0, 3),
     )
-    t_ag_a = t_ag_a[(None, 0, None, 0)]
-    t_bg_b = t_bg_b[(None, 0, None, 0)]
-    t_ag_rope_a = t_ag_rope_a[(None, 0, None, 0)]
-    t_bg_rope_b = t_bg_rope_b[(None, 0, None, 0)]
+    t_ag_a = t_ag_a[(None, 0, None, None)]
+    t_bg_b = t_bg_b[(None, 0, None, None)]
+    t_ag_rope_a = t_ag_rope_a[(None, 0, None, None)]
+    t_bg_rope_b = t_bg_rope_b[(None, 0, None, None)]
 
     ab_copy_bytes = (
         cute.size_in_bytes(
@@ -307,7 +319,7 @@ def ownership_kernel(
         num_stages=1,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, THREADS_PER_CTA
+            pipeline.Agent.Thread, THREADS_PER_CTA * CLUSTER_SHAPE_MNK[0]
         ),
         barrier_storage=storage.mma_mbar.data_ptr(),
         cta_layout_vmnk=cta_layout_vmnk,
@@ -317,11 +329,14 @@ def ownership_kernel(
     retrieve_barrier = pipeline.NamedBarrier(
         barrier_id=1, num_threads=TMEM_RETRIEVE_THREADS
     )
+    softmax_barrier_pair_02 = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
+    softmax_barrier_pair_13 = pipeline.NamedBarrier(barrier_id=3, num_threads=64)
     tmem = utils.TmemAllocator(
         storage.tmem_holding_buf.ptr,
         barrier_for_retrieve=retrieve_barrier,
         allocator_warp_id=8,
-        is_two_cta=False,
+        is_two_cta=True,
+        two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
     )
 
     # Match production's initialized mbarrier environment before TMEM
@@ -409,12 +424,9 @@ def ownership_kernel(
     if tidx == 0:
         v_smem[0] = cutlass.Int8(0)
 
-    is_owner = (cta_rank == 0 and tidx < ROWS_PER_CTA) or (
-        cta_rank == 1 and tidx >= ROWS_PER_CTA and tidx < SCORE_ROWS
-    )
-
     for tile in cutlass.range_constexpr(TILES):
         barrier_base = tile * (LATENT_K_TILES + 1)
+        key_tile_index = cluster_index * TILES + tile
         if warp_idx == 9:
             for latent_tile in cutlass.range_constexpr(LATENT_K_TILES):
                 barrier_index = barrier_base + latent_tile
@@ -422,13 +434,13 @@ def ownership_kernel(
                 tma_barriers.arrive_and_expect_tx(barrier_index, ab_copy_bytes)
                 cute.copy(
                     tma_atom_a,
-                    t_ag_a[(None, latent_tile)],
+                    t_ag_a[(None, latent_tile, cluster_index)],
                     t_as_a[(None, latent_tile)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
                 cute.copy(
                     tma_atom_b,
-                    t_bg_b[(None, latent_tile)],
+                    t_bg_b[(None, latent_tile, key_tile_index)],
                     t_bs_b[(None, latent_tile)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -437,18 +449,18 @@ def ownership_kernel(
             tma_barriers.arrive_and_expect_tx(rope_barrier_index, rope_copy_bytes)
             cute.copy(
                 tma_atom_rope_a,
-                t_ag_rope_a[(None, 0)],
+                t_ag_rope_a[(None, 0, cluster_index)],
                 t_as_rope_a[(None, 0)],
                 tma_bar_ptr=rope_bar_ptr,
             )
             cute.copy(
                 tma_atom_rope_b,
-                t_bg_rope_b[(None, 0)],
+                t_bg_rope_b[(None, 0, key_tile_index)],
                 t_bs_rope_b[(None, 0)],
                 tma_bar_ptr=rope_bar_ptr,
             )
 
-        if warp_idx == 8:
+        if warp_idx == 8 and cta_rank == 0:
             mma_producer.acquire_and_advance()
             mixed_mma.set(tcgen05.Field.ACCUMULATE, False)
             for latent_tile in cutlass.range_constexpr(LATENT_K_TILES):
@@ -477,10 +489,7 @@ def ownership_kernel(
 
         # Apply the persistent per-token BF16 TurboQuant scale in place.  The
         # scale varies by tile, which makes any stale score reuse observable.
-        mixed_score_tile = cute.make_tensor(
-            score_tmem_ptr,
-            cute.make_layout((SCORE_ROWS, TOKENS), stride=(1 << 16, 1)),
-        )
+        local_score_coords = cute.make_identity_tensor((ROWS_PER_CTA, TOKENS))
         if tidx < SCORE_ROWS:
             score_load_atom = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
@@ -490,14 +499,13 @@ def ownership_kernel(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
                 cutlass.Float32,
             )
-            score_load = tcgen05.make_tmem_copy(score_load_atom, mixed_score_tile)
+            score_load = tcgen05.make_tmem_copy(score_load_atom, acc_tile)
             score_store = tcgen05.make_tmem_copy(score_store_atom, acc_tile)
             load_thr = score_load.get_slice(tidx)
             store_thr = score_store.get_slice(tidx)
-            score_coords = cute.make_identity_tensor(mixed_score_tile.shape)
-            load_src = load_thr.partition_S(mixed_score_tile)
-            load_regs_layout = load_thr.partition_D(score_coords)
-            store_regs_layout = store_thr.partition_S(score_coords)
+            load_src = load_thr.partition_S(acc_tile)
+            load_regs_layout = load_thr.partition_D(local_score_coords)
+            store_regs_layout = store_thr.partition_S(local_score_coords)
             store_dst = store_thr.partition_D(acc_tile)
             load_regs = cute.make_fragment_like(load_regs_layout, cutlass.Float32)
             store_regs = cute.make_fragment_like(store_regs_layout, cutlass.Float32)
@@ -512,7 +520,7 @@ def ownership_kernel(
         cute.arch.fence_view_async_tmem_store()
         cute.arch.sync_threads()
 
-        if warp_idx == 8:
+        if warp_idx == 8 and cta_rank == 0:
             tma_barriers.wait(barrier_base + LATENT_K_TILES, 0)
             mma_producer.acquire_and_advance()
             rope_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -530,83 +538,80 @@ def ownership_kernel(
         rope_full.release()
         cute.arch.sync_threads()
 
-        if is_owner:
-            row_max = cutlass.Float32(-1.0e6)
+        if tidx < SCORE_ROWS:
+            # Group-two M128 folds each CTA-local M64 x N128 score tile across
+            # two 64-column lane groups.  Load only the calling lane's N64
+            # half, then exchange max/sum with its paired lane group exactly as
+            # the stock TokenSpeed group-two softmax does.
+            score_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                cutlass.Float32,
+            )
+            score_load = tcgen05.make_tmem_copy(score_load_atom, acc_tile)
+            load_thr = score_load.get_slice(tidx)
+            load_src = load_thr.partition_S(acc_tile)
+            load_reg_layout = load_thr.partition_D(local_score_coords)
+            load_regs = cute.make_fragment_like(load_reg_layout, cutlass.Float32)
+            cute.copy(score_load, load_src, load_regs)
+            cute.arch.fence_view_async_tmem_load()
 
-            # First pass: load each half independently and keep only the
-            # row maximum.  No warp exchange or peer-TMEM access exists.
-            for half in cutlass.range_constexpr(2):
-                score_half = cute.make_tensor(
-                    tmem_ptr + SCORE_OFFSET + half * N64,
-                    cute.make_layout((SCORE_ROWS, N64), stride=(1 << 16, 1)),
-                )
-                score_load_atom = cute.make_copy_atom(
-                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
-                    cutlass.Float32,
-                )
-                score_load = tcgen05.make_tmem_copy(score_load_atom, score_half)
-                load_thr = score_load.get_slice(tidx)
-                score_coords = cute.make_identity_tensor(score_half.shape)
-                load_src = load_thr.partition_S(score_half)
-                load_reg_layout = load_thr.partition_D(score_coords)
-                load_regs = cute.make_fragment_like(load_reg_layout, cutlass.Float32)
-                cute.copy(score_load, load_src, load_regs)
-                cute.arch.fence_view_async_tmem_load()
-                row_max = load_regs.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+            row_max = load_regs.load().reduce(
+                cute.ReductionOp.MAX, cutlass.Float32(-1.0e6), 0
+            )
+            softmax_max_exchange[tidx] = row_max
+            cute.arch.fence_view_async_shared()
+            if warp_idx % 2 == 0:
+                softmax_barrier_pair_02.wait()
+            else:
+                softmax_barrier_pair_13.wait()
+            row_max = cute.arch.fmax(
+                row_max, softmax_max_exchange[(tidx + N64) % SCORE_ROWS]
+            )
 
-            row_sum = cutlass.Float32(0.0)
             stage = tile % P_STAGES
-            local_row = tidx - cta_rank * ROWS_PER_CTA
-
-            # Second pass: reload, exponentiate, accumulate the unquantized
-            # sum, and publish the exact transposed-P logical coordinate.
-            for half in cutlass.range_constexpr(2):
-                score_half = cute.make_tensor(
-                    tmem_ptr + SCORE_OFFSET + half * N64,
-                    cute.make_layout((SCORE_ROWS, N64), stride=(1 << 16, 1)),
+            local_row = load_reg_layout[0][0]
+            row_sum = cutlass.Float32(0.0)
+            for element in cutlass.range_constexpr(cute.size(load_regs)):
+                token = load_reg_layout[element][1]
+                probability = cute.math.exp2(
+                    (load_regs[element] - row_max) * SOFTMAX_SCALE_LOG2,
+                    fastmath=False,
                 )
-                score_load_atom = cute.make_copy_atom(
-                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
-                    cutlass.Float32,
-                )
-                score_load = tcgen05.make_tmem_copy(score_load_atom, score_half)
-                load_thr = score_load.get_slice(tidx)
-                score_coords = cute.make_identity_tensor(score_half.shape)
-                load_src = load_thr.partition_S(score_half)
-                load_reg_layout = load_thr.partition_D(score_coords)
-                load_regs = cute.make_fragment_like(load_reg_layout, cutlass.Float32)
-                cute.copy(score_load, load_src, load_regs)
-                cute.arch.fence_view_async_tmem_load()
-                for element in cutlass.range_constexpr(cute.size(load_regs)):
-                    token = half * N64 + load_reg_layout[element][1]
-                    probability = cute.math.exp2(
-                        (load_regs[element] - row_max) * SOFTMAX_SCALE_LOG2,
-                        fastmath=False,
+                row_sum += probability
+                p_smem[
+                    (
+                        (local_row, token % 32),
+                        0,
+                        token // 32,
+                        stage,
                     )
-                    row_sum += probability
-                    p_smem[
-                        (
-                            (local_row, token % 32),
-                            0,
-                            token // 32,
-                            stage,
-                        )
-                    ] = probability.to(cutlass.Float8E4M3FN)
+                ] = probability.to(cutlass.Float8E4M3FN)
 
-            max_output[cta_rank, tile, local_row] = row_max
-            sum_output[cta_rank, tile, local_row] = row_sum
-            owner_output[cta_rank, tile, local_row] = tidx + 1
+            softmax_sum_exchange[tidx] = row_sum
+            cute.arch.fence_view_async_shared()
+            if warp_idx % 2 == 0:
+                softmax_barrier_pair_02.wait()
+            else:
+                softmax_barrier_pair_13.wait()
+            row_sum += softmax_sum_exchange[(tidx + N64) % SCORE_ROWS]
+
+            if tidx < ROWS_PER_CTA:
+                max_output[cta_global, tile, local_row] = row_max
+                sum_output[cta_global, tile, local_row] = row_sum
+                owner_output[cta_global, tile, local_row] = (
+                    cta_rank * ROWS_PER_CTA + local_row + 1
+                )
 
         cute.arch.fence_view_async_shared()
         cute.arch.sync_threads()
 
         # Diagnostic consumer: read through the same logical operand that
         # PV MMA will consume.  Export before the stage is recycled.
-        if is_owner:
+        if tidx < ROWS_PER_CTA:
             stage = tile % P_STAGES
-            local_row = tidx - cta_rank * ROWS_PER_CTA
+            local_row = tidx
             for token in cutlass.range_constexpr(TOKENS):
-                p_output[cta_rank, tile, local_row, token] = p_smem[
+                p_output[cta_global, tile, local_row, token] = p_smem[
                     (
                         (local_row, token % 32),
                         0,
@@ -617,8 +622,10 @@ def ownership_kernel(
         cute.arch.sync_threads()
 
     cute.arch.sync_threads()
-    if warp_idx == 8:
+    if warp_idx == 8 and cta_rank == 0:
         mma_producer.tail()
+    cute.arch.sync_threads()
+    if warp_idx == 8:
         tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
@@ -635,30 +642,29 @@ def ownership_probe(
     sum_output: cute.Tensor,
     owner_output: cute.Tensor,
     token_scale: cute.Tensor,
+    CLUSTERS: cutlass.Constexpr[int],
     stream,
 ):
     mixed_mma, rope_mma, vp_mma = make_mmas()
     g_mixed_a = cute.make_tensor(
         mixed_a_ptr,
-        cute.make_ordered_layout((SCORE_ROWS, LATENT_K, 1), order=(1, 0, 2)),
+        cute.make_ordered_layout((SCORE_ROWS, LATENT_K, CLUSTERS), order=(1, 0, 2)),
     )
     g_mixed_b = cute.make_tensor(
         mixed_b_ptr,
-        cute.make_ordered_layout((TOKENS, LATENT_K, 1), order=(1, 0, 2)),
+        cute.make_ordered_layout((TOKENS, LATENT_K, CLUSTERS * TILES), order=(1, 0, 2)),
     )
     g_rope_a = cute.make_tensor(
         rope_a_ptr,
-        cute.make_ordered_layout((SCORE_ROWS, ROPE_K, 1), order=(1, 0, 2)),
+        cute.make_ordered_layout((SCORE_ROWS, ROPE_K, CLUSTERS), order=(1, 0, 2)),
     )
     g_rope_b = cute.make_tensor(
         rope_b_ptr,
-        cute.make_ordered_layout((TOKENS, ROPE_K, 1), order=(1, 0, 2)),
+        cute.make_ordered_layout((TOKENS, ROPE_K, CLUSTERS * TILES), order=(1, 0, 2)),
     )
 
-    # This composition gate intentionally models two independent one-CTA
-    # producers inside the physical two-CTA cluster.
     cta_layout_vmnk = cute.tiled_divide(
-        cute.make_layout((1, 1, 1)), (mixed_mma.thr_id.shape,)
+        cute.make_layout(CLUSTER_SHAPE_MNK), (mixed_mma.thr_id.shape,)
     )
     mixed_a_layout = sm100_utils.make_smem_layout_a(
         mixed_mma,
@@ -672,8 +678,12 @@ def ownership_probe(
         MIXED_B_SMEM_DTYPE,
         LATENT_K_TILES,
     )
-    a_op = sm100_utils.cluster_shape_to_tma_atom_A((1, 1), mixed_mma.thr_id)
-    b_op = sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mixed_mma.thr_id)
+    a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+        CLUSTER_SHAPE_MNK[:2], mixed_mma.thr_id
+    )
+    b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+        CLUSTER_SHAPE_MNK[:2], mixed_mma.thr_id
+    )
     tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
         a_op,
         g_mixed_a,
@@ -697,8 +707,12 @@ def ownership_probe(
     rope_b_layout = sm100_utils.make_smem_layout_b(
         rope_mma, ROPE_TILER_MNK, cutlass.Float8E4M3FN, 1
     )
-    rope_a_op = sm100_utils.cluster_shape_to_tma_atom_A((1, 1), rope_mma.thr_id)
-    rope_b_op = sm100_utils.cluster_shape_to_tma_atom_B((1, 1), rope_mma.thr_id)
+    rope_a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+        CLUSTER_SHAPE_MNK[:2], rope_mma.thr_id
+    )
+    rope_b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+        CLUSTER_SHAPE_MNK[:2], rope_mma.thr_id
+    )
     tma_atom_rope_a, tma_tensor_rope_a = cute.nvgpu.make_tiled_tma_atom_A(
         rope_a_op,
         g_rope_a,
@@ -749,6 +763,17 @@ def ownership_probe(
     )
     if cutlass.const_expr(cute.cosize(p_layout) != P_SMEM_BYTES):
         raise ValueError(f"transposed-P footprint changed: {cute.cosize(p_layout)}")
+    mixed_acc_layout = mixed_mma.make_fragment_C(
+        mixed_mma.partition_shape_C(MIXED_TILER_MNK[:2])
+    ).layout
+    rope_acc_layout = rope_mma.make_fragment_C(
+        rope_mma.partition_shape_C(ROPE_TILER_MNK[:2])
+    ).layout
+    print(f"S3_MIXED_THR_ID={mixed_mma.thr_id}")
+    print(f"S3_CTA_LAYOUT_VMNK={cta_layout_vmnk}")
+    print(f"S3_MIXED_ACC_LAYOUT={mixed_acc_layout}")
+    print(f"S3_ROPE_ACC_LAYOUT={rope_acc_layout}")
+    print(f"S3_SCALE_COLS={sfa_cols + sfb_cols}")
     kernel = ownership_kernel(
         p_output,
         max_output,
@@ -776,7 +801,7 @@ def ownership_probe(
         cta_layout_vmnk,
     )
     kernel.launch(
-        grid=CLUSTER_SHAPE_MNK,
+        grid=(CLUSTER_SHAPE_MNK[0] * CLUSTERS, 1, 1),
         block=(THREADS_PER_CTA, 1, 1),
         cluster=CLUSTER_SHAPE_MNK,
         min_blocks_per_mp=1,
@@ -843,10 +868,20 @@ def verify(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--clusters", type=int, default=1)
     parser.add_argument("--graph-replays", type=int, default=100)
+    parser.add_argument("--benchmark-replays", type=int, default=0)
+    parser.add_argument("--benchmark-samples", type=int, default=7)
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.clusters < 1:
+        parser.error("--clusters must be positive")
+    if args.benchmark_replays < 0:
+        parser.error("--benchmark-replays must be non-negative")
+    if args.benchmark_samples < 1:
+        parser.error("--benchmark-samples must be positive")
+    ctas = CLUSTER_SHAPE_MNK[0] * args.clusters
 
     compiled = cute.compile(
         ownership_probe,
@@ -874,18 +909,20 @@ def main() -> None:
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        fake(cutlass.Float8E4M3FN, (2, TILES, ROWS_PER_CTA, TOKENS), 16),
-        fake(cutlass.Float32, (2, TILES, ROWS_PER_CTA), 16),
-        fake(cutlass.Float32, (2, TILES, ROWS_PER_CTA), 16),
-        fake(cutlass.Int32, (2, TILES, ROWS_PER_CTA), 16),
+        fake(cutlass.Float8E4M3FN, (ctas, TILES, ROWS_PER_CTA, TOKENS), 16),
+        fake(cutlass.Float32, (ctas, TILES, ROWS_PER_CTA), 16),
+        fake(cutlass.Float32, (ctas, TILES, ROWS_PER_CTA), 16),
+        fake(cutlass.Int32, (ctas, TILES, ROWS_PER_CTA), 16),
         fake(cutlass.BFloat16, (TILES, TOKENS), 16),
+        args.clusters,
         make_fake_stream(),
         options="--enable-tvm-ffi --opt-level 3",
     )
     if args.compile_only:
         print(
-            "PASS_C1_M0QP_S1_COMPILE_ONLY "
-            f"tiles={TILES} p_stages={P_STAGES} smem_payload={SMEM_PAYLOAD_BYTES}"
+            "PASS_C1_M0QP_S3_COMPILE_ONLY "
+            f"clusters={args.clusters} tiles={TILES} p_stages={P_STAGES} "
+            f"smem_payload={SMEM_PAYLOAD_BYTES}"
         )
         return
 
@@ -930,7 +967,11 @@ def main() -> None:
     token_scale = (0.75 + ((tile * 7 + token_row * 3) % 17).float() / 32.0).to(
         torch.bfloat16
     )
-    expected_outputs = expected(query, key, rope_query, rope_key, token_scale)
+    base_expected_outputs = expected(query, key, rope_query, rope_key, token_scale)
+    expected_outputs = tuple(
+        value.repeat((args.clusters,) + (1,) * (value.ndim - 1))
+        for value in base_expected_outputs
+    )
 
     def to_cute_tensor(source: torch.Tensor, dtype):
         source_cuda = source.cuda().contiguous()
@@ -948,28 +989,32 @@ def main() -> None:
         )
 
     query_cute = to_cute_tensor(
-        query.view(SCORE_ROWS, LATENT_K, 1), cutlass.Float8E4M3FN
+        query.unsqueeze(0).repeat(args.clusters, 1, 1), cutlass.Float8E4M3FN
     )
-    key_cute = to_cute_tensor(key.view(TOKENS, LATENT_K, 1), cutlass.Float4E2M1FN)
+    key_cute = to_cute_tensor(
+        key.unsqueeze(0).repeat(args.clusters * TILES, 1, 1),
+        cutlass.Float4E2M1FN,
+    )
     rope_query_cute = to_cute_tensor(
-        rope_query.view(SCORE_ROWS, ROPE_K, 1), cutlass.Float8E4M3FN
+        rope_query.unsqueeze(0).repeat(args.clusters, 1, 1), cutlass.Float8E4M3FN
     )
     rope_key_cute = to_cute_tensor(
-        rope_key.view(TOKENS, ROPE_K, 1), cutlass.Float8E4M3FN
+        rope_key.unsqueeze(0).repeat(args.clusters * TILES, 1, 1),
+        cutlass.Float8E4M3FN,
     )
     token_scale = token_scale.cuda().contiguous()
 
     p_output = torch.empty(
-        (2, TILES, ROWS_PER_CTA, TOKENS),
+        (ctas, TILES, ROWS_PER_CTA, TOKENS),
         dtype=torch.float8_e4m3fn,
         device="cuda",
     )
     max_output = torch.empty(
-        (2, TILES, ROWS_PER_CTA), dtype=torch.float32, device="cuda"
+        (ctas, TILES, ROWS_PER_CTA), dtype=torch.float32, device="cuda"
     )
     sum_output = torch.empty_like(max_output)
     owner_output = torch.zeros(
-        (2, TILES, ROWS_PER_CTA), dtype=torch.int32, device="cuda"
+        (ctas, TILES, ROWS_PER_CTA), dtype=torch.int32, device="cuda"
     )
 
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -987,6 +1032,52 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     verify(p_output, max_output, sum_output, owner_output, expected_outputs)
+
+    if args.benchmark_replays:
+        # Time repeated kernel nodes inside one graph so Python dispatch cannot
+        # dominate this bounded group-one/group-two schedule comparison.
+        benchmark_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(benchmark_graph):
+            benchmark_stream = cuda_driver.CUstream(
+                torch.cuda.current_stream().cuda_stream
+            )
+            for _ in range(args.benchmark_replays):
+                compiled(
+                    query_cute.iterator,
+                    key_cute.iterator,
+                    rope_query_cute.iterator,
+                    rope_key_cute.iterator,
+                    p_output,
+                    max_output,
+                    sum_output,
+                    owner_output,
+                    token_scale,
+                    benchmark_stream,
+                )
+        benchmark_graph.replay()
+        torch.cuda.synchronize()
+        benchmark_us = []
+        for _ in range(args.benchmark_samples):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            benchmark_graph.replay()
+            end.record()
+            end.synchronize()
+            benchmark_us.append(
+                start.elapsed_time(end) * 1000.0 / args.benchmark_replays
+            )
+        verify(p_output, max_output, sum_output, owner_output, expected_outputs)
+        print(
+            "BENCH_C1_M0QP_S3 "
+            f"clusters={args.clusters} "
+            f"replays_per_graph={args.benchmark_replays} "
+            f"samples={args.benchmark_samples} "
+            f"median_us={statistics.median(benchmark_us):.6f} "
+            f"min_us={min(benchmark_us):.6f} max_us={max(benchmark_us):.6f} "
+            f"all_us={','.join(f'{value:.6f}' for value in benchmark_us)}",
+            flush=True,
+        )
 
     if not args.skip_graph:
         graph = torch.cuda.CUDAGraph()
@@ -1020,11 +1111,12 @@ def main() -> None:
         verify(p_output, max_output, sum_output, owner_output, expected_outputs)
 
     print(
-        "PASS_C1_M0QP_S1_MIXED_QK_OWNERSHIP "
-        f"tiles={TILES} score_wraps={TILES - 1} p_stages={P_STAGES} "
-        f"p_wraps={TILES - P_STAGES} owner_threads=64_per_cta "
-        "qk=fp8xfp4 token_scale=bf16 rope_k=64 replicated_local=True "
-        "n64_passes=2max+2exp no_warp_exchange=True "
+        "PASS_C1_M0QP_S3_GROUP2_MIXED_QK_OWNERSHIP "
+        f"clusters={args.clusters} tiles={TILES} "
+        f"score_wraps={TILES - 1} p_stages={P_STAGES} "
+        f"p_wraps={TILES - P_STAGES} owner_lanes=128_per_cta "
+        "qk=fp8xfp4 token_scale=bf16 rope_k=64 cta_group=2 "
+        "folded_n64_exchange=True peer_p_dsm=False "
         f"graph_replays={0 if args.skip_graph else args.graph_replays} "
         f"smem_payload={SMEM_PAYLOAD_BYTES}"
     )
