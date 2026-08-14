@@ -29,6 +29,11 @@ or TMEM V operand is present.
 L0 proves only generated layout/TMA/MMA legality and resource shape.  It does
 not establish numerical attention, five-tile correction, endpoint speed,
 memory saving, quality, DFlash compatibility, or production readiness.
+
+The overlap and scale-init-tile parameters on this research branch are I1-only
+instrumentation.  Accepted L0 evidence remains bound to commit 93cfae24; this
+parameterized file has a distinct generated profile and is not an L0
+requalification.
 """
 
 import argparse
@@ -121,6 +126,8 @@ def direct_mixed_pv_kernel(
     LATENT_TILE: cutlass.Constexpr[int],
     SFA_EXP: cutlass.Constexpr[int],
     SFB_EXP: cutlass.Constexpr[int],
+    OVERLAP_TMA: cutlass.Constexpr[int],
+    SCALE_INIT_TILES: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -251,6 +258,30 @@ def direct_mixed_pv_kernel(
     prims.fence_mbarrier_init()
     cute.arch.sync_threads()
 
+    # I1 overlap arms let the elected TMA producer start the disjoint P/V SMEM
+    # transaction while the first four warps initialize scale TMEM.  Barrier
+    # initialization and its CTA fence remain before issue, and the elected
+    # MMA warp still waits for this transaction after scale publication.
+    if warp_idx == 9 and cutlass.const_expr(
+        OVERLAP_TMA == 1 and (ISSUE_P_TMA == 1 or ISSUE_V_TMA == 1)
+    ):
+        tma_bar_ptr = tma_barriers.get_barrier(0)
+        tma_barriers.arrive_and_expect_tx(0, copy_bytes)
+        if cutlass.const_expr(ISSUE_P_TMA == 1):
+            cute.copy(
+                tma_atom_p,
+                t_pg_p[(None, 0, cluster_index)],
+                t_ps_p[(None, 0)],
+                tma_bar_ptr=tma_bar_ptr,
+            )
+        if cutlass.const_expr(ISSUE_V_TMA == 1):
+            cute.copy(
+                tma_atom_v,
+                t_vg_v[(None, 0, cluster_index)],
+                t_vs_v[(None, 0)],
+                tma_bar_ptr=tma_bar_ptr,
+            )
+
     p_operand = mixed_pv_mma.make_fragment_A(p_smem)
     v_operand = mixed_pv_mma.make_fragment_B(v_smem)
     k_blocks = cute.size(p_operand, mode=[2])
@@ -300,11 +331,10 @@ def direct_mixed_pv_kernel(
             cutlass.Float32
         )
         poison_word = cutlass.Uint32(0x81818181).bitcast(cutlass.Float32)
-        # Initialize the complete reserved 0..63 scale region in four bounded
-        # 16-column stores.  Only generated SFA/SFB columns receive their
-        # requested values; an aliased pointer into any unclaimed column sees
-        # poison rather than accidentally observing unity.
-        for scale_block in cutlass.range_constexpr(OUTPUT_OFFSET // 16):
+        # Full controls initialize the complete 0..63 defensive reserve.
+        # Compact I1 arms initialize the one 16-column tile containing every
+        # live SFA/SFB address and retain poison in its four unclaimed columns.
+        for scale_block in cutlass.range_constexpr(SCALE_INIT_TILES):
             scale_init_tile = cute.make_tensor(
                 tmem_ptr + SCALE_OFFSET + scale_block * 16,
                 cute.make_layout((ROWS, 16), stride=(1 << 16, 1)),
@@ -356,7 +386,7 @@ def direct_mixed_pv_kernel(
         layout_output[cta_rank, 12] = SFB_EXP
 
     if warp_idx == 9 and cutlass.const_expr(
-        ISSUE_P_TMA == 1 or ISSUE_V_TMA == 1
+        OVERLAP_TMA == 0 and (ISSUE_P_TMA == 1 or ISSUE_V_TMA == 1)
     ):
         tma_bar_ptr = tma_barriers.get_barrier(0)
         tma_barriers.arrive_and_expect_tx(0, copy_bytes)
@@ -452,6 +482,8 @@ def direct_mixed_pv_probe(
     LATENT_TILE: cutlass.Constexpr[int],
     SFA_EXP: cutlass.Constexpr[int],
     SFB_EXP: cutlass.Constexpr[int],
+    OVERLAP_TMA: cutlass.Constexpr[int],
+    SCALE_INIT_TILES: cutlass.Constexpr[int],
     stream,
 ):
     mixed_pv_mma = make_mixed_pv_mma()
@@ -560,6 +592,17 @@ def direct_mixed_pv_probe(
             f"mixed PV output exceeds TMEM: {OUTPUT_OFFSET}+{output_cols} "
             f"> {TMEM_ALLOC_COLS}"
         )
+    if cutlass.const_expr(
+        SCALE_INIT_TILES not in (1, OUTPUT_OFFSET // 16)
+    ):
+        raise ValueError(
+            f"I1 scale-init tiles must be 1 or {OUTPUT_OFFSET // 16}"
+        )
+    if cutlass.const_expr(sfa_cols + sfb_cols > SCALE_INIT_TILES * 16):
+        raise ValueError(
+            f"I1 live scales exceed initialized columns: "
+            f"{sfa_cols}+{sfb_cols} > {SCALE_INIT_TILES * 16}"
+        )
     print(f"S4_C1_MIXED_PV_THR_ID={mixed_pv_mma.thr_id}")
     print(f"S4_C1_CTA_LAYOUT_VMNK={cta_layout_vmnk}")
     print(f"S4_C1_P_LAYOUT={p_layout}")
@@ -569,7 +612,8 @@ def direct_mixed_pv_probe(
         f"p_bytes={cute.size_in_bytes(cutlass.Float8E4M3FN, p_layout)} "
         f"v_smem_bytes={cute.size_in_bytes(MIXED_B_SMEM_DTYPE, v_layout)} "
         f"v_tma_bytes={cute.size_in_bytes(cutlass.Float4E2M1FN, v_layout)} "
-        f"sfa_cols={sfa_cols} sfb_cols={sfb_cols} output_cols={output_cols}"
+        f"sfa_cols={sfa_cols} sfb_cols={sfb_cols} output_cols={output_cols} "
+        f"overlap_tma={OVERLAP_TMA} scale_init_tiles={SCALE_INIT_TILES}"
     )
     kernel = direct_mixed_pv_kernel(
         layout_output,
@@ -593,6 +637,8 @@ def direct_mixed_pv_probe(
         LATENT_TILE,
         SFA_EXP,
         SFB_EXP,
+        OVERLAP_TMA,
+        SCALE_INIT_TILES,
     )
     kernel.launch(
         grid=(CLUSTER_SHAPE_MNK[0] * CLUSTERS, 1, 1),
@@ -642,6 +688,10 @@ def main() -> None:
     parser.add_argument("--graph-replays", type=int, default=0)
     parser.add_argument("--sfa-exp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--sfb-exp", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--overlap-tma", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--scale-init-tiles", type=int, choices=(1, 4), default=4
+    )
     args = parser.parse_args()
     if args.clusters < 1:
         parser.error("--clusters must be positive")
@@ -682,6 +732,8 @@ def main() -> None:
         args.latent_tile,
         args.sfa_exp,
         args.sfb_exp,
+        args.overlap_tma,
+        args.scale_init_tiles,
         make_fake_stream(),
         options="--enable-tvm-ffi --opt-level 3",
     )
@@ -691,7 +743,9 @@ def main() -> None:
             f"clusters={args.clusters} threads={THREADS_PER_CTA} "
             f"cluster_shape={CLUSTER_SHAPE_MNK} "
             f"smem_payload={SMEM_PAYLOAD_BYTES} "
-            f"tma_arm={args.tma_arm} issue_mma={int(not args.no_mma)}"
+            f"tma_arm={args.tma_arm} issue_mma={int(not args.no_mma)} "
+            f"overlap_tma={args.overlap_tma} "
+            f"scale_init_tiles={args.scale_init_tiles}"
         )
         return
 
@@ -836,6 +890,8 @@ def main() -> None:
             "PASS_S4_C1_L0_GRAPH "
             f"clusters={args.clusters} latent_tile={args.latent_tile} "
             f"sfa_exp={args.sfa_exp} sfb_exp={args.sfb_exp} "
+            f"overlap_tma={args.overlap_tma} "
+            f"scale_init_tiles={args.scale_init_tiles} "
             f"replays={args.graph_replays}"
         )
     print(f"S4_C1_L0_LAYOUT={layout_output.cpu().tolist()}")
@@ -843,7 +899,9 @@ def main() -> None:
         "PASS_S4_C1_L0_EAGER "
         f"tma_arm={args.tma_arm} issue_mma={int(not args.no_mma)} "
         f"latent_tile={args.latent_tile} "
-        f"sfa_exp={args.sfa_exp} sfb_exp={args.sfb_exp}"
+        f"sfa_exp={args.sfa_exp} sfb_exp={args.sfb_exp} "
+        f"overlap_tma={args.overlap_tma} "
+        f"scale_init_tiles={args.scale_init_tiles}"
     )
 
 
