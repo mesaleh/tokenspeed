@@ -29,6 +29,12 @@ or TMEM V operand is present.
 L0 proves only generated layout/TMA/MMA legality and resource shape.  It does
 not establish numerical attention, five-tile correction, endpoint speed,
 memory saving, quality, DFlash compatibility, or production readiness.
+
+The runtime repetition parameter in this research branch is an I0-only
+instrumentation extension.  Accepted L0 generated-code evidence (four static
+MMAs and 138 registers) remains bound to commit 93cfae24; this parameterized
+file emits a different generated profile even when its default R=1 semantics
+match L0.  It must not be described as an L0 requalification.
 """
 
 import argparse
@@ -121,6 +127,7 @@ def direct_mixed_pv_kernel(
     LATENT_TILE: cutlass.Constexpr[int],
     SFA_EXP: cutlass.Constexpr[int],
     SFB_EXP: cutlass.Constexpr[int],
+    REPETITIONS: cutlass.Int32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -400,6 +407,26 @@ def direct_mixed_pv_kernel(
                     accumulator,
                 )
                 mixed_pv_mma.set(tcgen05.Field.ACCUMULATE, True)
+            # ACCUMULATE is encoded in each tcgen05 instruction.  Keep the
+            # accumulate-false baseline outside this runtime loop so every
+            # additional resident-SMEM group accumulates rather than resets.
+            for _ in cutlass.range(1, REPETITIONS, unroll=1):
+                for k_block in cutlass.range(k_blocks, unroll_full=True):
+                    mixed_pv_mma.set(
+                        tcgen05.Field.SFA,
+                        t_sfa[None, None, k_block].iterator,
+                    )
+                    mixed_pv_mma.set(
+                        tcgen05.Field.SFB,
+                        t_sfb[None, None, k_block].iterator,
+                    )
+                    cute.gemm(
+                        mixed_pv_mma,
+                        accumulator,
+                        p_operand[None, None, k_block, 0],
+                        v_operand[None, None, k_block, 0],
+                        accumulator,
+                    )
         mma_producer.commit()
 
     mma_full = mma_consumer.wait_and_advance()
@@ -452,6 +479,7 @@ def direct_mixed_pv_probe(
     LATENT_TILE: cutlass.Constexpr[int],
     SFA_EXP: cutlass.Constexpr[int],
     SFB_EXP: cutlass.Constexpr[int],
+    REPETITIONS: cutlass.Int32,
     stream,
 ):
     mixed_pv_mma = make_mixed_pv_mma()
@@ -593,6 +621,7 @@ def direct_mixed_pv_probe(
         LATENT_TILE,
         SFA_EXP,
         SFB_EXP,
+        REPETITIONS,
     )
     kernel.launch(
         grid=(CLUSTER_SHAPE_MNK[0] * CLUSTERS, 1, 1),
@@ -642,6 +671,9 @@ def main() -> None:
     parser.add_argument("--graph-replays", type=int, default=0)
     parser.add_argument("--sfa-exp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--sfb-exp", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--repetitions", type=int, choices=(1, 4, 16, 64), default=1
+    )
     args = parser.parse_args()
     if args.clusters < 1:
         parser.error("--clusters must be positive")
@@ -682,6 +714,7 @@ def main() -> None:
         args.latent_tile,
         args.sfa_exp,
         args.sfb_exp,
+        cutlass.Int32(args.repetitions),
         make_fake_stream(),
         options="--enable-tvm-ffi --opt-level 3",
     )
@@ -756,6 +789,7 @@ def main() -> None:
         v_cute.iterator,
         layout_output,
         matrix_output,
+        cutlass.Int32(args.repetitions),
         stream,
     )
     torch.cuda.synchronize()
@@ -775,7 +809,7 @@ def main() -> None:
         ),
         dim=1,
     )
-    expected = expected_pair.reshape(
+    expected = args.repetitions * expected_pair.reshape(
         ctas, LATENT_SLICE, ROWS // CLUSTER_SHAPE_MNK[0]
     ).contiguous().cuda()
 
@@ -825,6 +859,7 @@ def main() -> None:
                 v_cute.iterator,
                 layout_output,
                 matrix_output,
+                cutlass.Int32(args.repetitions),
                 capture_stream,
             )
         for replay in range(args.graph_replays):
@@ -836,6 +871,7 @@ def main() -> None:
             "PASS_S4_C1_L0_GRAPH "
             f"clusters={args.clusters} latent_tile={args.latent_tile} "
             f"sfa_exp={args.sfa_exp} sfb_exp={args.sfb_exp} "
+            f"repetitions={args.repetitions} "
             f"replays={args.graph_replays}"
         )
     print(f"S4_C1_L0_LAYOUT={layout_output.cpu().tolist()}")
