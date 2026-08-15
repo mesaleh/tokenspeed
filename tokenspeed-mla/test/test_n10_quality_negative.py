@@ -63,22 +63,64 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.set_num_threads(1)
     evaluator = _load(args.evaluator_source, "a17_n10_negative_evaluator")
+    n8 = evaluator._load_module(
+        args.n8_evaluator,
+        name="a17_n10_negative_n8",
+        expected_sha256=evaluator.EXPECTED_N8_EVALUATOR_SHA256,
+    )
     tests: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="a17-n10-negative-") as temporary:
-        bad = Path(temporary) / "tampered-n8-result.json"
-        bad.write_bytes(args.n8_result.read_bytes() + b"tamper")
-        tests.append(
-            _expect_failure(
+        for name, canonical, expected in (
+            (
                 "accepted_n8_result_hash_tamper",
-                lambda: evaluator._require_hash(
-                    bad,
-                    evaluator.EXPECTED_N8_RESULT_SHA256,
-                    "accepted N8 result",
-                ),
-                "hash differs",
+                args.n8_result,
+                evaluator.EXPECTED_N8_RESULT_SHA256,
+            ),
+            (
+                "accepted_n8_evaluator_hash_tamper",
+                args.n8_evaluator,
+                evaluator.EXPECTED_N8_EVALUATOR_SHA256,
+            ),
+            (
+                "accepted_n8_operands_hash_tamper",
+                args.n8_operands,
+                evaluator.EXPECTED_N8_OPERANDS_SHA256,
+            ),
+        ):
+            bad = Path(temporary) / f"{name}.bin"
+            bad.write_bytes(canonical.read_bytes() + b"tamper")
+            tests.append(
+                _expect_failure(
+                    name,
+                    lambda bad=bad, expected=expected, name=name: evaluator._require_hash(
+                        bad, expected, name
+                    ),
+                    "hash differs",
+                )
             )
+
+    n8_payload = torch.load(args.n8_operands, map_location="cpu", weights_only=True)
+    _records, capture_hashes, capture_bytes = n8.N7._load_records(args.capture_root)
+    evaluator._validate_capture_identity(
+        capture_hashes=capture_hashes,
+        capture_bytes=capture_bytes,
+        n8_payload=n8_payload,
+    )
+    tests.append({"name": "canonical_capture_identity", "pass": True})
+    stale_hashes = dict(capture_hashes)
+    stale_hashes[sorted(stale_hashes)[0]] = "0" * 64
+    tests.append(
+        _expect_failure(
+            "stale_capture_inventory",
+            lambda: evaluator._validate_capture_identity(
+                capture_hashes=stale_hashes,
+                capture_bytes=capture_bytes,
+                n8_payload=n8_payload,
+            ),
+            "capture inventory differs",
         )
+    )
 
     key = torch.tensor(
         [[0.5, -1.0] * 32, [0.25, 2.0] * 32], dtype=torch.bfloat16
@@ -92,6 +134,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not torch.equal(stored, exact.to(torch.bfloat16)):
         raise NegativeTestError("BF16 reciprocal rounding differs")
     tests.append({"name": "positive_scale_rounding", "pass": True})
+    diagnostics = evaluator._bf16_diagnostics(exact, stored)
+    if not diagnostics["raw_bit_reconstruction_bit_identical"]:
+        raise NegativeTestError("BF16 raw-bit reconstruction differs")
+    tests.append({"name": "bf16_raw_bit_reconstruction", "pass": True})
 
     zero_key = torch.tensor([[0.5, -1.0] * 32], dtype=torch.bfloat16)
     zero_scale = torch.zeros(1, dtype=torch.bfloat16)
@@ -205,6 +251,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     tests.append({"name": "single_accumulator_scale_algebra", "pass": True})
 
+    labels = ["prefill_final"] + [f"target_verify_q{row}" for row in range(5)]
+    expected_keys = {(layer, label) for layer in (0, 30, 60) for label in labels}
+    expected_scores = {key: torch.empty(0) for key in expected_keys}
+    expected_cells = {key: {} for key in expected_keys}
+    complete_layers = [
+        {
+            "layer": layer,
+            "surfaces": [{"label": label} for label in labels],
+        }
+        for layer in (0, 30, 60)
+    ]
+    if (
+        evaluator._validate_evaluated_cell_set(
+            expected_scores=expected_scores,
+            expected_cells=expected_cells,
+            layers=complete_layers,
+        )
+        != 18
+    ):
+        raise NegativeTestError("complete-cell validation differs")
+    tests.append({"name": "complete_cell_coverage", "pass": True})
+    tests.extend(
+        [
+            _expect_failure(
+                "incomplete_cell_coverage",
+                lambda: evaluator._validate_evaluated_cell_set(
+                    expected_scores=expected_scores,
+                    expected_cells=expected_cells,
+                    layers=complete_layers[:-1],
+                ),
+                "cell set differs",
+            ),
+            _expect_failure(
+                "malformed_cell_structure",
+                lambda: evaluator._validate_evaluated_cell_set(
+                    expected_scores=expected_scores,
+                    expected_cells=expected_cells,
+                    layers=[{"layer": 0}],
+                ),
+                "structure is malformed",
+            ),
+            _expect_failure(
+                "wrong_pv_factorization",
+                lambda: evaluator._pv_factorization_self_test(
+                    n8.N7, scale_override=torch.ones(2, dtype=torch.float32)
+                ),
+                "P/V token-scale factorization differs",
+            ),
+        ]
+    )
+
     result = {
         "schema_version": 1,
         "experiment_id": evaluator.EXPERIMENT_ID,
@@ -213,9 +310,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "tests_passed": sum(test["pass"] for test in tests),
         "all_pass": all(test["pass"] for test in tests),
     }
-    if result["tests_passed"] != 13:
+    if result["tests_passed"] != 22:
         raise NegativeTestError(
-            f"negative test coverage differs: {result['tests_passed']} != 13"
+            f"negative test coverage differs: {result['tests_passed']} != 22"
         )
     return result
 
@@ -223,7 +320,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evaluator-source", type=Path, required=True)
+    parser.add_argument("--n8-evaluator", type=Path, required=True)
     parser.add_argument("--n8-result", type=Path, required=True)
+    parser.add_argument("--n8-operands", type=Path, required=True)
+    parser.add_argument("--capture-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = run(args)

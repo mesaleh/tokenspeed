@@ -198,6 +198,9 @@ def _bf16_diagnostics(exact: torch.Tensor, stored: torch.Tensor) -> dict[str, An
     error = stored_f32.to(torch.float64) - exact.to(torch.float64)
     absolute = torch.abs(stored_f32)
     bits = stored.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    reconstructed = (bits << 16).contiguous().view(torch.float32)
+    if not torch.equal(reconstructed, stored_f32):
+        raise EvidenceError("independent BF16 raw-bit reconstruction differs")
     exponent = bits & 0x7F80
     mantissa = bits & 0x007F
     subnormal = (exponent == 0) & (mantissa != 0)
@@ -222,6 +225,96 @@ def _bf16_diagnostics(exact: torch.Tensor, stored: torch.Tensor) -> dict[str, An
         "rounding_rmse": float(torch.sqrt(torch.mean(error * error)).item()),
         "rounding_max_abs": float(torch.max(torch.abs(error)).item()),
         "stored_raw_sha256": _sha256_tensor_raw(stored),
+        "raw_bit_reconstruction_bit_identical": True,
+    }
+
+
+def _scale_diagnostics(scale: torch.Tensor) -> dict[str, Any]:
+    if scale.ndim != 1 or not torch.isfinite(scale).all() or (scale <= 0).any():
+        raise EvidenceError("N10 candidate scale diagnostics input is invalid")
+    quantiles = torch.quantile(
+        scale.to(torch.float64),
+        torch.tensor([0.0, 0.5, 0.9, 0.99, 1.0], dtype=torch.float64),
+    )
+    return {
+        "elements": scale.numel(),
+        "positive": True,
+        "quantiles": {
+            label: float(value)
+            for label, value in zip(
+                ("min", "p50", "p90", "p99", "max"), quantiles.tolist()
+            )
+        },
+        "sha256": _sha256_tensor_f32(scale),
+    }
+
+
+def _validate_capture_identity(
+    *,
+    capture_hashes: dict[str, str],
+    capture_bytes: int,
+    n8_payload: dict[str, Any],
+) -> None:
+    if (
+        len(capture_hashes) != EXPECTED_CAPTURE_FILES
+        or capture_bytes != EXPECTED_CAPTURE_BYTES
+    ):
+        raise EvidenceError(
+            f"capture identity differs: files={len(capture_hashes)}, "
+            f"bytes={capture_bytes}"
+        )
+    if dict(sorted(capture_hashes.items())) != n8_payload.get("capture_sha256"):
+        raise EvidenceError("capture inventory differs from accepted N8 operands")
+
+
+def _validate_evaluated_cell_set(
+    *,
+    expected_scores: dict[tuple[int, str], torch.Tensor],
+    expected_cells: dict[tuple[int, str], dict[str, Any]],
+    layers: list[dict[str, Any]],
+) -> int:
+    try:
+        evaluated = {
+            (int(layer["layer"]), str(surface["label"]))
+            for layer in layers
+            for surface in layer["surfaces"]
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise EvidenceError("N10 evaluated cell structure is malformed") from error
+    if set(expected_scores) != evaluated or set(expected_cells) != evaluated:
+        raise EvidenceError("N8/N10 evaluated cell set differs")
+    if len(evaluated) != 18:
+        raise EvidenceError(f"N10 evaluator covered {len(evaluated)} cells")
+    return len(evaluated)
+
+
+def _pv_factorization_self_test(
+    n7: ModuleType, *, scale_override: torch.Tensor | None = None
+) -> dict[str, Any]:
+    score = torch.zeros((1, 2), dtype=torch.float32)
+    raw = torch.zeros((2, 512), dtype=torch.float32)
+    raw[0, :2] = torch.tensor([1.0, 2.0])
+    raw[1, :2] = torch.tensor([3.0, 4.0])
+    scale = torch.tensor([0.5, 2.0], dtype=torch.float32)
+    effective_scale = scale if scale_override is None else scale_override
+    output, metrics = n7._block_normalized_output(
+        score=score,
+        scale=1.0,
+        reconstructed_scale=effective_scale,
+        raw_values=raw,
+        label="N10 P/V factorization self-test",
+        safe_peak=224.0,
+        candidate_owned=True,
+    )
+    expected = torch.mean(raw * scale.unsqueeze(1), dim=0, keepdim=True)
+    if not torch.equal(output, expected):
+        raise EvidenceError("N10 P/V token-scale factorization differs")
+    return {
+        "pass": True,
+        "expected_output_sha256": _sha256_tensor_f32(expected),
+        "observed_output_sha256": _sha256_tensor_f32(output),
+        "lost_energy_gate_pass": metrics["lost_energy_gate_pass"],
+        "saturation_gate_pass": metrics["saturation_gate_pass"],
     }
 
 
@@ -455,15 +548,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         runner_source=args.n8_runner_source,
     )
     records, capture_hashes, capture_bytes = n8.N7._load_records(args.capture_root)
-    if (
-        len(capture_hashes) != EXPECTED_CAPTURE_FILES
-        or capture_bytes != EXPECTED_CAPTURE_BYTES
-    ):
-        raise EvidenceError(
-            f"capture identity differs: files={len(capture_hashes)}, bytes={capture_bytes}"
-        )
-    if dict(sorted(capture_hashes.items())) != n8_payload.get("capture_sha256"):
-        raise EvidenceError("capture inventory differs from accepted N8 operands")
+    _validate_capture_identity(
+        capture_hashes=capture_hashes,
+        capture_bytes=capture_bytes,
+        n8_payload=n8_payload,
+    )
+    pv_factorization_self_test = _pv_factorization_self_test(n8.N7)
 
     n8_cells = {
         (int(layer["layer"]), str(surface["label"])): surface
@@ -521,16 +611,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
         reciprocal_metrics = _bf16_diagnostics(exact_reciprocal, stored_reciprocal)
+        scale_metrics = _scale_diagnostics(candidate_scale)
         layer_pass = (
             reciprocal_metrics["finite"]
             and reciprocal_metrics["endpoint_count"] == 0
+            and reciprocal_metrics["raw_bit_reconstruction_bit_identical"]
             and all(surface["surface_pass"] for surface in surfaces)
         )
         layers.append(
             {
                 "layer": layer_id,
                 "zero_scale_rows": int(zero.sum().item()),
-                "candidate_scale_sha256": _sha256_tensor_f32(candidate_scale),
+                "latent_raw_sha256": _sha256_tensor_f32(raw),
+                "candidate_scale": scale_metrics,
                 "reciprocal_rope": reciprocal_metrics,
                 "surfaces": surfaces,
                 "layer_pass": layer_pass,
@@ -540,16 +633,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         del exact_reciprocal, stored_reciprocal, zero
         gc.collect()
 
-    evaluated_keys = {
-        (int(layer["layer"]), str(surface["label"]))
-        for layer in layers
-        for surface in layer["surfaces"]
-    }
-    if set(n8_native_scores) != evaluated_keys or set(n8_cells) != evaluated_keys:
-        raise EvidenceError("N8/N10 evaluated cell set differs")
+    cell_count = _validate_evaluated_cell_set(
+        expected_scores=n8_native_scores,
+        expected_cells=n8_cells,
+        layers=layers,
+    )
     surfaces = [surface for layer in layers for surface in layer["surfaces"]]
-    if len(surfaces) != 18:
-        raise EvidenceError(f"N10 evaluator covered {len(surfaces)} cells")
+    if len(surfaces) != cell_count:
+        raise EvidenceError("N10 cell count differs after validation")
     all_surfaces_pass = all(surface["surface_pass"] for surface in surfaces)
     all_layers_pass = all(layer["layer_pass"] for layer in layers)
     decision = (
@@ -588,6 +679,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "n8_reproduction_sha256": reproduced_n8_hash,
         "n8_reproduction_bit_identical": True,
         "n8_native_identity": native_identity,
+        "pv_factorization_self_test": pv_factorization_self_test,
         "layers": layers,
         "summary": {
             "cells": len(surfaces),
