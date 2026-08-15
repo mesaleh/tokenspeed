@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Compile and numerically gate the M64 production-owner E2M1 C1 path."""
+"""Gate N10-D0's four-arm M64 E2M1 owner-attribution experiment."""
 
 import math
 import os
@@ -43,6 +43,13 @@ TMEM_INTERVALS = {
     "correction": (384, 392),
     "rope": (448, 512),
 }
+ARM_NAMES = ("base", "v", "scale", "both")
+
+
+def _arm_flags(arm: str) -> tuple[bool, bool]:
+    if arm not in ARM_NAMES:
+        raise ValueError(f"unsupported N10-D0 arm: {arm}")
+    return arm in ("v", "both"), arm in ("scale", "both")
 
 
 def _audit_static_owner_contract() -> None:
@@ -286,6 +293,62 @@ def _build_inputs(heads: int):
             logical_page, page_offset = divmod(logical_token, PAGE_SIZE)
             physical_page = int(page_table_t[batch, logical_page].item())
             scale_t[physical_page, page_offset] = float("nan")
+    # Test-only pre-gathered logical-token side input. It starts from the same
+    # nibbles as the canonical paged cache and is then expanded into the
+    # data-plus-padding byte coordinates expected by the mixed-PV operand.
+    # Building this optimistic diagnostic ceiling is outside kernel timing.
+    if SEQ_K % 64:
+        raise AssertionError("D0 diagnostic K extent must be a multiple of 64")
+    diag_token_packed = torch.empty(
+        (BATCH, SEQ_K, LATENT // 2), device=device, dtype=torch.uint8
+    )
+    diag_scale_t = torch.zeros(
+        (BATCH, SEQ_K), device=device, dtype=torch.bfloat16
+    )
+    for batch, cache_length in enumerate(cache_lengths):
+        for logical_token in range(SEQ_K):
+            logical_page, page_offset = divmod(logical_token, PAGE_SIZE)
+            physical_page = int(page_table_t[batch, logical_page].item())
+            diag_token_packed[batch, logical_token] = packed_t[
+                physical_page, page_offset
+            ]
+            if logical_token < cache_length:
+                diag_scale_t[batch, logical_token] = scale_t[
+                    physical_page, page_offset
+                ]
+    # Preformat the packed nibbles into the exact F8F6F4 SMEM operand's
+    # data-plus-padding coordinates. This is deliberately an optimistic,
+    # non-memory-valid D0 ceiling: a U8 TMA can now remove the entire canonical
+    # warp-serial population path while mixed E2M1 PV arithmetic stays intact.
+    diag_packed_t = torch.zeros(
+        (LATENT // 2, BATCH * 2 * SEQ_K),
+        device=device,
+        dtype=torch.uint8,
+    )
+    pair = torch.arange(32, device=device)
+    internal_slot = (pair // 8) * 16 + pair % 8
+    for batch in range(BATCH):
+        for latent_tile in range(2):
+            packed_columns = diag_token_packed[
+                batch, :, latent_tile * 128 : (latent_tile + 1) * 128
+            ]
+            for token_base in range(0, SEQ_K, 64):
+                packed_0 = packed_columns[token_base : token_base + 64 : 2]
+                packed_1 = packed_columns[token_base + 1 : token_base + 64 : 2]
+                latent_0 = (packed_0 & 0xF) | ((packed_1 & 0xF) << 4)
+                latent_1 = (packed_0 >> 4) | (packed_1 & 0xF0)
+                internal = torch.stack((latent_0, latent_1), dim=-1).reshape(
+                    32, LATENT // 2
+                )
+                block = (
+                    (batch * 2 + latent_tile) * (SEQ_K // 64)
+                    + token_base // 64
+                )
+                diag_packed_t[:, block * 64 + internal_slot] = internal.T
+    if diag_packed_t.data_ptr() == packed_t.data_ptr():
+        raise AssertionError("diagnostic V aliases canonical packed cache")
+    if diag_scale_t.data_ptr() == scale_t.data_ptr():
+        raise AssertionError("diagnostic scale aliases canonical scale cache")
     cache_seqs_t = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
     output_t = torch.zeros(
         (BATCH, SEQ_Q, heads, LATENT),
@@ -322,6 +385,8 @@ def _build_inputs(heads: int):
         "q_rope": _cute_tensor(q_rope_t, cutlass.Float8E4M3FN, 3),
         "packed": _cute_tensor(packed_t, cutlass.Uint8, 2),
         "scale": _cute_tensor(scale_t, cutlass.BFloat16, 1),
+        "diag_packed": _cute_tensor(diag_packed_t, cutlass.Uint8, 1),
+        "diag_scale": _cute_tensor(diag_scale_t, cutlass.BFloat16, 1),
         "dense": _cute_tensor(dense_t, cutlass.Float8E4M3FN, 2),
         "rope": _cute_tensor(rope_t, cutlass.Float8E4M3FN, 2),
         "page_table": _cute_tensor(page_table_t, cutlass.Int32, 1),
@@ -375,7 +440,14 @@ def _build_inputs(heads: int):
 
 
 def _run_case(heads: int, run_graph: bool) -> None:
-    print(f"S6_C1_CASE_START heads={heads}", flush=True)
+    arm = os.environ.get("TQ_N10_D0_ARM", "base")
+    v_bypass, scale_bypass = _arm_flags(arm)
+    reference_arm = os.environ.get("TQ_N10_D0_REFERENCE_ARM", "base")
+    reference_v_bypass, reference_scale_bypass = _arm_flags(reference_arm)
+    print(
+        f"N10_D0_CASE_START arm={arm} reference={reference_arm} heads={heads}",
+        flush=True,
+    )
     (
         inputs,
         output_t,
@@ -403,6 +475,9 @@ def _run_case(heads: int, run_graph: bool) -> None:
         cp_world=1,
         use_tq_e2m1=True,
         tq_debug_trace=os.environ.get("TQ_S6_TRACE") == "1",
+        tq_d0_v_bypass=v_bypass,
+        tq_d0_scale_bypass=scale_bypass,
+        tq_d0_diag_seq_k=SEQ_K if v_bypass else 0,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     softmax_scale = 1.0 / math.sqrt(LATENT + ROPE)
@@ -425,80 +500,141 @@ def _run_case(heads: int, run_graph: bool) -> None:
         stream,
         True,
         inputs["scale"],
+        inputs["diag_packed"],
+        inputs["diag_scale"],
         options="--enable-tvm-ffi --opt-level 3",
     )
-    print(f"S6_C1_COMPILED heads={heads}", flush=True)
+    print(f"N10_D0_COMPILED arm={arm} heads={heads}", flush=True)
     if os.environ.get("TQ_S6_AUDIT_GENERATED") == "1":
         generated = _audit_generated(compiled)
         print(
-            f"S6_C1_GENERATED heads={heads} "
+            f"N10_D0_GENERATED arm={arm} heads={heads} "
             + " ".join(f"{key}={value}" for key, value in generated.items()),
             flush=True,
         )
+    if os.environ.get("TQ_N10_D0_COMPILE_ONLY") == "1":
+        print(f"N10_D0_COMPILE_ONLY_PASS arm={arm} heads={heads}", flush=True)
+        return
 
     dense_only = os.environ.get("TQ_S6_DENSE_ONLY") == "1"
     timing_enabled = os.environ.get("TQ_S6_TIMING") == "1" or dense_only
+    paired_timing = os.environ.get("TQ_N10_D0_PAIRED") == "1"
+    if paired_timing and (not timing_enabled or dense_only):
+        raise ValueError("N10-D0 paired timing requires TQ_S6_TIMING=1")
+    if paired_timing and reference_arm == arm:
+        raise ValueError("N10-D0 paired timing requires distinct arms")
     dense_compiled = None
     dense_args = None
     if timing_enabled:
-        dense_op = BlackwellMultiHeadLatentAttentionForwardFP8(
-            cutlass.Float32,
-            cutlass.Float32,
-            (64, 128),
-            (64, 256),
-            max_clusters,
-            PAGE_SIZE,
-            0.0,
-            False,
-            True,
-            False,
-            num_heads=heads,
-            seq_len_q=SEQ_Q,
-            cp_world=1,
-        )
-        dense_compiled = cute.compile(
-            dense_op,
-            inputs["dense_q_latent"],
-            inputs["dense_q_rope"],
-            inputs["dense"],
-            inputs["dense_rope"],
-            inputs["dense_page_table"],
-            inputs["dense_output"],
-            inputs["dense_lse"],
-            None,
-            1,
-            inputs["dense_cache_seqs"],
-            inputs["dense_cache_seqs"],
-            None,
-            softmax_scale,
-            1.0,
-            stream,
-            True,
-            options="--enable-tvm-ffi --opt-level 3",
-        )
-        dense_args = (
-            inputs["dense_q_latent"],
-            inputs["dense_q_rope"],
-            inputs["dense"],
-            inputs["dense_rope"],
-            inputs["dense_page_table"],
-            inputs["dense_output"],
-            inputs["dense_lse"],
-            None,
-            1,
-            inputs["dense_cache_seqs"],
-            inputs["dense_cache_seqs"],
-            None,
-            softmax_scale,
-            1.0,
-            stream,
-        )
+        if paired_timing:
+            dense_op = BlackwellMultiHeadLatentAttentionForwardFP8(
+                cutlass.Float32,
+                cutlass.Float32,
+                (64, 128),
+                (64, 256),
+                max_clusters,
+                PAGE_SIZE,
+                0.0,
+                False,
+                True,
+                False,
+                num_heads=heads,
+                seq_len_q=SEQ_Q,
+                cp_world=1,
+                use_tq_e2m1=True,
+                tq_d0_v_bypass=reference_v_bypass,
+                tq_d0_scale_bypass=reference_scale_bypass,
+                tq_d0_diag_seq_k=SEQ_K if reference_v_bypass else 0,
+            )
+            dense_compiled = cute.compile(
+                dense_op,
+                inputs["q_latent"],
+                inputs["q_rope"],
+                inputs["packed"],
+                inputs["rope"],
+                inputs["page_table"],
+                inputs["dense_output"],
+                inputs["dense_lse"],
+                None,
+                1,
+                inputs["cache_seqs"],
+                inputs["cache_seqs"],
+                None,
+                softmax_scale,
+                1.0,
+                stream,
+                True,
+                inputs["scale"],
+                inputs["diag_packed"],
+                inputs["diag_scale"],
+                options="--enable-tvm-ffi --opt-level 3",
+            )
+            dense_args = (
+                inputs["q_latent"], inputs["q_rope"], inputs["packed"],
+                inputs["rope"], inputs["page_table"], inputs["dense_output"],
+                inputs["dense_lse"], None, 1, inputs["cache_seqs"],
+                inputs["cache_seqs"], None, softmax_scale, 1.0, stream,
+                inputs["scale"], inputs["diag_packed"], inputs["diag_scale"],
+            )
+        else:
+            dense_op = BlackwellMultiHeadLatentAttentionForwardFP8(
+                cutlass.Float32,
+                cutlass.Float32,
+                (64, 128),
+                (64, 256),
+                max_clusters,
+                PAGE_SIZE,
+                0.0,
+                False,
+                True,
+                False,
+                num_heads=heads,
+                seq_len_q=SEQ_Q,
+                cp_world=1,
+            )
+            dense_compiled = cute.compile(
+                dense_op,
+                inputs["dense_q_latent"],
+                inputs["dense_q_rope"],
+                inputs["dense"],
+                inputs["dense_rope"],
+                inputs["dense_page_table"],
+                inputs["dense_output"],
+                inputs["dense_lse"],
+                None,
+                1,
+                inputs["dense_cache_seqs"],
+                inputs["dense_cache_seqs"],
+                None,
+                softmax_scale,
+                1.0,
+                stream,
+                True,
+                options="--enable-tvm-ffi --opt-level 3",
+            )
+            dense_args = (
+                inputs["dense_q_latent"],
+                inputs["dense_q_rope"],
+                inputs["dense"],
+                inputs["dense_rope"],
+                inputs["dense_page_table"],
+                inputs["dense_output"],
+                inputs["dense_lse"],
+                None,
+                1,
+                inputs["dense_cache_seqs"],
+                inputs["dense_cache_seqs"],
+                None,
+                softmax_scale,
+                1.0,
+                stream,
+            )
 
     args = (
         inputs["q_latent"], inputs["q_rope"], inputs["packed"], inputs["rope"],
         inputs["page_table"], inputs["output"], inputs["lse"], None, 1,
         inputs["cache_seqs"], inputs["cache_seqs"], None, softmax_scale, 1.0,
-        stream, inputs["scale"],
+        stream, inputs["scale"], inputs["diag_packed"], inputs["diag_scale"],
     )
     if dense_only:
         assert dense_compiled is not None and dense_args is not None
@@ -509,7 +645,10 @@ def _run_case(heads: int, run_graph: bool) -> None:
     for iteration in range(3):
         compiled(*args)
         torch.cuda.synchronize()
-        print(f"S6_C1_EAGER heads={heads} iteration={iteration}", flush=True)
+        print(
+            f"N10_D0_EAGER arm={arm} heads={heads} iteration={iteration}",
+            flush=True,
+        )
 
     observed = output_t.float()
     torch.testing.assert_close(observed, expected, atol=0.75, rtol=0.35)
@@ -521,7 +660,13 @@ def _run_case(heads: int, run_graph: bool) -> None:
         graph_args = (
             args[:-1] + (graph_stream,)
             if dense_only
-            else args[:14] + (graph_stream, inputs["scale"])
+            else args[:14]
+            + (
+                graph_stream,
+                inputs["scale"],
+                inputs["diag_packed"],
+                inputs["diag_scale"],
+            )
         )
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
@@ -563,7 +708,17 @@ def _run_case(heads: int, run_graph: bool) -> None:
             dense_graph = torch.cuda.CUDAGraph()
             dense_capture_stream = torch.cuda.Stream()
             dense_graph_stream = cuda.CUstream(dense_capture_stream.cuda_stream)
-            dense_graph_args = dense_args[:-1] + (dense_graph_stream,)
+            dense_graph_args = (
+                dense_args[:14]
+                + (
+                    dense_graph_stream,
+                    inputs["scale"],
+                    inputs["diag_packed"],
+                    inputs["diag_scale"],
+                )
+                if paired_timing
+                else dense_args[:-1] + (dense_graph_stream,)
+            )
             dense_capture_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(dense_capture_stream):
                 dense_compiled(*dense_graph_args)
@@ -618,11 +773,12 @@ def _run_case(heads: int, run_graph: bool) -> None:
             ci95_low = math.exp(mean_log - t_critical * standard_error)
             ci95_high = math.exp(mean_log + t_critical * standard_error)
             print(
-                "S6_C1_TIMING "
-                f"heads={heads} batch={BATCH} seq_k={SEQ_K} "
+                "N10_D0_TIMING "
+                f"arm={arm} heads={heads} batch={BATCH} seq_k={SEQ_K} "
                 f"candidate_mean_us={statistics.fmean(candidate_samples):.6f} "
-                f"dense_mean_us={statistics.fmean(dense_samples):.6f} "
-                f"candidate_over_dense={ratio:.6f} "
+                f"reference={reference_arm if paired_timing else 'dense'} "
+                f"reference_mean_us={statistics.fmean(dense_samples):.6f} "
+                f"candidate_over_reference={ratio:.6f} "
                 f"ci95_low={ci95_low:.6f} ci95_high={ci95_high:.6f} "
                 f"windows={windows} replays={replays}",
                 flush=True,
@@ -633,8 +789,8 @@ def _run_case(heads: int, run_graph: bool) -> None:
     if os.environ.get("TQ_S6_PRINT_GENERATED") == "1":
         print(getattr(compiled, "__mlir__", ""))
     print(
-        f"S6_C1_CASE_PASS heads={heads} cache_lengths={cache_lengths} "
-        f"graph={run_graph}"
+        f"N10_D0_CASE_PASS arm={arm} heads={heads} "
+        f"cache_lengths={cache_lengths} graph={run_graph}"
     )
 
 
@@ -654,7 +810,7 @@ def main() -> None:
     for heads in head_cases:
         _run_case(heads, run_graph=time_every_case or heads == head_cases[-1])
     print(
-        "S6_C1_PASS owner=stock_m64 packed_hbm=True qk_e2m1=True "
+        "N10_D0_PASS owner=stock_m64 packed_hbm=True qk_e2m1=True "
         "pv_e2m1=True bf16_scale=True carrier_exact=True q1=True q5=True "
         "multi_tile=True partial_pages=31_32_33 page_permutation=True "
         "graph_replays=100"
