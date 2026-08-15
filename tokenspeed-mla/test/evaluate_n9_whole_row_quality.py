@@ -365,7 +365,6 @@ def _surface_quality(
     dense_values: torch.Tensor,
     raw: torch.Tensor,
     row_scale: torch.Tensor,
-    reconstruction: torch.Tensor,
     n8_raw: torch.Tensor,
     n8_scale: torch.Tensor,
     n8_native_score: torch.Tensor,
@@ -387,7 +386,6 @@ def _surface_quality(
     q_rope = qi[:, 512:]
     raw = raw[eligible]
     row_scale = row_scale[eligible]
-    reconstruction = reconstruction[eligible]
     n8_raw = n8_raw[eligible]
     n8_scale = n8_scale[eligible]
     n8_native_score = n8_native_score.to(torch.float32)
@@ -416,13 +414,12 @@ def _surface_quality(
         n8_native_score, capture.attention_scale, candidate_owned=True
     )
     n8_probability = n7._probability(n8_numerator)
-    ones = torch.ones(key_count, dtype=torch.float32)
     n9_output, n9_p = n7._block_normalized_output(
         score=n9_score,
         scale=capture.attention_scale,
-        reconstructed_scale=ones,
-        raw_values=reconstruction,
-        label="N9 whole-row algebraic candidate",
+        reconstructed_scale=row_scale,
+        raw_values=raw,
+        label="N9 whole-row exponent-folded candidate",
         safe_peak=224.0,
         candidate_owned=True,
     )
@@ -589,7 +586,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     dense_values=rotated_dense,
                     raw=raw,
                     row_scale=row_scale,
-                    reconstruction=reconstruction,
                     n8_raw=n8_raw,
                     n8_scale=n8_scale,
                     n8_native_score=n8_native_scores[key],
