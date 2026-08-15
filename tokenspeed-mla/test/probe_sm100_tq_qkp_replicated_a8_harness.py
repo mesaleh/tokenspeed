@@ -17,10 +17,8 @@ import math
 import statistics
 from pathlib import Path
 
-import torch
-
 import probe_sm100_tq_qkp_replicated as base
-
+import torch
 
 ARMS = ("c0", "rn", "native")
 ARM_CONFIGS = {
@@ -110,8 +108,7 @@ def assert_frozen_base_source() -> tuple[str, str]:
     digest = hashlib.sha256(region).hexdigest()
     if digest != FROZEN_KERNEL_REGION_SHA256:
         raise AssertionError(
-            f"A4 kernel region drifted: {digest} != "
-            f"{FROZEN_KERNEL_REGION_SHA256}"
+            f"A4 kernel region drifted: {digest} != " f"{FROZEN_KERNEL_REGION_SHA256}"
         )
     return file_digest, digest
 
@@ -137,8 +134,7 @@ def williams_orders(windows: int) -> list[tuple[str, ...]]:
                 continue
             observed = sum(
                 sum(
-                    order[position] == first
-                    and order[position + 1] == second
+                    order[position] == first and order[position + 1] == second
                     for position in range(len(ARMS) - 1)
                 )
                 for order in orders
@@ -204,16 +200,12 @@ def assert_scale_case_coverage() -> None:
 def make_host_pattern(
     scale_case: int, pv_scale_falsifier: int
 ) -> tuple[torch.Tensor, ...]:
-    row = torch.arange(base.SCORE_ROWS, dtype=torch.int64).view(
-        base.SCORE_ROWS, 1
-    )
+    row = torch.arange(base.SCORE_ROWS, dtype=torch.int64).view(base.SCORE_ROWS, 1)
     token = torch.arange(base.TOKENS, dtype=torch.int64).view(base.TOKENS, 1)
     latent_coordinate = torch.arange(base.LATENT_K, dtype=torch.int64).view(
         1, base.LATENT_K
     )
-    rope_coordinate = torch.arange(base.ROPE_K, dtype=torch.int64).view(
-        1, base.ROPE_K
-    )
+    rope_coordinate = torch.arange(base.ROPE_K, dtype=torch.int64).view(1, base.ROPE_K)
     query = (
         (
             (
@@ -238,9 +230,7 @@ def make_host_pattern(
         % 3
     ).float()
     key_base = (key_base - 1.0) * 0.5
-    key_factors = torch.tensor([1.0, 1.0, 2.0, 1.0, 1.0]).view(
-        base.TILES, 1, 1
-    )
+    key_factors = torch.tensor([1.0, 1.0, 2.0, 1.0, 1.0]).view(base.TILES, 1, 1)
     key = key_base.unsqueeze(0) * key_factors
     rope_query = (
         (((row + 3) * (rope_coordinate + 1) * 11 + row * 13) % 127) % 3
@@ -250,18 +240,13 @@ def make_host_pattern(
         (((token + 5) * (rope_coordinate + 7) * 19 + token * 17) % 131) % 3
     ).float()
     rope_key_base = (rope_key_base - 1.0) * 0.5
-    rope_factors = torch.tensor([1.0, 0.5, 2.0, 1.0, 1.0]).view(
-        base.TILES, 1, 1
-    )
+    rope_factors = torch.tensor([1.0, 0.5, 2.0, 1.0, 1.0]).view(base.TILES, 1, 1)
     rope_key = rope_key_base.unsqueeze(0) * rope_factors
     tile = torch.arange(base.TILES, dtype=torch.int64).view(base.TILES, 1)
     token_row = torch.arange(base.TOKENS, dtype=torch.int64).view(1, base.TOKENS)
-    scale_factors = torch.tensor([1.0, 2.0, 0.5, 8.0, 4.0]).view(
-        base.TILES, 1
-    )
+    scale_factors = torch.tensor([1.0, 2.0, 0.5, 8.0, 4.0]).view(base.TILES, 1)
     token_scale = (
-        (0.75 + ((tile * 7 + token_row * 3) % 17).float() / 32.0)
-        * scale_factors
+        (0.75 + ((tile * 7 + token_row * 3) % 17).float() / 32.0) * scale_factors
     ).to(torch.bfloat16)
 
     if scale_case < 0:
@@ -287,9 +272,7 @@ def make_host_pattern(
         key.zero_()
         exponents = scale_case_exponents(scale_case)
         for tile_index, exponent in enumerate(exponents):
-            boundary = torch.tensor(
-                224.0 * (2.0**exponent), dtype=torch.bfloat16
-            )
+            boundary = torch.tensor(224.0 * (2.0**exponent), dtype=torch.bfloat16)
             below = torch.nextafter(
                 boundary,
                 torch.tensor(float("-inf"), dtype=torch.bfloat16),
@@ -483,9 +466,7 @@ def require_c512_generated_identity(
     for arm, values in audit.items():
         cubin_sha256 = values["cubin_sha256"]
         if cubin_sha256 != EXPECTED_C512_CUBIN_SHA256[arm]:
-            raise AssertionError(
-                f"c512 {arm} cubin identity drifted: {cubin_sha256}"
-            )
+            raise AssertionError(f"c512 {arm} cubin identity drifted: {cubin_sha256}")
         counts = {key: values[key] for key in EXPECTED_C512_SASS_COUNTS[arm]}
         if counts != EXPECTED_C512_SASS_COUNTS[arm]:
             raise AssertionError(
@@ -499,12 +480,42 @@ def expected_layout(arm: str, overlap_setup: int) -> torch.Tensor:
     return torch.tensor(
         [
             [
-                1, 0, 64, 64, 20, 84, 8, 128, 64, 256, 256, 512,
-                16384, 8192, overlap_setup, native, native,
+                1,
+                0,
+                64,
+                64,
+                20,
+                84,
+                8,
+                128,
+                64,
+                256,
+                256,
+                512,
+                16384,
+                8192,
+                overlap_setup,
+                native,
+                native,
             ],
             [
-                2, 0, 64, 64, 20, 84, 8, 128, 64, 256, 256, 512,
-                16384, 8192, overlap_setup, native, native,
+                2,
+                0,
+                64,
+                64,
+                20,
+                84,
+                8,
+                128,
+                64,
+                256,
+                256,
+                512,
+                16384,
+                8192,
+                overlap_setup,
+                native,
+                native,
             ],
         ],
         dtype=torch.int32,
@@ -649,8 +660,7 @@ def verify_pool(
             normalized_output[begin:end].to(torch.bfloat16).view(torch.int16),
         ):
             raise AssertionError(
-                f"BF16 epilogue differs from normalized output: "
-                f"nodes={begin}:{end}"
+                f"BF16 epilogue differs from normalized output: " f"nodes={begin}:{end}"
             )
     checked.add("bf16")
     exact("carrier", carrier_output, expected[5])  # type: ignore[arg-type]
@@ -725,9 +735,9 @@ def build_runtime(
     query, key, rope_query, rope_key, token_scale = make_host_pattern(
         args.scale_case, args.pv_sfa_exp + args.pv_sfb_exp
     )
-    native_latent = (
-        key.float() * token_scale.float().unsqueeze(-1)
-    ).to(torch.float8_e4m3fn)
+    native_latent = (key.float() * token_scale.float().unsqueeze(-1)).to(
+        torch.float8_e4m3fn
+    )
     require_mixed_max_wins = not (
         args.scale_case >= 0 or args.pv_sfa_exp or args.pv_sfb_exp
     )
@@ -808,9 +818,7 @@ def build_runtime(
     native_node = native_latent.float().repeat(args.clusters, 1, 1)
     rope_query_node = rope_query.unsqueeze(0).repeat(args.clusters, 1, 1)
     rope_key_node = rope_key.repeat(args.clusters, 1, 1)
-    query_cute, query_backing = make_cute_nodes(
-        query_node, base.cutlass.Float8E4M3FN
-    )
+    query_cute, query_backing = make_cute_nodes(query_node, base.cutlass.Float8E4M3FN)
     key_cute, key_backing = make_cute_nodes(key_node, base.cutlass.Float4E2M1FN)
     native_cute, native_backing = make_cute_nodes(
         native_node, base.cutlass.Float8E4M3FN
@@ -821,8 +829,8 @@ def build_runtime(
     rope_key_cute, rope_key_backing = make_cute_nodes(
         rope_key_node, base.cutlass.Float8E4M3FN
     )
-    token_scale_pool = token_scale.cuda().contiguous().unsqueeze(0).repeat(
-        args.nodes, 1, 1
+    token_scale_pool = (
+        token_scale.cuda().contiguous().unsqueeze(0).repeat(args.nodes, 1, 1)
     )
 
     ctas = base.CLUSTER_SHAPE_MNK[0] * args.clusters
@@ -918,9 +926,7 @@ def build_runtime(
         },
     }
     ranges = allocation_ranges(node_pools, independent_nodes, args.nodes)
-    if len(ranges) != args.nodes * (
-        len(independent_nodes) + len(node_pools)
-    ):
+    if len(ranges) != args.nodes * (len(independent_nodes) + len(node_pools)):
         raise AssertionError("allocation cardinality self-check failed")
 
     def launch_node(arm: str, node: int, stream) -> None:
@@ -979,7 +985,9 @@ def main() -> None:
     parser.add_argument("--matrix-export", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--arm", choices=("all",) + ARMS, default="all")
-    parser.add_argument("--scale-case", type=int, choices=tuple(range(-1, 9)), default=-1)
+    parser.add_argument(
+        "--scale-case", type=int, choices=tuple(range(-1, 9)), default=-1
+    )
     parser.add_argument("--overlap-setup", type=int, choices=(0, 1), default=1)
     parser.add_argument("--pv-sfa-exp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--pv-sfb-exp", type=int, choices=(0, 1), default=0)
@@ -990,9 +998,7 @@ def main() -> None:
     if args.graph_replays < 0:
         parser.error("--graph-replays must be non-negative")
     if args.windows not in SUPPORTED_TIMING_WINDOWS:
-        parser.error(
-            "--windows must be 6 (rehearsal) or 30 (scored candidate)"
-        )
+        parser.error("--windows must be 6 (rehearsal) or 30 (scored candidate)")
     if args.warmup_windows < 0 or args.warmup_windows % 6:
         parser.error("--warmup-windows must be a non-negative multiple of six")
     if args.pv_sfa_exp and args.pv_sfb_exp:
@@ -1038,8 +1044,7 @@ def main() -> None:
     generated_audit = build_generated_audit(compiled)
     require_c512_generated_identity(args, generated_audit)
     print(
-        "A8_GENERATED_AUDIT_JSON="
-        + json.dumps(generated_audit, sort_keys=True),
+        "A8_GENERATED_AUDIT_JSON=" + json.dumps(generated_audit, sort_keys=True),
         flush=True,
     )
     if args.compile_only:
@@ -1066,9 +1071,7 @@ def main() -> None:
         for node in range(args.nodes):
             launch_node(arm, node, stream)
         torch.cuda.synchronize()
-        verify_pool(
-            arm, outputs, expected[arm], args.matrix_export, args.overlap_setup
-        )
+        verify_pool(arm, outputs, expected[arm], args.matrix_export, args.overlap_setup)
         print(
             f"PASS_A8_EAGER arm={arm} clusters={args.clusters} nodes={args.nodes}",
             flush=True,
@@ -1120,9 +1123,7 @@ def main() -> None:
         return
 
     audit_events: list[tuple[str, int, str]] = []
-    warmup_orders = (
-        williams_orders(args.warmup_windows) if args.warmup_windows else []
-    )
+    warmup_orders = williams_orders(args.warmup_windows) if args.warmup_windows else []
     for warmup, order in enumerate(warmup_orders, start=1):
         for arm in order:
             audit_events.append(("poison", -warmup, arm))

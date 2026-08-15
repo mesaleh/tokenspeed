@@ -48,8 +48,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import (
     make_fake_compact_tensor,
     make_fake_stream,
@@ -81,6 +81,7 @@ def ptx_redux_sync_max_f32(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
 
 THREADS_PER_CTA = 384
 TMEM_RETRIEVE_THREADS = 288
@@ -166,7 +167,6 @@ SMEM_PAYLOAD_BYTES = (
 )
 
 
-
 @cute.jit
 def consume_pv_tile(
     tidx,
@@ -239,9 +239,7 @@ def consume_pv_tile(
         if cutlass.const_expr(consume_tile > 0):
             no_correction = pcor_regs_i32[3] & cutlass.Int32(1)
             correction_factor = (
-                pcor_regs[2]
-                * consumer_carrier_smem[0]
-                / carrier_stage_smem[stage]
+                pcor_regs[2] * consumer_carrier_smem[0] / carrier_stage_smem[stage]
             )
             if no_correction != cutlass.Int32(0):
                 correction_factor = cutlass.Float32(1.0)
@@ -258,13 +256,9 @@ def consume_pv_tile(
 
     if cutlass.const_expr(consume_tile > 0):
         if cutlass.const_expr(NATIVE_PV == 1):
-            for latent_slice in cutlass.range_constexpr(
-                NATIVE_PV_LATENT_SLICES
-            ):
+            for latent_slice in cutlass.range_constexpr(NATIVE_PV_LATENT_SLICES):
                 pv_acc = cute.make_tensor(
-                    tmem_ptr
-                    + OUTPUT_OFFSET
-                    + latent_slice * native_pv_output_cols,
+                    tmem_ptr + OUTPUT_OFFSET + latent_slice * native_pv_output_cols,
                     native_pv_acc_fake.layout,
                 )
                 if tidx < 128:
@@ -292,19 +286,13 @@ def consume_pv_tile(
                     cute.arch.fence_view_async_tmem_load()
                     for element in cutlass.range_constexpr(cute.size(r_acc)):
                         row = r_layout[element][0]
-                        r_acc[element] = (
-                            r_acc[element] * correction_scale_smem[row]
-                        )
+                        r_acc[element] = r_acc[element] * correction_scale_smem[row]
                     cute.copy(tmem_store, r_acc, t_tmem_store)
                     cute.arch.fence_view_async_tmem_store()
         else:
-            for latent_slice in cutlass.range_constexpr(
-                MIXED_PV_LATENT_SLICES
-            ):
+            for latent_slice in cutlass.range_constexpr(MIXED_PV_LATENT_SLICES):
                 pv_acc = cute.make_tensor(
-                    tmem_ptr
-                    + OUTPUT_OFFSET
-                    + latent_slice * mixed_pv_output_cols,
+                    tmem_ptr + OUTPUT_OFFSET + latent_slice * mixed_pv_output_cols,
                     mixed_pv_acc_fake.layout,
                 )
                 if tidx < 128:
@@ -332,9 +320,7 @@ def consume_pv_tile(
                     cute.arch.fence_view_async_tmem_load()
                     for element in cutlass.range_constexpr(cute.size(r_acc)):
                         row = r_layout[element][0]
-                        r_acc[element] = (
-                            r_acc[element] * correction_scale_smem[row]
-                        )
+                        r_acc[element] = r_acc[element] * correction_scale_smem[row]
                     cute.copy(tmem_store, r_acc, t_tmem_store)
                     cute.arch.fence_view_async_tmem_store()
         cute.arch.sync_threads()
@@ -350,17 +336,14 @@ def consume_pv_tile(
             # slice reuses a stage only after the prior cooperative MMA has
             # completed and all local consumers have released it.
             if cutlass.const_expr(
-                consume_tile > 0
-                or latent_slice >= INITIAL_NATIVE_V_PREFETCHES
+                consume_tile > 0 or latent_slice >= INITIAL_NATIVE_V_PREFETCHES
             ):
                 if tidx == 0:
                     prims.mbarrier_arrive_expect_tx(
                         v_bar_ptr, native_cache_v_desc.global_tx_bytes()
                     )
                     v_stage_ptr = raw_v_smem.data_ptr() + v_stage * (
-                        TOKENS
-                        * NATIVE_PV_SLICE_COLS
-                        // CLUSTER_SHAPE_MNK[0]
+                        TOKENS * NATIVE_PV_SLICE_COLS // CLUSTER_SHAPE_MNK[0]
                     )
                     prims.cp_async_bulk_tensor_shared_cta_global(
                         v_stage_ptr,
@@ -369,10 +352,7 @@ def consume_pv_tile(
                             cutlass.Int32(
                                 latent_slice * NATIVE_PV_SLICE_COLS
                                 + cta_rank
-                                * (
-                                    NATIVE_PV_SLICE_COLS
-                                    // CLUSTER_SHAPE_MNK[0]
-                                )
+                                * (NATIVE_PV_SLICE_COLS // CLUSTER_SHAPE_MNK[0])
                             ),
                             cutlass.Int32(0),
                             cutlass.Int32(key_tile_index),
@@ -387,9 +367,7 @@ def consume_pv_tile(
             cute.arch.cluster_wait()
 
             pv_acc = cute.make_tensor(
-                tmem_ptr
-                + OUTPUT_OFFSET
-                + latent_slice * native_pv_output_cols,
+                tmem_ptr + OUTPUT_OFFSET + latent_slice * native_pv_output_cols,
                 native_pv_acc_fake.layout,
             )
             if warp_idx == 8 and cta_rank == 0:
@@ -448,8 +426,7 @@ def consume_pv_tile(
             v_phase = consume_tile % 2
             v_bar_ptr = v_tma_mbar.get_barrier(v_stage)
             if cutlass.const_expr(
-                consume_tile > 0
-                or latent_slice >= INITIAL_MIXED_V_PREFETCHES
+                consume_tile > 0 or latent_slice >= INITIAL_MIXED_V_PREFETCHES
             ):
                 if warp_idx == 9:
                     if cta_rank == 0:
@@ -485,9 +462,7 @@ def consume_pv_tile(
             cute.arch.cluster_wait()
 
             pv_acc = cute.make_tensor(
-                tmem_ptr
-                + OUTPUT_OFFSET
-                + latent_slice * mixed_pv_output_cols,
+                tmem_ptr + OUTPUT_OFFSET + latent_slice * mixed_pv_output_cols,
                 mixed_pv_acc_fake.layout,
             )
             if warp_idx == 8 and cta_rank == 0:
@@ -556,12 +531,11 @@ def consume_pv_tile(
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
 
+
 @cute.struct
 class SharedStorage:
     init_mbar: cutlass.Int64
-    tma_mbar: cute.struct.MemRange[
-        cutlass.Int64, TILES * (QK_BARRIER_SLOTS + 1)
-    ]
+    tma_mbar: cute.struct.MemRange[cutlass.Int64, TILES * (QK_BARRIER_SLOTS + 1)]
     mma_mbar: cute.struct.MemRange[cutlass.Int64, 2]
     vp_mbar: cute.struct.MemRange[cutlass.Int64, 2]
     softmax_max_exchange: cute.struct.MemRange[cutlass.Float32, SCORE_ROWS]
@@ -1274,9 +1248,7 @@ def ownership_kernel(
         layout_output[cta_rank, 7] = SCORE_OFFSET
         layout_output[cta_rank, 8] = OUTPUT_OFFSET - SCORE_OFFSET - 64
         layout_output[cta_rank, 9] = OUTPUT_OFFSET
-        layout_output[cta_rank, 10] = (
-            mixed_pv_output_cols * MIXED_PV_LATENT_SLICES
-        )
+        layout_output[cta_rank, 10] = mixed_pv_output_cols * MIXED_PV_LATENT_SLICES
         layout_output[cta_rank, 11] = TMEM_ALLOC_COLS
         layout_output[cta_rank, 12] = mixed_v_copy_bytes
         layout_output[cta_rank, 13] = native_cache_v_desc.global_tx_bytes()
@@ -1295,17 +1267,11 @@ def ownership_kernel(
     # as the mbarriers are initialized.  The strict native control likewise
     # performs its earliest legal two-stage prefetch.  The serial arm defers
     # the same candidate transactions until after scale publication.
-    if warp_idx == 9 and cutlass.const_expr(
-        NATIVE_PV == 0 and OVERLAP_SETUP == 1
-    ):
-        for latent_slice in cutlass.range_constexpr(
-            INITIAL_MIXED_V_PREFETCHES
-        ):
+    if warp_idx == 9 and cutlass.const_expr(NATIVE_PV == 0 and OVERLAP_SETUP == 1):
+        for latent_slice in cutlass.range_constexpr(INITIAL_MIXED_V_PREFETCHES):
             v_bar_ptr = v_tma_barriers.get_barrier(latent_slice)
             if cta_rank == 0:
-                v_tma_barriers.arrive_and_expect_tx(
-                    latent_slice, mixed_v_copy_bytes
-                )
+                v_tma_barriers.arrive_and_expect_tx(latent_slice, mixed_v_copy_bytes)
             if cutlass.const_expr(latent_slice == 0):
                 cute.copy(
                     tma_atom_mixed_pv_v,
@@ -1321,9 +1287,7 @@ def ownership_kernel(
                     tma_bar_ptr=v_bar_ptr,
                 )
     if tidx == 0 and cutlass.const_expr(NATIVE_PV == 1):
-        for latent_slice in cutlass.range_constexpr(
-            INITIAL_NATIVE_V_PREFETCHES
-        ):
+        for latent_slice in cutlass.range_constexpr(INITIAL_NATIVE_V_PREFETCHES):
             v_bar_ptr = v_tma_barriers.get_barrier(latent_slice)
             prims.mbarrier_arrive_expect_tx(
                 v_bar_ptr, native_cache_v_desc.global_tx_bytes()
@@ -1337,8 +1301,7 @@ def ownership_kernel(
                 (
                     cutlass.Int32(
                         latent_slice * NATIVE_PV_SLICE_COLS
-                        + cta_rank
-                        * (NATIVE_PV_SLICE_COLS // CLUSTER_SHAPE_MNK[0])
+                        + cta_rank * (NATIVE_PV_SLICE_COLS // CLUSTER_SHAPE_MNK[0])
                     ),
                     cutlass.Int32(0),
                     cutlass.Int32(cluster_index * TILES),
@@ -1357,23 +1320,15 @@ def ownership_kernel(
         )
         pv_sfa_byte = 0x7F + PV_SFA_EXP
         pv_sfb_byte = 0x7F + PV_SFB_EXP
-        pv_sfa_word = cutlass.Uint32(pv_sfa_byte * 0x01010101).bitcast(
-            cutlass.Float32
-        )
-        pv_sfb_word = cutlass.Uint32(pv_sfb_byte * 0x01010101).bitcast(
-            cutlass.Float32
-        )
+        pv_sfa_word = cutlass.Uint32(pv_sfa_byte * 0x01010101).bitcast(cutlass.Float32)
+        pv_sfb_word = cutlass.Uint32(pv_sfb_byte * 0x01010101).bitcast(cutlass.Float32)
         poison_word = cutlass.Uint32(0x81818181).bitcast(cutlass.Float32)
-        for scale_block in cutlass.range_constexpr(
-            MIXED_PV_SCALE_RESERVE_COLS // 16
-        ):
+        for scale_block in cutlass.range_constexpr(MIXED_PV_SCALE_RESERVE_COLS // 16):
             pv_scale_tile = cute.make_tensor(
                 tmem_ptr + MIXED_PV_SCALE_OFFSET + scale_block * 16,
                 cute.make_layout((SCORE_ROWS, 16), stride=(1 << 16, 1)),
             )
-            pv_scale_init = tcgen05.make_tmem_copy(
-                pv_scale_init_atom, pv_scale_tile
-            )
+            pv_scale_init = tcgen05.make_tmem_copy(pv_scale_init_atom, pv_scale_tile)
             pv_scale_thr = pv_scale_init.get_slice(tidx)
             pv_scale_coords = cute.make_identity_tensor(pv_scale_tile.shape)
             pv_scale_regs_layout = pv_scale_thr.partition_S(pv_scale_coords)
@@ -1416,17 +1371,11 @@ def ownership_kernel(
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
 
-    if warp_idx == 9 and cutlass.const_expr(
-        NATIVE_PV == 0 and OVERLAP_SETUP == 0
-    ):
-        for latent_slice in cutlass.range_constexpr(
-            INITIAL_MIXED_V_PREFETCHES
-        ):
+    if warp_idx == 9 and cutlass.const_expr(NATIVE_PV == 0 and OVERLAP_SETUP == 0):
+        for latent_slice in cutlass.range_constexpr(INITIAL_MIXED_V_PREFETCHES):
             v_bar_ptr = v_tma_barriers.get_barrier(latent_slice)
             if cta_rank == 0:
-                v_tma_barriers.arrive_and_expect_tx(
-                    latent_slice, mixed_v_copy_bytes
-                )
+                v_tma_barriers.arrive_and_expect_tx(latent_slice, mixed_v_copy_bytes)
             if cutlass.const_expr(latent_slice == 0):
                 cute.copy(
                     tma_atom_mixed_pv_v,
@@ -1508,9 +1457,7 @@ def ownership_kernel(
                         carrier_exp = carrier_exp + cutlass.Int32(1)
             if cutlass.const_expr(tile == MASKED_TILE):
                 carrier_scale = carrier_stage_smem[(tile - 1) % CORRECTION_STAGES]
-                carrier_exp = carrier_exp_stage_smem[
-                    (tile - 1) % CORRECTION_STAGES
-                ]
+                carrier_exp = carrier_exp_stage_smem[(tile - 1) % CORRECTION_STAGES]
             carrier_scale_smem[0] = carrier_scale
             if cutlass.const_expr(HOIST_CARRIER_INVERSE == 1):
                 inverse_bits = cutlass.Uint32(
@@ -1527,9 +1474,10 @@ def ownership_kernel(
             carrier_scale = carrier_scale_smem[0]
         if cutlass.const_expr(STAGE_NORMALIZED_SCALES == 1):
             if tidx < TOKENS:
-                normalized_scale_smem[tidx] = absolute_scale_smem[tidx].to(
-                    cutlass.Float32
-                ) * carrier_inverse_smem[0]
+                normalized_scale_smem[tidx] = (
+                    absolute_scale_smem[tidx].to(cutlass.Float32)
+                    * carrier_inverse_smem[0]
+                )
             cute.arch.fence_view_async_shared()
             cute.arch.sync_threads()
         if warp_idx == 9:
@@ -1591,9 +1539,7 @@ def ownership_kernel(
                 native_qk_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for latent_tile in cutlass.range_constexpr(NATIVE_LATENT_K_TILES):
                     tma_barriers.wait(barrier_base + latent_tile, 0)
-                    for k_block in cutlass.range(
-                        native_k_blocks, unroll_full=True
-                    ):
+                    for k_block in cutlass.range(native_k_blocks, unroll_full=True):
                         cute.gemm(
                             native_qk_mma,
                             native_acc,
@@ -1754,11 +1700,7 @@ def ownership_kernel(
                             absolute_scale = token_scale[tile, token].to(
                                 cutlass.Float32
                             )
-                        p_value = (
-                            probability
-                            * absolute_scale
-                            * carrier_inverse
-                        )
+                        p_value = probability * absolute_scale * carrier_inverse
                     else:
                         p_value = (
                             probability
@@ -1774,13 +1716,9 @@ def ownership_kernel(
                     stage,
                 )
                 if cutlass.const_expr(NATIVE_PV == 1):
-                    native_p_smem[p_coordinate] = p_value.to(
-                        cutlass.Float8E4M3FN
-                    )
+                    native_p_smem[p_coordinate] = p_value.to(cutlass.Float8E4M3FN)
                 else:
-                    mixed_p_smem[p_coordinate] = p_value.to(
-                        cutlass.Float8E4M3FN
-                    )
+                    mixed_p_smem[p_coordinate] = p_value.to(cutlass.Float8E4M3FN)
 
             softmax_sum_exchange[tidx] = tile_row_sum
             cute.arch.fence_view_async_shared()
@@ -1805,9 +1743,7 @@ def ownership_kernel(
                 prior_carrier = carrier_stage_smem[(tile - 1) % CORRECTION_STAGES]
                 if carrier_scale != prior_carrier:
                     advance_g = cutlass.Int32(1)
-                combined_correction = (
-                    prior_correction * prior_carrier / carrier_scale
-                )
+                combined_correction = prior_correction * prior_carrier / carrier_scale
                 if combined_correction == cutlass.Float32(1.0):
                     no_correction = cutlass.Int32(1)
             if cutlass.const_expr(tile == MASKED_TILE):
@@ -1880,9 +1816,9 @@ def ownership_kernel(
                         p_coordinate
                     ]
                 else:
-                    p_output[cta_global, tile, local_row, token] = (
-                        mixed_p_smem[p_coordinate]
-                    )
+                    p_output[cta_global, tile, local_row, token] = mixed_p_smem[
+                        p_coordinate
+                    ]
         cute.arch.sync_threads()
 
         if cutlass.const_expr(tile > 0):
@@ -1966,18 +1902,14 @@ def ownership_kernel(
     )
 
     if tidx < ROWS_PER_CTA:
-        correction_scale_smem[tidx] = (
-            consumer_carrier_smem[0] / online_row_sum
-        )
+        correction_scale_smem[tidx] = consumer_carrier_smem[0] / online_row_sum
     cute.arch.fence_view_async_shared()
     cute.arch.sync_threads()
 
     if cutlass.const_expr(NATIVE_PV == 0):
         for latent_slice in cutlass.range_constexpr(MIXED_PV_LATENT_SLICES):
             mixed_pv_acc = cute.make_tensor(
-                tmem_ptr
-                + OUTPUT_OFFSET
-                + latent_slice * mixed_pv_output_cols,
+                tmem_ptr + OUTPUT_OFFSET + latent_slice * mixed_pv_output_cols,
                 mixed_pv_acc_fake.layout,
             )
             if tidx < 128:
@@ -1990,10 +1922,7 @@ def ownership_kernel(
                 thr_load = tmem_load.get_slice(tidx)
                 g_fp32 = cute.make_tensor(
                     normalized_output.iterator
-                    + (
-                        cta_global * LATENT_K
-                        + latent_slice * MIXED_PV_SLICE_COLS
-                    )
+                    + (cta_global * LATENT_K + latent_slice * MIXED_PV_SLICE_COLS)
                     * ROWS_PER_CTA,
                     cute.make_layout(
                         (ROWS_PER_CTA, MIXED_PV_SLICE_COLS),
@@ -2002,10 +1931,7 @@ def ownership_kernel(
                 )
                 g_bf16 = cute.make_tensor(
                     bf16_output.iterator
-                    + (
-                        cta_global * LATENT_K
-                        + latent_slice * MIXED_PV_SLICE_COLS
-                    )
+                    + (cta_global * LATENT_K + latent_slice * MIXED_PV_SLICE_COLS)
                     * ROWS_PER_CTA,
                     cute.make_layout(
                         (ROWS_PER_CTA, MIXED_PV_SLICE_COLS),
@@ -2024,9 +1950,7 @@ def ownership_kernel(
                 cute.arch.fence_view_async_tmem_load()
                 for element in cutlass.range_constexpr(cute.size(r_acc)):
                     row = r_coords[element][0]
-                    r_acc[element] = (
-                        r_acc[element] * correction_scale_smem[row]
-                    )
+                    r_acc[element] = r_acc[element] * correction_scale_smem[row]
                 cute.autovec_copy(r_acc, t_fp32)
                 r_bf16 = cute.make_fragment_like(t_bf16, cutlass.BFloat16)
                 r_bf16.store(r_acc.load().to(cutlass.BFloat16))
@@ -2036,9 +1960,7 @@ def ownership_kernel(
     for latent_slice in cutlass.range_constexpr(LATENT_SLICES):
         if cutlass.const_expr(NATIVE_PV == 1):
             native_pv_acc = cute.make_tensor(
-                tmem_ptr
-                + OUTPUT_OFFSET
-                + latent_slice * native_pv_output_cols,
+                tmem_ptr + OUTPUT_OFFSET + latent_slice * native_pv_output_cols,
                 native_pv_acc_fake.layout,
             )
             if tidx < 128:
@@ -2067,9 +1989,7 @@ def ownership_kernel(
                         stride=(1, ROWS_PER_CTA),
                     ),
                 )
-                output_coords = cute.make_identity_tensor(
-                    (ROWS_PER_CTA, V_SLICE_COLS)
-                )
+                output_coords = cute.make_identity_tensor((ROWS_PER_CTA, V_SLICE_COLS))
                 t_tmem = thr_load.partition_S(t_acc)
                 t_fp32 = thr_load.partition_D(g_fp32)
                 t_bf16 = thr_load.partition_D(g_bf16)
@@ -2152,9 +2072,7 @@ def ownership_probe(
     )
     g_native_latent = cute.make_tensor(
         native_latent_ptr,
-        cute.make_ordered_layout(
-            (TOKENS, LATENT_K, CLUSTERS * TILES), order=(1, 0, 2)
-        ),
+        cute.make_ordered_layout((TOKENS, LATENT_K, CLUSTERS * TILES), order=(1, 0, 2)),
     )
     g_native_latent_transpose = cute.make_tensor(
         g_native_latent.iterator,
@@ -2317,16 +2235,14 @@ def ownership_probe(
     mixed_pv_b_op = sm100_utils.cluster_shape_to_tma_atom_B(
         CLUSTER_SHAPE_MNK[:2], mixed_pv_mma.thr_id
     )
-    tma_atom_mixed_pv_v, tma_tensor_mixed_pv_v = (
-        cute.nvgpu.make_tiled_tma_atom_B(
-            mixed_pv_b_op,
-            g_mixed_b_transpose,
-            cute.slice_(mixed_v_layout, (None, None, None, 0)),
-            MIXED_PV_TILER_MNK,
-            mixed_pv_mma,
-            cta_layout_vmnk.shape,
-            internal_type=MIXED_B_SMEM_DTYPE,
-        )
+    tma_atom_mixed_pv_v, tma_tensor_mixed_pv_v = cute.nvgpu.make_tiled_tma_atom_B(
+        mixed_pv_b_op,
+        g_mixed_b_transpose,
+        cute.slice_(mixed_v_layout, (None, None, None, 0)),
+        MIXED_PV_TILER_MNK,
+        mixed_pv_mma,
+        cta_layout_vmnk.shape,
+        internal_type=MIXED_B_SMEM_DTYPE,
     )
     mixed_pv_sfa_layout = blockscaled_utils.make_smem_layout_sfa(
         mixed_pv_mma, MIXED_PV_TILER_MNK, SF_VEC_SIZE, 1
@@ -2415,8 +2331,7 @@ def ownership_probe(
             f"!= {P_SMEM_BYTES}"
         )
     if cutlass.const_expr(
-        cute.size_in_bytes(cutlass.Float8E4M3FN, native_cache_v_layout)
-        > V_SMEM_BYTES
+        cute.size_in_bytes(cutlass.Float8E4M3FN, native_cache_v_layout) > V_SMEM_BYTES
     ):
         raise ValueError(
             "native V footprint exceeds candidate capacity: "
@@ -2427,9 +2342,7 @@ def ownership_probe(
         mixed_mma.partition_shape_C(MIXED_TILER_MNK[:2])
     ).layout
     mixed_acc_cols = utils.get_num_tmem_alloc_cols(
-        mixed_mma.make_fragment_C(
-            mixed_mma.partition_shape_C(MIXED_TILER_MNK[:2])
-        )
+        mixed_mma.make_fragment_C(mixed_mma.partition_shape_C(MIXED_TILER_MNK[:2]))
     )
     mixed_pv_output_cols = utils.get_num_tmem_alloc_cols(
         mixed_pv_mma.make_fragment_C(
@@ -2456,22 +2369,15 @@ def ownership_probe(
     if cutlass.const_expr(SCORE_OFFSET + mixed_acc_cols > OUTPUT_OFFSET):
         raise ValueError("score overlaps persistent output")
     if cutlass.const_expr(mixed_pv_output_cols != 128):
-        raise ValueError(
-            f"mixed PV output footprint changed: {mixed_pv_output_cols}"
-        )
+        raise ValueError(f"mixed PV output footprint changed: {mixed_pv_output_cols}")
     if cutlass.const_expr(native_pv_output_cols != 64):
-        raise ValueError(
-            f"native PV output footprint changed: {native_pv_output_cols}"
-        )
+        raise ValueError(f"native PV output footprint changed: {native_pv_output_cols}")
     if cutlass.const_expr(
-        OUTPUT_OFFSET
-        + mixed_pv_output_cols * MIXED_PV_LATENT_SLICES
-        != TMEM_ALLOC_COLS
+        OUTPUT_OFFSET + mixed_pv_output_cols * MIXED_PV_LATENT_SLICES != TMEM_ALLOC_COLS
     ):
         raise ValueError("two mixed PV outputs do not fill TMEM tail")
     if cutlass.const_expr(
-        OUTPUT_OFFSET
-        + native_pv_output_cols * NATIVE_PV_LATENT_SLICES
+        OUTPUT_OFFSET + native_pv_output_cols * NATIVE_PV_LATENT_SLICES
         != TMEM_ALLOC_COLS
     ):
         raise ValueError("four native PV outputs do not fill TMEM tail")
@@ -2630,9 +2536,7 @@ def expected(
         row_max_new = torch.maximum(row_max, tile_max)
         prior_correction = torch.ones_like(row_max)
         if tile > 0:
-            prior_correction = torch.exp2(
-                (row_max - row_max_new) * SOFTMAX_SCALE_LOG2
-            )
+            prior_correction = torch.exp2((row_max - row_max_new) * SOFTMAX_SCALE_LOG2)
         probabilities = torch.zeros_like(tile_scores)
         if not masked:
             probabilities = torch.exp2(
@@ -2642,9 +2546,7 @@ def expected(
         carrier = prior_carrier if masked else raw_carrier[tile]
         p_values = probabilities
         if not native_pv:
-            p_values = (
-                probabilities * token_scale[tile].float().unsqueeze(0) / carrier
-            )
+            p_values = probabilities * token_scale[tile].float().unsqueeze(0) / carrier
             if pv_scale_exp:
                 p_values = p_values * (2.0**-pv_scale_exp)
         p_tile = p_values.to(torch.float8_e4m3fn)
@@ -2657,11 +2559,7 @@ def expected(
             combined = prior_correction * prior_carrier / carrier
             no_correction = (combined == 1.0).to(torch.int32)
             advance_g = int(not masked and carrier != prior_carrier)
-        flags = (
-            no_correction
-            | (advance_g << 1)
-            | ((exponent + 127) << 8)
-        )
+        flags = no_correction | (advance_g << 1) | ((exponent + 127) << 8)
 
         p_tiles.append(p_tile)
         max_tiles.append(row_max_new)
@@ -2716,9 +2614,7 @@ def expected(
         running_tiles = []
         running_bounds = []
         for tile in range(TILES):
-            p_tile = p_expected_full[
-                tile, row_begin : row_begin + ROWS_PER_CTA
-            ].float()
+            p_tile = p_expected_full[tile, row_begin : row_begin + ROWS_PER_CTA].float()
             tile_output = pv_key[tile].T.double() @ p_tile.T.double()
             tile_abs = pv_key[tile].T.double().abs() @ p_tile.T.double().abs()
             if not native_pv and pv_scale_exp:
@@ -2732,7 +2628,9 @@ def expected(
                 sum_abs = tile_abs
             else:
                 factor = (
-                    correction_expected_full[tile, row_begin : row_begin + ROWS_PER_CTA, 2]
+                    correction_expected_full[
+                        tile, row_begin : row_begin + ROWS_PER_CTA, 2
+                    ]
                     * carrier_scale[tile - 1]
                     / carrier_scale[tile]
                 ).double()
@@ -2775,10 +2673,7 @@ def expected(
         ]
         reference_numerator = torch.zeros_like(running)
         for tile in range(TILES):
-            weighted = (
-                final_weights[tile]
-                * token_scale[tile].float().unsqueeze(0)
-            )
+            weighted = final_weights[tile] * token_scale[tile].float().unsqueeze(0)
             reference_numerator += key[tile].T.double() @ weighted.T.double()
         reference = reference_numerator / sum_expected_full[
             -1, row_begin : row_begin + ROWS_PER_CTA
@@ -2918,11 +2813,19 @@ def verify(
             matrix_cpu = matrix_output.cpu()
             for cta in range(matrix_cpu.shape[0]):
                 for latent_begin in range(0, LATENT_K, V_SLICE_COLS):
-                    actual_slice = matrix_cpu[cta, -1, latent_begin : latent_begin + V_SLICE_COLS]
-                    expected_slice = matrix_expected[cta, -1, latent_begin : latent_begin + V_SLICE_COLS]
+                    actual_slice = matrix_cpu[
+                        cta, -1, latent_begin : latent_begin + V_SLICE_COLS
+                    ]
+                    expected_slice = matrix_expected[
+                        cta, -1, latent_begin : latent_begin + V_SLICE_COLS
+                    ]
                     denominator = expected_slice.abs().sum().item()
-                    l1_ratio = actual_slice.abs().sum().item() / max(denominator, 1.0e-20)
-                    signed_ratio = actual_slice.sum().item() / max(expected_slice.sum().item(), 1.0e-20)
+                    l1_ratio = actual_slice.abs().sum().item() / max(
+                        denominator, 1.0e-20
+                    )
+                    signed_ratio = actual_slice.sum().item() / max(
+                        expected_slice.sum().item(), 1.0e-20
+                    )
                     print(
                         "S4_NATIVE_PV_DIAG "
                         f"cta={cta} latent_begin={latent_begin} "
@@ -2951,9 +2854,7 @@ def verify(
         rtol=0,
         atol=0,
     )
-    torch.testing.assert_close(
-        carrier_output.cpu(), carrier_expected, rtol=0, atol=0
-    )
+    torch.testing.assert_close(carrier_output.cpu(), carrier_expected, rtol=0, atol=0)
     quantized_contract_error = (normalized_expected - attention_reference).abs()
     print(
         "S4_C0_QUALITY "
@@ -3023,12 +2924,8 @@ def main() -> None:
     if args.stage_absolute_scales and not args.hoist_carrier_inverse:
         parser.error("scale staging requires --hoist-carrier-inverse")
     if args.parallel_carrier_reduction and not args.stage_absolute_scales:
-        parser.error(
-            "--parallel-carrier-reduction requires --stage-absolute-scales"
-        )
-    if args.native_pv and (
-        args.stage_absolute_scales or args.stage_normalized_scales
-    ):
+        parser.error("--parallel-carrier-reduction requires --stage-absolute-scales")
+    if args.native_pv and (args.stage_absolute_scales or args.stage_normalized_scales):
         parser.error("scale staging does not apply to native QK/PV")
     if args.pv_sfa_exp and args.pv_sfb_exp:
         parser.error("falsify mixed-PV SFA and SFB independently")
@@ -3139,9 +3036,7 @@ def main() -> None:
         ):
             payload = getattr(compiled, attribute, None)
             if payload is None:
-                raise RuntimeError(
-                    f"CUTE_DSL_KEEP=all did not retain {attribute}"
-                )
+                raise RuntimeError(f"CUTE_DSL_KEEP=all did not retain {attribute}")
             output_path = dump_dir / f"c0r.{suffix}"
             if binary:
                 output_path.write_bytes(payload)
@@ -3199,8 +3094,7 @@ def main() -> None:
     token_row = torch.arange(TOKENS, dtype=torch.int64).view(1, TOKENS)
     scale_factors = torch.tensor([1.0, 2.0, 0.5, 8.0, 4.0]).view(TILES, 1)
     token_scale = (
-        (0.75 + ((tile * 7 + token_row * 3) % 17).float() / 32.0)
-        * scale_factors
+        (0.75 + ((tile * 7 + token_row * 3) % 17).float() / 32.0) * scale_factors
     ).to(torch.bfloat16)
     pv_scale_falsifier = args.pv_sfa_exp + args.pv_sfb_exp
     if pv_scale_falsifier:
@@ -3214,9 +3108,9 @@ def main() -> None:
     native_latent_values = None
     need_native_latent = args.native_qk or bool(args.compare_native_windows)
     if need_native_latent:
-        native_latent_values = (
-            key.float() * token_scale.float().unsqueeze(-1)
-        ).to(torch.float8_e4m3fn)
+        native_latent_values = (key.float() * token_scale.float().unsqueeze(-1)).to(
+            torch.float8_e4m3fn
+        )
     candidate_expected_outputs = expected(
         query,
         key,
@@ -3238,9 +3132,9 @@ def main() -> None:
             pv_scale_exp=0,
             require_mixed_max_wins=False,
         )
-        expected_half_p = (
-            unity_scale_expected[0].float() * 0.5
-        ).to(torch.float8_e4m3fn)
+        expected_half_p = (unity_scale_expected[0].float() * 0.5).to(
+            torch.float8_e4m3fn
+        )
         torch.testing.assert_close(
             candidate_expected_outputs[0].view(torch.uint8),
             expected_half_p.view(torch.uint8),
@@ -3252,9 +3146,10 @@ def main() -> None:
             candidate_expected_outputs[0][:, nonmasked].float()
         ).all():
             raise AssertionError("P0 emitted a non-finite E4M3 value")
-        if torch.count_nonzero(
-            candidate_expected_outputs[0][:, nonmasked].float()
-        ) != candidate_expected_outputs[0][:, nonmasked].numel():
+        if (
+            torch.count_nonzero(candidate_expected_outputs[0][:, nonmasked].float())
+            != candidate_expected_outputs[0][:, nonmasked].numel()
+        ):
             raise AssertionError("P0 emitted a non-normal zero E4M3 value")
         for state_index in (1, 2, 5, 6, 7):
             torch.testing.assert_close(
@@ -3280,8 +3175,7 @@ def main() -> None:
 
     def repeat_clusters(values):
         return tuple(
-            value.repeat((args.clusters,) + (1,) * (value.ndim - 1))
-            for value in values
+            value.repeat((args.clusters,) + (1,) * (value.ndim - 1)) for value in values
         )
 
     expected_outputs_by_arm = {
@@ -3345,9 +3239,7 @@ def main() -> None:
     bf16_output = torch.empty(
         (ctas, LATENT_K, ROWS_PER_CTA), dtype=torch.bfloat16, device="cuda"
     )
-    carrier_output = torch.empty(
-        (ctas, TILES), dtype=torch.float32, device="cuda"
-    )
+    carrier_output = torch.empty((ctas, TILES), dtype=torch.float32, device="cuda")
     p_output = torch.empty(
         (ctas, TILES, ROWS_PER_CTA, TOKENS),
         dtype=torch.float8_e4m3fn,
@@ -3414,13 +3306,41 @@ def main() -> None:
         return torch.tensor(
             [
                 [
-                    1, 0, 64, 64, 20, 84, 8, 128, 64, 256, 256, 512,
-                    16384, 8192, args.overlap_setup, int(native_qk),
+                    1,
+                    0,
+                    64,
+                    64,
+                    20,
+                    84,
+                    8,
+                    128,
+                    64,
+                    256,
+                    256,
+                    512,
+                    16384,
+                    8192,
+                    args.overlap_setup,
+                    int(native_qk),
                     int(native_pv),
                 ],
                 [
-                    2, 0, 64, 64, 20, 84, 8, 128, 64, 256, 256, 512,
-                    16384, 8192, args.overlap_setup, int(native_qk),
+                    2,
+                    0,
+                    64,
+                    64,
+                    20,
+                    84,
+                    8,
+                    128,
+                    64,
+                    256,
+                    256,
+                    512,
+                    16384,
+                    8192,
+                    args.overlap_setup,
+                    int(native_qk),
                     int(native_pv),
                 ],
             ],
@@ -3494,9 +3414,13 @@ def main() -> None:
             comparison_graphs[arm] = graph
 
         for warmup in range(args.compare_native_warmups):
-            order = ("candidate", "native") if warmup % 2 == 0 else (
-                "native",
-                "candidate",
+            order = (
+                ("candidate", "native")
+                if warmup % 2 == 0
+                else (
+                    "native",
+                    "candidate",
+                )
             )
             for arm in order:
                 comparison_graphs[arm].replay()
@@ -3505,9 +3429,13 @@ def main() -> None:
         comparison_us = {"candidate": [], "native": []}
         comparison_orders = []
         for window in range(args.compare_native_windows):
-            order = ("candidate", "native") if window % 2 == 0 else (
-                "native",
-                "candidate",
+            order = (
+                ("candidate", "native")
+                if window % 2 == 0
+                else (
+                    "native",
+                    "candidate",
+                )
             )
             window_events = {}
             for arm in order:
@@ -3554,12 +3482,8 @@ def main() -> None:
             log_se = statistics.stdev(paired_log_ratios) / math.sqrt(
                 len(paired_log_ratios)
             )
-            ratio_ci_low = math.exp(
-                statistics.mean(paired_log_ratios) - 1.96 * log_se
-            )
-            ratio_ci_high = math.exp(
-                statistics.mean(paired_log_ratios) + 1.96 * log_se
-            )
+            ratio_ci_low = math.exp(statistics.mean(paired_log_ratios) - 1.96 * log_se)
+            ratio_ci_high = math.exp(statistics.mean(paired_log_ratios) + 1.96 * log_se)
         else:
             ratio_ci_low = float("nan")
             ratio_ci_high = float("nan")
