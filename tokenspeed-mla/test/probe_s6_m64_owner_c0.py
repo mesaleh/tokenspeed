@@ -253,7 +253,7 @@ def _build_inputs(heads: int):
     output_t = torch.zeros(
         (BATCH, SEQ_Q, heads, LATENT),
         device=device,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
     )
     lse_t = torch.zeros((BATCH, SEQ_Q, heads), device=device, dtype=torch.float32)
     dense_t = (
@@ -263,6 +263,22 @@ def _build_inputs(heads: int):
     )
     dense_output_t = torch.zeros_like(output_t)
     dense_lse_t = torch.zeros_like(lse_t)
+    dense_q_latent_t = q_latent_t.clone()
+    dense_q_rope_t = q_rope_t.clone()
+    dense_rope_t = rope_t.clone()
+    dense_page_table_t = page_table_t.clone()
+    dense_cache_seqs_t = cache_seqs_t.clone()
+    for name, candidate, dense in (
+        ("q_latent", q_latent_t, dense_q_latent_t),
+        ("q_rope", q_rope_t, dense_q_rope_t),
+        ("rope", rope_t, dense_rope_t),
+        ("page_table", page_table_t, dense_page_table_t),
+        ("cache_seqs", cache_seqs_t, dense_cache_seqs_t),
+        ("output", output_t, dense_output_t),
+        ("lse", lse_t, dense_lse_t),
+    ):
+        if candidate.data_ptr() == dense.data_ptr():
+            raise AssertionError(f"candidate/dense allocation alias: {name}")
 
     cute_inputs = {
         "q_latent": _cute_tensor(q_latent_t, cutlass.Float8E4M3FN, 3),
@@ -273,12 +289,27 @@ def _build_inputs(heads: int):
         "rope": _cute_tensor(rope_t, cutlass.Float8E4M3FN, 2),
         "page_table": _cute_tensor(page_table_t, cutlass.Int32, 1),
         "cache_seqs": _cute_tensor(cache_seqs_t, cutlass.Int32, 0),
-        "output": _cute_tensor(output_t, cutlass.Float8E4M3FN, 3),
+        "output": _cute_tensor(output_t, cutlass.BFloat16, 3),
         "lse": _cute_tensor(lse_t, cutlass.Float32, 2),
         "dense_output": _cute_tensor(
-            dense_output_t, cutlass.Float8E4M3FN, 3
+            dense_output_t, cutlass.BFloat16, 3
         ),
         "dense_lse": _cute_tensor(dense_lse_t, cutlass.Float32, 2),
+        "dense_q_latent": _cute_tensor(
+            dense_q_latent_t, cutlass.Float8E4M3FN, 3
+        ),
+        "dense_q_rope": _cute_tensor(
+            dense_q_rope_t, cutlass.Float8E4M3FN, 3
+        ),
+        "dense_rope": _cute_tensor(
+            dense_rope_t, cutlass.Float8E4M3FN, 2
+        ),
+        "dense_page_table": _cute_tensor(
+            dense_page_table_t, cutlass.Int32, 1
+        ),
+        "dense_cache_seqs": _cute_tensor(
+            dense_cache_seqs_t, cutlass.Int32, 0
+        ),
     }
     references = []
     for batch, length in enumerate(cache_lengths):
@@ -389,17 +420,17 @@ def _run_case(heads: int, run_graph: bool) -> None:
         )
         dense_compiled = cute.compile(
             dense_op,
-            inputs["q_latent"],
-            inputs["q_rope"],
+            inputs["dense_q_latent"],
+            inputs["dense_q_rope"],
             inputs["dense"],
-            inputs["rope"],
-            inputs["page_table"],
+            inputs["dense_rope"],
+            inputs["dense_page_table"],
             inputs["dense_output"],
             inputs["dense_lse"],
             None,
             1,
-            inputs["cache_seqs"],
-            inputs["cache_seqs"],
+            inputs["dense_cache_seqs"],
+            inputs["dense_cache_seqs"],
             None,
             softmax_scale,
             1.0,
@@ -408,17 +439,17 @@ def _run_case(heads: int, run_graph: bool) -> None:
             options="--enable-tvm-ffi --opt-level 3",
         )
         dense_args = (
-            inputs["q_latent"],
-            inputs["q_rope"],
+            inputs["dense_q_latent"],
+            inputs["dense_q_rope"],
             inputs["dense"],
-            inputs["rope"],
-            inputs["page_table"],
+            inputs["dense_rope"],
+            inputs["dense_page_table"],
             inputs["dense_output"],
             inputs["dense_lse"],
             None,
             1,
-            inputs["cache_seqs"],
-            inputs["cache_seqs"],
+            inputs["dense_cache_seqs"],
+            inputs["dense_cache_seqs"],
             None,
             softmax_scale,
             1.0,
@@ -521,7 +552,13 @@ def _run_case(heads: int, run_graph: bool) -> None:
             ]
             mean_log = statistics.fmean(log_ratios)
             standard_error = statistics.stdev(log_ratios) / math.sqrt(windows)
-            t_critical = 2.045229642 if windows == 30 else 2.262157163
+            t_critical = {
+                6: 2.570581836,
+                10: 2.262157163,
+                30: 2.045229642,
+            }.get(windows)
+            if t_critical is None:
+                raise ValueError("timing windows must be 6, 10, or 30")
             ratio = math.exp(mean_log)
             ci95_low = math.exp(mean_log - t_critical * standard_error)
             ci95_high = math.exp(mean_log + t_critical * standard_error)
@@ -547,9 +584,16 @@ def _run_case(heads: int, run_graph: bool) -> None:
 
 
 def main() -> None:
+    requested_heads = os.environ.get("TQ_S6_HEADS")
     head_cases = (
-        (8,) if os.environ.get("TQ_S6_DEBUG_Q1_ONLY") == "1" else HEAD_CASES
+        (int(requested_heads),)
+        if requested_heads is not None
+        else (8,)
+        if os.environ.get("TQ_S6_DEBUG_Q1_ONLY") == "1"
+        else HEAD_CASES
     )
+    if any(heads not in HEAD_CASES for heads in head_cases):
+        raise ValueError(f"TQ_S6_HEADS must be one of {HEAD_CASES}")
     for heads in head_cases:
         _run_case(heads, run_graph=heads == head_cases[-1])
     print(
