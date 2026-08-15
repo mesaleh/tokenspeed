@@ -362,6 +362,7 @@ def _surface_quality(
     q_inc: torch.Tensor,
     query_position: int,
     capture: Any,
+    dense_values: torch.Tensor,
     raw: torch.Tensor,
     row_scale: torch.Tensor,
     reconstruction: torch.Tensor,
@@ -390,7 +391,7 @@ def _surface_quality(
     n8_raw = n8_raw[eligible]
     n8_scale = n8_scale[eligible]
     n8_native_score = n8_native_score.to(torch.float32)
-    rotated_dense = n7.rotate(k_orig, signs)
+    rotated_dense = dense_values[eligible]
     dense_score = qn @ k_orig.transpose(0, 1) + qp @ rope.transpose(0, 1)
     n9_score = _whole_row_algebra_score(
         q_rot, raw, row_scale, q_rope, key_rope
@@ -554,9 +555,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         n8_layer = n8_layers[layer_id]
         n8_raw = n8_layer["raw_key_e2m1"].to(torch.float32)
         n8_scale = n8_layer["token_scale_bf16"].to(torch.float32)
-        rotated_dense = n8.N7.rotate(
-            capture.k_nope[:, 0].to(torch.float32), signs
+        carrier = n8.N7.quantize_rows(
+            capture.k_nope[:, 0].to(torch.float32), signs, family="k4"
         )
+        if not torch.equal(n8_raw, carrier.raw) or not torch.equal(
+            n8_scale, carrier.scale
+        ):
+            raise EvidenceError(f"accepted N8 carrier differs at layer={layer_id}")
+        rotated_dense = carrier.rotated_reference
         n9_error = reconstruction.to(torch.float64) - rotated_dense.to(torch.float64)
         n8_reconstruction = n8_raw * n8_scale.unsqueeze(-1)
         n8_error = n8_reconstruction.to(torch.float64) - rotated_dense.to(torch.float64)
@@ -580,6 +586,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     q_inc=q_inc,
                     query_position=query_position,
                     capture=capture,
+                    dense_values=rotated_dense,
                     raw=raw,
                     row_scale=row_scale,
                     reconstruction=reconstruction,
@@ -641,6 +648,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             n8_reconstruction,
             n9_error,
             n8_error,
+            carrier,
         )
         gc.collect()
     evaluated_keys = {
