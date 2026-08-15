@@ -18,15 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Probe N8 mixed FP8-query x FP4-key score composition on SM100.
+"""Probe mixed FP8-query x FP4-key score composition on SM100.
 
 Kimi MLA scores combine a 512-wide latent product with a 64-wide RoPE product.
 The N8 path keeps the rotated query in FP8, the persistent latent key in E2M1
-FP4, and the hardware UE8M0 block scales at unity. It multiplies the completed
-latent score by one nonuniform BF16 key-token scale, then accumulates ordinary
-FP8 RoPE into the same TMEM tile. Both operations use the one-CTA M=128 shape
-of TokenSpeed's production reader. This is a legality and ownership probe, not
-an attention benchmark or an endpoint speed gate.
+FP4. The accepted N8 mode keeps hardware UE8M0 block scales at unity and
+multiplies the completed latent score by one nonuniform BF16 key-token scale.
+The U0-S0 mode instead consumes a nonuniform UE8M0 scale for every token/K32
+group through CUTLASS's generated SFB layout. Both modes then accumulate
+ordinary FP8 RoPE into the same TMEM tile and use the one-CTA M=128 shape of
+TokenSpeed's production reader. This is a legality and ownership probe, not an
+attention benchmark or an endpoint speed gate.
 """
 
 import argparse
@@ -40,6 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -49,7 +52,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cute.runtime import make_fake_compact_tensor, make_ptr
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_ptr
 
 THREADS = 128
 CLUSTER_SHAPE_MNK = (1, 1, 1)
@@ -63,10 +66,12 @@ LATENT_K_TILES = LATENT_K // MIXED_TILER_MNK[2]
 SCALE_STAGES = LATENT_K_TILES
 ROPE_TILER_MNK = (128, 128, 128)
 SF_VEC_SIZE = 32
+SFB_GROUPS = LATENT_K // SF_VEC_SIZE
 SF_DTYPE = cutlass.Float8E8M0FNU
 TMEM_ALLOC_COLS = 512
 SCALE_SCRATCH_COLS = 128
 LIVE_SCALE_COLS = 16
+SFB_READBACK_COLS = 8
 # SM100 mxf8f6f4 uses U4_UNPACK_U8 to expand each persistent packed E2M1 value
 # into one byte in SMEM. The expanded byte is the instruction's E2M1 operand
 # container (not two packed values); persistent K4 stays densely packed in
@@ -108,14 +113,18 @@ def make_tiled_mmas():
 def mixed_accumulate_kernel(
     output: cute.Tensor,
     metadata: cute.Tensor,
+    scale_readback: cute.Tensor,
     token_scale: cute.Tensor,
     elapsed_ns: cute.Tensor,
+    sfb_storage: cute.Tensor,
     mixed_mma: cute.TiledMma,
     rope_mma: cute.TiledMma,
     tma_atom_a: cute.CopyAtom,
     tma_tensor_a: cute.Tensor,
     tma_atom_b: cute.CopyAtom,
     tma_tensor_b: cute.Tensor,
+    tma_atom_sfb: cute.CopyAtom,
+    tma_tensor_sfb: cute.Tensor,
     tma_atom_rope_a: cute.CopyAtom,
     tma_tensor_rope_a: cute.Tensor,
     tma_atom_rope_b: cute.CopyAtom,
@@ -153,6 +162,7 @@ def mixed_accumulate_kernel(
         byte_alignment=128,
         swizzle=mixed_b_layout.inner,
     )
+    s_sfb = smem.allocate_tensor(SF_DTYPE, sfb_layout, byte_alignment=128)
     s_rope_a = smem.allocate_tensor(
         cutlass.Float8E4M3FN,
         rope_a_layout.outer,
@@ -179,6 +189,11 @@ def mixed_accumulate_kernel(
         cute.slice_(MIXED_TILER_MNK, (0, None, None)),
         (None, None, None),
     )
+    g_sfb_nkl = cute.local_tile(
+        tma_tensor_sfb,
+        cute.slice_(MIXED_TILER_MNK, (0, None, None)),
+        (None, None, None),
+    )
     g_rope_a_mkl = cute.local_tile(
         tma_tensor_rope_a,
         cute.slice_(ROPE_TILER_MNK, (None, 0, None)),
@@ -193,6 +208,7 @@ def mixed_accumulate_kernel(
     thr_mma = mixed_mma.get_slice(mma_tile_coord_v)
     t_cg_a = thr_mma.partition_A(g_a_mkl)
     t_cg_b = thr_mma.partition_B(g_b_nkl)
+    t_cg_sfb = thr_mma.partition_B(g_sfb_nkl)
     a_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape)
     b_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape)
     t_as_a, t_ag_a = cpasync.tma_partition(
@@ -209,6 +225,15 @@ def mixed_accumulate_kernel(
         cute.group_modes(s_mixed_b, 0, 3),
         cute.group_modes(t_cg_b, 0, 3),
     )
+    t_bs_sfb, t_bg_sfb = cpasync.tma_partition(
+        tma_atom_sfb,
+        cta_coord_vmnk[1],
+        b_cta_layout,
+        cute.group_modes(s_sfb, 0, 3),
+        cute.group_modes(t_cg_sfb, 0, 3),
+    )
+    t_bs_sfb = cute.filter_zeros(t_bs_sfb)
+    t_bg_sfb = cute.filter_zeros(t_bg_sfb)
     rope_thr_mma = rope_mma.get_slice(mma_tile_coord_v)
     t_cg_rope_a = rope_thr_mma.partition_A(g_rope_a_mkl)
     t_cg_rope_b = rope_thr_mma.partition_B(g_rope_b_nkl)
@@ -233,6 +258,7 @@ def mixed_accumulate_kernel(
         print(f"T_BG_B={t_bg_b}")
     t_ag_a = t_ag_a[(None, 0, None, 0)]
     t_bg_b = t_bg_b[(None, 0, None, 0)]
+    t_bg_sfb = t_bg_sfb[(None, 0, None, 0)]
     t_ag_rope_a = t_ag_rope_a[(None, 0, None, 0)]
     t_bg_rope_b = t_bg_rope_b[(None, 0, None, 0)]
     ab_copy_bytes = (
@@ -243,6 +269,10 @@ def mixed_accumulate_kernel(
         + cute.size_in_bytes(
             cutlass.Float4E2M1FN,
             cute.slice_(s_mixed_b, (None, None, None, 0)),
+        )
+        + cute.size_in_bytes(
+            SF_DTYPE,
+            cute.slice_(s_sfb, (None, None, None, 0)),
         )
     ) * cute.size(mixed_mma.thr_id.shape)
     tma_barriers = pipeline.MbarrierArray(
@@ -328,6 +358,16 @@ def mixed_accumulate_kernel(
     )
     t_sfb = cute.make_tensor(sfb_tmem_ptr, t_sfb_layout)
 
+    scale_copy_atom = cute.make_copy_atom(
+        tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE), SF_DTYPE
+    )
+    sfb_copy = tcgen05.make_s2t_copy(scale_copy_atom, cute.filter_zeros(t_sfb))
+    sfb_thr = sfb_copy.get_slice(0)
+    sfb_source = tcgen05.get_s2t_smem_desc_tensor(
+        sfb_copy, sfb_thr.partition_S(cute.filter_zeros(s_sfb))
+    )
+    sfb_destination = sfb_thr.partition_D(cute.filter_zeros(t_sfb))
+
     if cutlass.const_expr(os.environ.get("TQ_N8_S0_POISON_SCALE_PADDING") == "1"):
         # Validation-only negative control: poison the entire aligned scale
         # scratch before overwriting the exact live footprint below. An exact
@@ -395,6 +435,12 @@ def mixed_accumulate_kernel(
                 t_bs_b[(None, latent_tile)],
                 tma_bar_ptr=tma_bar_ptr,
             )
+            cute.copy(
+                tma_atom_sfb,
+                t_bg_sfb[(None, latent_tile)],
+                t_bs_sfb[(None, latent_tile)],
+                tma_bar_ptr=tma_bar_ptr,
+            )
         rope_tma_bar_ptr = tma_barriers.get_barrier(LATENT_K_TILES)
         tma_barriers.arrive_and_expect_tx(LATENT_K_TILES, rope_copy_bytes)
         cute.copy(
@@ -415,6 +461,11 @@ def mixed_accumulate_kernel(
 
         for latent_tile in cutlass.range_constexpr(LATENT_K_TILES):
             tma_barriers.wait(latent_tile, 0)
+            cute.copy(
+                sfb_copy,
+                sfb_source[None, None, None, None, latent_tile],
+                sfb_destination,
+            )
             for k_block in cutlass.range(mixed_k_blocks, unroll_full=True):
                 mixed_mma.set(tcgen05.Field.SFA, t_sfa[None, None, k_block].iterator)
                 mixed_mma.set(tcgen05.Field.SFB, t_sfb[None, None, k_block].iterator)
@@ -521,6 +572,30 @@ def mixed_accumulate_kernel(
     cute.autovec_copy(registers, t_gmem)
     cute.arch.sync_threads()
 
+    # Read the raw physical SFB TMEM footprint after the second K256 stage.
+    # Logical score exactness proves placement; this byte-exact readback proves
+    # the stock S2T copy neither drops nor invents scale codes.
+    raw_sfb_tile = cute.make_tensor(
+        tmem_ptr + sfa_cols,
+        cute.make_layout((OBSERVED_M, sfb_cols), stride=(65536, 1)),
+    )
+    raw_sfb_output = cute.make_tensor(
+        scale_readback.iterator,
+        cute.make_layout((OBSERVED_M, sfb_cols), stride=(sfb_cols, 1)),
+    )
+    raw_sfb_load_atom = cute.make_copy_atom(
+        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(2)), cutlass.Float32
+    )
+    raw_sfb_load = tcgen05.make_tmem_copy(raw_sfb_load_atom, raw_sfb_tile)
+    raw_sfb_thr = raw_sfb_load.get_slice(tidx)
+    raw_sfb_source = raw_sfb_thr.partition_S(raw_sfb_tile)
+    raw_sfb_destination = raw_sfb_thr.partition_D(raw_sfb_output)
+    raw_sfb_registers = cute.make_fragment_like(raw_sfb_destination, cutlass.Float32)
+    cute.copy(raw_sfb_load, raw_sfb_source, raw_sfb_registers)
+    cute.arch.fence_view_async_tmem_load()
+    cute.autovec_copy(raw_sfb_registers, raw_sfb_destination)
+    cute.arch.sync_threads()
+
     if tidx == 0:
         elapsed_ns[cta_rank] = composition_end_ns - composition_start_ns
     if tidx == 0 and is_leader_cta:
@@ -546,8 +621,11 @@ def mixed_accumulate_probe(
     rope_b_ptr: cute.Pointer,
     output: cute.Tensor,
     metadata: cute.Tensor,
+    scale_readback: cute.Tensor,
     token_scale: cute.Tensor,
     elapsed_ns: cute.Tensor,
+    sfb_storage: cute.Tensor,
+    stream,
 ):
     mixed_mma, rope_mma = make_tiled_mmas()
     g_mixed_a = cute.make_tensor(
@@ -606,16 +684,45 @@ def mixed_accumulate_probe(
     sfb_layout = blockscaled_utils.make_smem_layout_sfb(
         mixed_mma, MIXED_TILER_MNK, SF_VEC_SIZE, SCALE_STAGES
     )
+    m_sfb = cute.make_tensor(
+        sfb_storage.iterator,
+        blockscaled_utils.tile_atom_to_shape_SF(
+            (MIXED_TILER_MNK[1], LATENT_K, 1), SF_VEC_SIZE
+        ),
+    )
+    sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
+        CLUSTER_SHAPE_MNK[:2], mixed_mma.thr_id
+    )
+    tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
+        sfb_op,
+        m_sfb,
+        cute.slice_(sfb_layout, (None, None, None, 0)),
+        MIXED_TILER_MNK,
+        mixed_mma,
+        cta_layout_vmnk.shape,
+        internal_type=cutlass.Int16,
+    )
     if os.environ.get("TQ_N8_S0_PRINT_LAYOUTS") == "1":
         print(f"CTA_LAYOUT_VMNK={cta_layout_vmnk}")
         print(f"TMA_TENSOR_A={tma_tensor_a}")
         print(f"TMA_TENSOR_B={tma_tensor_b}")
         print(f"MIXED_A_LAYOUT={mixed_a_layout}")
         print(f"MIXED_B_LAYOUT={mixed_b_layout}")
-        print(
-            "AB_COPY_BYTES_PER_CTA="
-            f"{cute.size_in_bytes(cutlass.Float8E4M3FN, cute.slice_(mixed_a_layout, (None, None, None, 0))) + cute.size_in_bytes(cutlass.Float4E2M1FN, cute.slice_(mixed_b_layout, (None, None, None, 0)))}"
+        debug_ab_copy_bytes = (
+            cute.size_in_bytes(
+                cutlass.Float8E4M3FN,
+                cute.slice_(mixed_a_layout, (None, None, None, 0)),
+            )
+            + cute.size_in_bytes(
+                cutlass.Float4E2M1FN,
+                cute.slice_(mixed_b_layout, (None, None, None, 0)),
+            )
+            + cute.size_in_bytes(
+                SF_DTYPE,
+                cute.slice_(sfb_layout, (None, None, None, 0)),
+            )
         )
+        print("AB_COPY_BYTES_PER_CTA=" f"{debug_ab_copy_bytes}")
         print(f"SFA_SMEM_LAYOUT={sfa_layout}")
         print(f"SFB_SMEM_LAYOUT={sfb_layout}")
     rope_a_layout = sm100_utils.make_smem_layout_a(
@@ -692,14 +799,18 @@ def mixed_accumulate_probe(
     kernel = mixed_accumulate_kernel(
         output,
         metadata,
+        scale_readback,
         token_scale,
         elapsed_ns,
+        sfb_storage,
         mixed_mma,
         rope_mma,
         tma_atom_a,
         tma_tensor_a,
         tma_atom_b,
         tma_tensor_b,
+        tma_atom_sfb,
+        tma_tensor_sfb,
         tma_atom_rope_a,
         tma_tensor_rope_a,
         tma_atom_rope_b,
@@ -720,10 +831,110 @@ def mixed_accumulate_probe(
         grid=CLUSTER_SHAPE_MNK,
         block=(THREADS, 1, 1),
         min_blocks_per_mp=1,
+        stream=stream,
     )
 
 
+def make_ue8m0_sfb_storage(codes: torch.Tensor) -> torch.Tensor:
+    """Pack logical [token, K32-group] UE8M0 codes in CUTLASS SF order."""
+    expected_shape = (128, SFB_GROUPS)
+    if tuple(codes.shape) != expected_shape or codes.dtype != torch.uint8:
+        raise ValueError(
+            f"expected uint8 SFB codes with shape {expected_shape}, got "
+            f"{codes.dtype} {tuple(codes.shape)}"
+        )
+    codes = codes.cpu().contiguous()
+    storage = torch.empty(codes.numel(), dtype=torch.uint8)
+    seen = torch.zeros_like(storage, dtype=torch.bool)
+    for token in range(128):
+        atom_token = token % 32
+        token_quadrant = (token // 32) % 4
+        token_rest = token // 128
+        for k_group in range(SFB_GROUPS):
+            k_quadrant = k_group % 4
+            k_block = k_group // 4
+            offset = (
+                atom_token * 16
+                + token_quadrant * 4
+                + token_rest * (128 * SFB_GROUPS)
+                + k_quadrant
+                + k_block * 512
+            )
+            if seen[offset]:
+                raise AssertionError(f"duplicate SFB storage offset: {offset}")
+            storage[offset] = codes[token, k_group]
+            seen[offset] = True
+    if not bool(seen.all()):
+        raise AssertionError("SFB storage mapping left physical holes")
+    return storage.cuda().view(torch.float8_e8m0fnu)
+
+
+def make_u0_full_period_sfb_codes() -> torch.Tensor:
+    """Return distinct token and K32-group exponent signatures."""
+    token = torch.arange(128, dtype=torch.int64).view(128, 1)
+    group = torch.arange(SFB_GROUPS, dtype=torch.int64).view(1, SFB_GROUPS)
+    exponent = (
+        token * 73
+        + group * 29
+        + token * group * 17
+        + torch.bitwise_xor(token, group * 11) * 13
+        + token * token * (group + 1)
+    ) % 9 - 4
+    codes = (exponent + 127).to(torch.uint8)
+    if torch.unique(codes, dim=0).shape[0] != 128:
+        raise AssertionError("U0 SFB token signatures are not all distinct")
+    if torch.unique(codes.transpose(0, 1), dim=0).shape[0] != SFB_GROUPS:
+        raise AssertionError("U0 SFB K32-group signatures are not all distinct")
+    return codes
+
+
+def group_scaled_latent_reference(
+    query: torch.Tensor, key: torch.Tensor, codes: torch.Tensor
+) -> torch.Tensor:
+    """Reproduce K32 instruction-order accumulation with logical SFB codes."""
+    result = torch.zeros(
+        (query.shape[0], key.shape[0]), device="cuda", dtype=torch.float32
+    )
+    codes_cuda = codes.to(device="cuda", dtype=torch.int32)
+    query = query.to(device="cuda", dtype=torch.float32)
+    key = key.to(device="cuda", dtype=torch.float32)
+    for group in range(SFB_GROUPS):
+        start = group * SF_VEC_SIZE
+        stop = start + SF_VEC_SIZE
+        partial = query[:, start:stop] @ key[:, start:stop].transpose(0, 1)
+        scale = torch.ldexp(
+            torch.ones(128, device="cuda", dtype=torch.float32),
+            codes_cuda[:, group] - 127,
+        )
+        result = result + partial * scale.view(1, 128)
+    return result
+
+
+def validate_sfb_readback(
+    scale_readback: torch.Tensor, codes: torch.Tensor
+) -> torch.Tensor:
+    """Validate the four-way raw TMEM replication of the final K256 stage."""
+    raw = scale_readback.detach().contiguous().view(torch.uint8).cpu().flatten()
+    if raw.numel() != 128 * SFB_READBACK_COLS * 4:
+        raise AssertionError(f"unexpected SFB readback byte count: {raw.numel()}")
+    expected_codes = codes[:, SFB_GROUPS // 2 :].contiguous().flatten()
+    expected_counts = torch.bincount(expected_codes.to(torch.int64), minlength=256) * 4
+    observed_counts = torch.bincount(raw.to(torch.int64), minlength=256)
+    if not torch.equal(observed_counts, expected_counts):
+        mismatch = torch.nonzero(
+            observed_counts != expected_counts, as_tuple=False
+        ).flatten()
+        raise AssertionError(
+            "SFB raw readback histogram differs for codes " f"{mismatch.tolist()}"
+        )
+    return raw
+
+
 def _synthetic_main() -> None:
+    process_start_ns = time.time_ns()
+    process_id = os.getpid()
+    run_nonce = secrets.token_hex(16)
+    u0_mode = os.environ.get("TQ_U0_S0_SYNTHETIC") == "1"
     compiled = cute.compile(
         mixed_accumulate_probe,
         make_ptr(
@@ -763,6 +974,12 @@ def _synthetic_main() -> None:
             assumed_align=4,
         ),
         make_fake_compact_tensor(
+            cutlass.Float32,
+            (OBSERVED_M, SFB_READBACK_COLS),
+            stride_order=(1, 0),
+            assumed_align=16,
+        ),
+        make_fake_compact_tensor(
             cutlass.BFloat16,
             (128,),
             stride_order=(0,),
@@ -774,23 +991,46 @@ def _synthetic_main() -> None:
             stride_order=(0,),
             assumed_align=8,
         ),
+        make_fake_compact_tensor(
+            SF_DTYPE,
+            (128 * SFB_GROUPS,),
+            stride_order=(0,),
+            assumed_align=32,
+        ),
+        make_fake_stream(),
         options="--enable-tvm-ffi --opt-level 3",
     )
     if os.environ.get("TQ_N8_S0_COMPILE_ONLY") == "1":
+        token_scale_mode = "unity" if u0_mode else "bf16_post_mma"
         print(
             "PASS compile_only=True mixed_fp8_query_fp4_key=True "
-            "sfa=unity sfb=unity token_scale=bf16_post_mma "
+            f"sfa=unity sfb={'nonuniform_group32' if u0_mode else 'unity'} "
+            f"token_scale={token_scale_mode} "
             f"tmem_alloc_cols={TMEM_ALLOC_COLS}"
         )
         return
 
     output = torch.empty((1, OBSERVED_M, 128), device="cuda", dtype=torch.float32)
     metadata = torch.empty(5, device="cuda", dtype=torch.int32)
+    scale_readback = torch.empty(
+        (OBSERVED_M, SFB_READBACK_COLS), device="cuda", dtype=torch.float32
+    )
     elapsed_ns = torch.empty(1, device="cuda", dtype=torch.int64)
+    eager_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    sfb_codes = (
+        make_u0_full_period_sfb_codes()
+        if u0_mode
+        else torch.full((128, SFB_GROUPS), 127, dtype=torch.uint8)
+    )
+    sfb_storage = make_ue8m0_sfb_storage(sfb_codes)
 
     token_scale = (
-        1.0 + torch.arange(128, device="cuda", dtype=torch.float32) / 128.0
-    ).to(torch.bfloat16)
+        torch.ones(128, device="cuda", dtype=torch.bfloat16)
+        if u0_mode
+        else (1.0 + torch.arange(128, device="cuda", dtype=torch.float32) / 128.0).to(
+            torch.bfloat16
+        )
+    )
     all_rows = torch.arange(OBSERVED_M, device="cuda", dtype=torch.int64)
     token_ids = torch.arange(128, device="cuda", dtype=torch.int64)
     latent_ids = torch.arange(LATENT_K, device="cuda", dtype=torch.int64)
@@ -869,7 +1109,11 @@ def _synthetic_main() -> None:
         cutlass.Float8E4M3FN,
         is_dynamic_layout=True,
     )
-    latent_expected = query_value.float() @ key_value.float().T
+    latent_expected = (
+        group_scaled_latent_reference(query_value, key_value, sfb_codes)
+        if u0_mode
+        else query_value.float() @ key_value.float().T
+    )
     if torch.unique(latent_expected, dim=0).shape[0] != 128:
         raise AssertionError("latent oracle does not distinguish all output rows")
     if torch.unique(latent_expected.T, dim=0).shape[0] != 128:
@@ -887,8 +1131,11 @@ def _synthetic_main() -> None:
         rope_b_cute.iterator,
         output,
         metadata,
+        scale_readback,
         token_scale,
         elapsed_ns,
+        sfb_storage,
+        eager_stream,
     )
     torch.cuda.synchronize()
     if not torch.equal(output, token_expected):
@@ -914,6 +1161,162 @@ def _synthetic_main() -> None:
             )
     torch.testing.assert_close(output, token_expected, rtol=0, atol=0)
 
+    if u0_mode:
+        normal = output.clone()
+        normal_scale_raw = validate_sfb_readback(scale_readback, sfb_codes)
+
+        coordinate_key = key_value.clone()
+        coordinate_key[73, 349] = 4
+        coordinate_key_cute = _to_cute_tensor(
+            coordinate_key.float().view(128, LATENT_K, 1),
+            cutlass.Float4E2M1FN,
+        )
+        coordinate_expected = group_scaled_latent_reference(
+            query_value, coordinate_key, sfb_codes
+        ).view_as(output)
+        for _ in range(4):
+            coordinate_expected = coordinate_expected + 32.0
+        compiled(
+            query_cute.iterator,
+            coordinate_key_cute.iterator,
+            rope_a_cute.iterator,
+            rope_b_cute.iterator,
+            output,
+            metadata,
+            scale_readback,
+            token_scale,
+            elapsed_ns,
+            sfb_storage,
+            eager_stream,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, coordinate_expected, rtol=0, atol=0)
+        if not torch.equal(
+            validate_sfb_readback(scale_readback, sfb_codes), normal_scale_raw
+        ):
+            raise AssertionError("coordinate poison changed SFB TMEM readback")
+        coordinate_changed = output != normal
+        if bool(coordinate_changed[:, :, :73].any()) or bool(
+            coordinate_changed[:, :, 74:].any()
+        ):
+            raise AssertionError("one-coordinate poison escaped token 73")
+        if not bool(coordinate_changed[:, :, 73].any()):
+            raise AssertionError("one-coordinate poison was not observable")
+
+        scale_codes = sfb_codes.clone()
+        scale_codes[91, 11] += 1
+        scale_storage = make_ue8m0_sfb_storage(scale_codes)
+        scale_expected = group_scaled_latent_reference(
+            query_value, key_value, scale_codes
+        ).view_as(output)
+        for _ in range(4):
+            scale_expected = scale_expected + 32.0
+        compiled(
+            query_cute.iterator,
+            key_cute.iterator,
+            rope_a_cute.iterator,
+            rope_b_cute.iterator,
+            output,
+            metadata,
+            scale_readback,
+            token_scale,
+            elapsed_ns,
+            scale_storage,
+            eager_stream,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, scale_expected, rtol=0, atol=0)
+        scale_raw = validate_sfb_readback(scale_readback, scale_codes)
+        raw_change = scale_raw != normal_scale_raw
+        if int(raw_change.sum().item()) != 4:
+            raise AssertionError(
+                "one SFB slot must change exactly four replicated TMEM bytes, "
+                f"observed {int(raw_change.sum().item())}"
+            )
+        if not bool(
+            (
+                scale_raw[raw_change].to(torch.int16)
+                == normal_scale_raw[raw_change].to(torch.int16) + 1
+            ).all()
+        ):
+            raise AssertionError("one SFB slot changed unexpected raw byte values")
+        scale_changed = output != normal
+        if bool(scale_changed[:, :, :91].any()) or bool(scale_changed[:, :, 92:].any()):
+            raise AssertionError("one-scale-slot poison escaped token 91")
+        if not bool(scale_changed[:, :, 91].any()):
+            raise AssertionError("one-scale-slot poison was not observable")
+
+        # Restore the primary U0 case before graph and component timing.
+        compiled(
+            query_cute.iterator,
+            key_cute.iterator,
+            rope_a_cute.iterator,
+            rope_b_cute.iterator,
+            output,
+            metadata,
+            scale_readback,
+            token_scale,
+            elapsed_ns,
+            sfb_storage,
+            eager_stream,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, token_expected, rtol=0, atol=0)
+
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        graph_stream = cuda_driver.CUstream(capture_stream.cuda_stream)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            compiled(
+                query_cute.iterator,
+                key_cute.iterator,
+                rope_a_cute.iterator,
+                rope_b_cute.iterator,
+                output,
+                metadata,
+                scale_readback,
+                token_scale,
+                elapsed_ns,
+                sfb_storage,
+                graph_stream,
+            )
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            compiled(
+                query_cute.iterator,
+                key_cute.iterator,
+                rope_a_cute.iterator,
+                rope_b_cute.iterator,
+                output,
+                metadata,
+                scale_readback,
+                token_scale,
+                elapsed_ns,
+                sfb_storage,
+                graph_stream,
+            )
+        torch.cuda.synchronize()
+        output.fill_(float("nan"))
+        scale_readback.zero_()
+        torch.cuda.synchronize()
+        allocation_after_capture = torch.cuda.memory_allocated()
+        for _ in range(100):
+            graph.replay()
+        torch.cuda.synchronize()
+        allocation_after_replay = torch.cuda.memory_allocated()
+        graph_allocation_growth = allocation_after_replay - allocation_after_capture
+        if graph_allocation_growth != 0:
+            raise AssertionError(
+                f"graph100 allocation grew by {graph_allocation_growth} bytes"
+            )
+        torch.testing.assert_close(output, token_expected, rtol=0, atol=0)
+        if not torch.equal(
+            validate_sfb_readback(scale_readback, sfb_codes), normal_scale_raw
+        ):
+            raise AssertionError("graph replay changed SFB TMEM readback")
+
     samples_ns = []
     for _ in range(20):
         compiled(
@@ -923,27 +1326,109 @@ def _synthetic_main() -> None:
             rope_b_cute.iterator,
             output,
             metadata,
+            scale_readback,
             token_scale,
             elapsed_ns,
+            sfb_storage,
+            eager_stream,
         )
         torch.cuda.synchronize()
         samples_ns.append(max(elapsed_ns.cpu().tolist()))
 
     acc_cols, sfa_cols, sfb_cols, total_cols, allocated_cols = metadata.cpu().tolist()
-    print(
+    token_scale_mode = "unity" if u0_mode else "bf16_post_mma"
+    pass_line = (
         "PASS mixed_fp8_query_fp4_key=True same_score_tile_serialization=True "
         "cta_group=1 ownership_case=full_period_row_token_k_tma_unpack "
         "row_signatures=128 token_signatures=128 ab_stages=2 "
         "u4_unpack_u8=True "
-        "sfa=unity sfb=unity "
+        f"sfa=unity sfb={'nonuniform_group32' if u0_mode else 'unity'} "
+        f"one_coordinate_poison={u0_mode} one_scale_slot_poison={u0_mode} "
+        f"exact_scale_readback={u0_mode} "
+        f"graph_replays={100 if u0_mode else 0} "
+        f"graph_allocation_growth={graph_allocation_growth if u0_mode else 'na'} "
         f"scale_padding_poisoned={os.environ.get('TQ_N8_S0_POISON_SCALE_PADDING') == '1'} "
-        "token_scale=bf16_post_mma "
+        f"token_scale={token_scale_mode} "
         "score_workspace_bytes=0 "
         f"acc_cols={acc_cols} sfa_cols={sfa_cols} sfb_cols={sfb_cols} "
         f"total_cols={total_cols} allocated_cols={allocated_cols} "
         f"serialization_median_ns={statistics.median(samples_ns):.1f} "
         f"serialization_max_ns={max(samples_ns)}"
     )
+    print(pass_line)
+
+    result_dir_value = os.environ.get("TQ_SYNTHETIC_RESULT_DIR")
+    if result_dir_value:
+        output_bytes = output.detach().contiguous().cpu().numpy().tobytes(order="C")
+        scale_bytes = (
+            normal_scale_raw.contiguous().numpy().tobytes(order="C") if u0_mode else b""
+        )
+        try:
+            cutlass_version = importlib.metadata.version("nvidia-cutlass-dsl")
+        except importlib.metadata.PackageNotFoundError:
+            cutlass_version = "unknown"
+        result = {
+            "schema_version": 1,
+            "experiment_id": "a17-u0-s0-20260814",
+            "mode": "u0_nonuniform_group32" if u0_mode else "n8_unity",
+            "process_id": process_id,
+            "process_start_ns": process_start_ns,
+            "process_end_ns": time.time_ns(),
+            "run_nonce": run_nonce,
+            "runner_source_sha256": _sha256_file(Path(__file__)),
+            "dependency_manifest_sha256": os.environ.get(
+                "TQ_DEPENDENCY_MANIFEST_SHA256", ""
+            ),
+            "image_digest": os.environ.get("TQ_IMAGE_DIGEST", ""),
+            "pod_name": os.environ.get("HOSTNAME", ""),
+            "node_name": os.environ.get("TQ_NODE_NAME", ""),
+            "device_name": torch.cuda.get_device_name(0),
+            "cuda_version": torch.version.cuda,
+            "torch_version": torch.__version__,
+            "cutlass_dsl_version": cutlass_version,
+            "scale_padding_poisoned": os.environ.get("TQ_N8_S0_POISON_SCALE_PADDING")
+            == "1",
+            "one_coordinate_poison": u0_mode,
+            "one_scale_slot_poison": u0_mode,
+            "exact_scale_readback": u0_mode,
+            "graph_replays": 100 if u0_mode else 0,
+            "graph_allocation_growth_bytes": (
+                graph_allocation_growth if u0_mode else None
+            ),
+            "token_scale": token_scale_mode,
+            "metadata": [
+                acc_cols,
+                sfa_cols,
+                sfb_cols,
+                total_cols,
+                allocated_cols,
+            ],
+            "serialization_samples_ns": samples_ns,
+            "serialization_median_ns": statistics.median(samples_ns),
+            "serialization_max_ns": max(samples_ns),
+            "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+            "scale_readback_sha256": (
+                hashlib.sha256(scale_bytes).hexdigest() if u0_mode else None
+            ),
+            "pass_line": pass_line,
+        }
+        result_bytes = _canonical_json_bytes(result) + b"\n"
+        result_dir = Path(result_dir_value)
+        _atomic_bytes(result_dir / "result.json", result_bytes)
+        identity = {
+            "schema_version": 1,
+            "experiment_id": result["experiment_id"],
+            "process_id": process_id,
+            "process_start_ns": process_start_ns,
+            "process_end_ns": result["process_end_ns"],
+            "run_nonce": run_nonce,
+            "runner_source_sha256": result["runner_source_sha256"],
+            "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        }
+        _atomic_bytes(
+            result_dir / "run-identity.json",
+            _canonical_json_bytes(identity) + b"\n",
+        )
 
 
 S0_PARENT_COMMIT = "45e3fa1c1c33826e023dc8b0234ed13c0fcfb503"
@@ -1021,6 +1506,12 @@ def _compile_native_probe():
             assumed_align=4,
         ),
         make_fake_compact_tensor(
+            cutlass.Float32,
+            (OBSERVED_M, SFB_READBACK_COLS),
+            stride_order=(1, 0),
+            assumed_align=16,
+        ),
+        make_fake_compact_tensor(
             cutlass.BFloat16,
             (TILE_TOKENS,),
             stride_order=(0,),
@@ -1032,6 +1523,13 @@ def _compile_native_probe():
             stride_order=(0,),
             assumed_align=8,
         ),
+        make_fake_compact_tensor(
+            SF_DTYPE,
+            (128 * SFB_GROUPS,),
+            stride_order=(0,),
+            assumed_align=32,
+        ),
+        make_fake_stream(),
         options="--enable-tvm-ffi --opt-level 3",
     )
 
@@ -1106,7 +1604,14 @@ def _run_surface(
         (1, OBSERVED_M, TILE_TOKENS), device="cuda", dtype=torch.float32
     )
     metadata = torch.empty(5, device="cuda", dtype=torch.int32)
+    scale_readback = torch.empty(
+        (OBSERVED_M, SFB_READBACK_COLS), device="cuda", dtype=torch.float32
+    )
     elapsed_ns = torch.empty(1, device="cuda", dtype=torch.int64)
+    eager_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    sfb_storage = make_ue8m0_sfb_storage(
+        torch.full((128, SFB_GROUPS), 127, dtype=torch.uint8)
+    )
     for start in range(0, key_count, TILE_TOKENS):
         valid = min(TILE_TOKENS, key_count - start)
         key, token_scale, key_rope = _prepare_key_tile(layer, start, valid, control)
@@ -1117,8 +1622,11 @@ def _run_surface(
             key_rope.iterator,
             output,
             metadata,
+            scale_readback,
             token_scale,
             elapsed_ns,
+            sfb_storage,
+            eager_stream,
         )
         torch.cuda.synchronize()
         tile = output[0, :VALID_HEADS, :valid].cpu()
@@ -1261,7 +1769,10 @@ def _run_native_campaign(
 
 
 def main() -> None:
-    if os.environ.get("TQ_N8_Q1_SYNTHETIC") == "1":
+    if (
+        os.environ.get("TQ_N8_Q1_SYNTHETIC") == "1"
+        or os.environ.get("TQ_U0_S0_SYNTHETIC") == "1"
+    ):
         _synthetic_main()
         return
     parser = argparse.ArgumentParser()
