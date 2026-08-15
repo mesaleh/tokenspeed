@@ -24,10 +24,14 @@ repos:
     rev: 8.0.1
     hooks:
       - id: isort
+        # A8 hashes this accepted oracle's exact source bytes at runtime.
+        exclude: ^tokenspeed-mla/test/probe_sm100_tq_qkp_replicated\.py$
   - repo: https://github.com/psf/black
     rev: 26.3.1
     hooks:
       - id: black-jupyter
+        # Keep the same byte-frozen A8 oracle out of mechanical rewrites.
+        exclude: ^tokenspeed-mla/test/probe_sm100_tq_qkp_replicated\.py$
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.1
     hooks:

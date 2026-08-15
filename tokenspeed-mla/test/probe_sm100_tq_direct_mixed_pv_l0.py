@@ -133,9 +133,7 @@ def direct_mixed_pv_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     cta_global, _, _ = cute.arch.block_idx()
     cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    cluster_index = cute.arch.make_warp_uniform(
-        cta_global // CLUSTER_SHAPE_MNK[0]
-    )
+    cluster_index = cute.arch.make_warp_uniform(cta_global // CLUSTER_SHAPE_MNK[0])
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
@@ -181,12 +179,8 @@ def direct_mixed_pv_kernel(
     mixed_thr_mma = mixed_pv_mma.get_slice(mma_tile_coord)
     t_cg_p = mixed_thr_mma.partition_A(g_p_mkl)
     t_cg_v = mixed_thr_mma.partition_B(g_v_nkl)
-    a_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape
-    )
-    b_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape
-    )
+    a_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape)
+    b_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape)
     t_ps_p, t_pg_p = cpasync.tma_partition(
         tma_atom_p,
         cta_coord_vmnk[2],
@@ -324,12 +318,8 @@ def direct_mixed_pv_kernel(
         )
         sfa_byte = 0x7F + SFA_EXP
         sfb_byte = 0x7F + SFB_EXP
-        sfa_word = cutlass.Uint32(sfa_byte * 0x01010101).bitcast(
-            cutlass.Float32
-        )
-        sfb_word = cutlass.Uint32(sfb_byte * 0x01010101).bitcast(
-            cutlass.Float32
-        )
+        sfa_word = cutlass.Uint32(sfa_byte * 0x01010101).bitcast(cutlass.Float32)
+        sfb_word = cutlass.Uint32(sfb_byte * 0x01010101).bitcast(cutlass.Float32)
         poison_word = cutlass.Uint32(0x81818181).bitcast(cutlass.Float32)
         # Full controls initialize the complete 0..63 defensive reserve.
         # Compact I1 arms initialize the one 16-column tile containing every
@@ -339,16 +329,12 @@ def direct_mixed_pv_kernel(
                 tmem_ptr + SCALE_OFFSET + scale_block * 16,
                 cute.make_layout((ROWS, 16), stride=(1 << 16, 1)),
             )
-            scale_init = tcgen05.make_tmem_copy(
-                scale_init_atom, scale_init_tile
-            )
+            scale_init = tcgen05.make_tmem_copy(scale_init_atom, scale_init_tile)
             scale_init_thr = scale_init.get_slice(tidx)
             scale_coords = cute.make_identity_tensor(scale_init_tile.shape)
             scale_regs_layout = scale_init_thr.partition_S(scale_coords)
             scale_dst = scale_init_thr.partition_D(scale_init_tile)
-            scale_regs = cute.make_fragment_like(
-                scale_regs_layout, cutlass.Float32
-            )
+            scale_regs = cute.make_fragment_like(scale_regs_layout, cutlass.Float32)
             for element in cutlass.range_constexpr(cute.size(scale_regs)):
                 scale_col = scale_block * 16 + element
                 if cutlass.const_expr(scale_col < sfa_cols):
@@ -368,12 +354,8 @@ def direct_mixed_pv_kernel(
 
     if tidx == 0 and cluster_index == 0:
         layout_output[cta_rank, 0] = cta_rank + 1
-        layout_output[cta_rank, 1] = cute.size_in_bytes(
-            cutlass.Float8E4M3FN, p_smem
-        )
-        layout_output[cta_rank, 2] = cute.size_in_bytes(
-            cutlass.Float4E2M1FN, v_smem
-        )
+        layout_output[cta_rank, 1] = cute.size_in_bytes(cutlass.Float8E4M3FN, p_smem)
+        layout_output[cta_rank, 2] = cute.size_in_bytes(cutlass.Float4E2M1FN, v_smem)
         layout_output[cta_rank, 3] = sfa_cols
         layout_output[cta_rank, 4] = sfb_cols
         layout_output[cta_rank, 5] = k_blocks
@@ -416,12 +398,8 @@ def direct_mixed_pv_kernel(
         if cutlass.const_expr(ISSUE_MMA == 1):
             mixed_pv_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(k_blocks, unroll_full=True):
-                mixed_pv_mma.set(
-                    tcgen05.Field.SFA, t_sfa[None, None, k_block].iterator
-                )
-                mixed_pv_mma.set(
-                    tcgen05.Field.SFB, t_sfb[None, None, k_block].iterator
-                )
+                mixed_pv_mma.set(tcgen05.Field.SFA, t_sfa[None, None, k_block].iterator)
+                mixed_pv_mma.set(tcgen05.Field.SFB, t_sfb[None, None, k_block].iterator)
                 cute.gemm(
                     mixed_pv_mma,
                     accumulator,
@@ -523,8 +501,7 @@ def direct_mixed_pv_probe(
             f"!= {P_SMEM_BYTES}"
         )
     if cutlass.const_expr(
-        cute.size_in_bytes(MIXED_B_SMEM_DTYPE, v_layout)
-        != V_SMEM_STORAGE_BYTES
+        cute.size_in_bytes(MIXED_B_SMEM_DTYPE, v_layout) != V_SMEM_STORAGE_BYTES
     ):
         raise ValueError(
             "mixed PV V SMEM storage changed: "
@@ -592,12 +569,8 @@ def direct_mixed_pv_probe(
             f"mixed PV output exceeds TMEM: {OUTPUT_OFFSET}+{output_cols} "
             f"> {TMEM_ALLOC_COLS}"
         )
-    if cutlass.const_expr(
-        SCALE_INIT_TILES not in (1, OUTPUT_OFFSET // 16)
-    ):
-        raise ValueError(
-            f"I1 scale-init tiles must be 1 or {OUTPUT_OFFSET // 16}"
-        )
+    if cutlass.const_expr(SCALE_INIT_TILES not in (1, OUTPUT_OFFSET // 16)):
+        raise ValueError(f"I1 scale-init tiles must be 1 or {OUTPUT_OFFSET // 16}")
     if cutlass.const_expr(sfa_cols + sfb_cols > SCALE_INIT_TILES * 16):
         raise ValueError(
             f"I1 live scales exceed initialized columns: "
@@ -678,9 +651,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clusters", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument(
-        "--tma-arm", choices=("both", "p", "v", "none"), default="both"
-    )
+    parser.add_argument("--tma-arm", choices=("both", "p", "v", "none"), default="both")
     parser.add_argument("--no-mma", action="store_true")
     parser.add_argument(
         "--latent-tile", type=int, choices=range(LATENT_SLICES), default=0
@@ -689,9 +660,7 @@ def main() -> None:
     parser.add_argument("--sfa-exp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--sfb-exp", type=int, choices=(0, 1), default=0)
     parser.add_argument("--overlap-tma", type=int, choices=(0, 1), default=0)
-    parser.add_argument(
-        "--scale-init-tiles", type=int, choices=(1, 4), default=4
-    )
+    parser.add_argument("--scale-init-tiles", type=int, choices=(1, 4), default=4)
     args = parser.parse_args()
     if args.clusters < 1:
         parser.error("--clusters must be positive")
@@ -752,13 +721,8 @@ def main() -> None:
     row = torch.arange(ROWS, dtype=torch.int64).view(ROWS, 1)
     token = torch.arange(TOKENS, dtype=torch.int64).view(1, TOKENS)
     latent = torch.arange(LATENT, dtype=torch.int64).view(1, LATENT)
-    p_base = (
-        ((((row + 1) * (token + 3) * 17) % 7) - 3).float() * 0.25
-    )
-    v_base = (
-        ((((token.T + 5) * (latent + 7) * 19 + latent * 3) % 5) - 2).float()
-        * 0.5
-    )
+    p_base = ((((row + 1) * (token + 3) * 17) % 7) - 3).float() * 0.25
+    v_base = ((((token.T + 5) * (latent + 7) * 19 + latent * 3) % 5) - 2).float() * 0.5
 
     # Give every tested cluster a unique, exactly representable P/V signature
     # without recomputing a full reference GEMM per cluster.  The low seven
@@ -829,9 +793,11 @@ def main() -> None:
         ),
         dim=1,
     )
-    expected = expected_pair.reshape(
-        ctas, LATENT_SLICE, ROWS // CLUSTER_SHAPE_MNK[0]
-    ).contiguous().cuda()
+    expected = (
+        expected_pair.reshape(ctas, LATENT_SLICE, ROWS // CLUSTER_SHAPE_MNK[0])
+        .contiguous()
+        .cuda()
+    )
 
     def verify_output(label: str) -> None:
         if args.no_mma:
@@ -858,9 +824,7 @@ def main() -> None:
         layout_output[:, 10].cpu()
         == torch.full((CLUSTER_SHAPE_MNK[0],), args.latent_tile)
     ):
-        raise AssertionError(
-            f"latent-tile sentinel failed: {layout_output.cpu()}"
-        )
+        raise AssertionError(f"latent-tile sentinel failed: {layout_output.cpu()}")
     if not torch.all(
         layout_output[:, 11:13].cpu()
         == torch.tensor([args.sfa_exp, args.sfb_exp]).view(1, 2)

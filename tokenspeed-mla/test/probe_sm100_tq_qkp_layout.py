@@ -221,16 +221,12 @@ def layout_kernel(
             cute.recast_ptr(tmem_ptr + SCALE_OFFSET, dtype=SF_DTYPE), sfa_layout
         )
         sfb = cute.make_tensor(
-            cute.recast_ptr(
-                tmem_ptr + SCALE_OFFSET + sfa_cols, dtype=SF_DTYPE
-            ),
+            cute.recast_ptr(tmem_ptr + SCALE_OFFSET + sfa_cols, dtype=SF_DTYPE),
             sfb_layout,
         )
         p_cor = cute.make_tensor(
             tmem_ptr + P_COR_OFFSET,
-            cute.make_layout(
-                (128, 4, 2), stride=(1 << 16, 1, 4)
-            ),
+            cute.make_layout((128, 4, 2), stride=(1 << 16, 1, 4)),
         )
         score = cute.make_tensor(tmem_ptr + SCORE_OFFSET, mixed_acc_layout)
         output_staged = cute.make_tensor(tmem_ptr + OUTPUT_OFFSET, vp_o_layout)
@@ -305,9 +301,7 @@ def layout_probe(
     # packed bytes; the first page supplies this bounded legality gate.
     latent_fp4 = cute.make_tensor(
         cute.recast_ptr(latent_pages.iterator, dtype=cutlass.Float4E2M1FN),
-        cute.make_ordered_layout(
-            (PAGE_SIZE, LATENT_K, NUM_PAGES), order=(1, 0, 2)
-        ),
+        cute.make_ordered_layout((PAGE_SIZE, LATENT_K, NUM_PAGES), order=(1, 0, 2)),
     )
     mixed_b_layout = sm100_utils.make_smem_layout_b(
         mixed_mma, MIXED_TILER_MNK, cutlass.Int8, 1
@@ -315,9 +309,7 @@ def layout_probe(
     qk_cta_layout = cute.tiled_divide(
         cute.make_layout((1, 1, 1)), (mixed_mma.thr_id.shape,)
     )
-    qk_b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-        (1, 1), mixed_mma.thr_id
-    )
+    qk_b_op = sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mixed_mma.thr_id)
     qk_tma_atom, qk_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
         qk_b_op,
         latent_fp4,
@@ -358,9 +350,7 @@ def layout_probe(
         cute.make_tensor(cute.make_ptr(SF_DTYPE, 0), sfb_layout)
     )
 
-    vp_a_shape = vp_mma.partition_shape_A(
-        (VP_TILER_MNK[0], VP_TILER_MNK[2], 2)
-    )
+    vp_a_shape = vp_mma.partition_shape_A((VP_TILER_MNK[0], VP_TILER_MNK[2], 2))
     vp_a_fake = vp_mma.get_slice(0).make_fragment_A(vp_a_shape)
     vp_a_cols = tcgen05.find_tmem_tensor_col_offset(vp_a_fake)
     vp_o_shape = vp_mma.partition_shape_C(VP_TILER_MNK[:2])

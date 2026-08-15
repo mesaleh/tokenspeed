@@ -23,13 +23,11 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import probe_sm100_tq_direct_mixed_pv_l0 as mixed_l0
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cutlass.experimental import primitives as prims
-
-import probe_sm100_tq_direct_mixed_pv_l0 as mixed_l0
-
 
 THREADS_PER_CTA = mixed_l0.THREADS_PER_CTA
 TMEM_RETRIEVE_THREADS = mixed_l0.TMEM_RETRIEVE_THREADS
@@ -95,9 +93,7 @@ def ordinary_pv_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     cta_global, _, _ = cute.arch.block_idx()
     cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    cluster_index = cute.arch.make_warp_uniform(
-        cta_global // CLUSTER_SHAPE_MNK[0]
-    )
+    cluster_index = cute.arch.make_warp_uniform(cta_global // CLUSTER_SHAPE_MNK[0])
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(OrdinarySharedStorage)
@@ -130,12 +126,8 @@ def ordinary_pv_kernel(
     ordinary_thr_mma = ordinary_mma.get_slice(mma_tile_coord)
     t_cg_p = ordinary_thr_mma.partition_A(g_p_mkl)
     t_cg_v = ordinary_thr_mma.partition_B(g_v_nkl)
-    a_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape
-    )
-    b_cta_layout = cute.make_layout(
-        cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape
-    )
+    a_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, 0, None, 0)).shape)
+    b_cta_layout = cute.make_layout(cute.slice_(cta_layout_vmnk, (0, None, 0, 0)).shape)
     t_ps_p, t_pg_p = cpasync.tma_partition(
         tma_atom_p,
         cta_coord_vmnk[2],
@@ -218,12 +210,8 @@ def ordinary_pv_kernel(
 
     if tidx == 0 and cluster_index == 0:
         layout_output[cta_rank, 0] = cta_rank + 1
-        layout_output[cta_rank, 1] = cute.size_in_bytes(
-            cutlass.Float8E4M3FN, p_smem
-        )
-        layout_output[cta_rank, 2] = cute.size_in_bytes(
-            cutlass.Float8E4M3FN, v_smem
-        )
+        layout_output[cta_rank, 1] = cute.size_in_bytes(cutlass.Float8E4M3FN, p_smem)
+        layout_output[cta_rank, 2] = cute.size_in_bytes(cutlass.Float8E4M3FN, v_smem)
         layout_output[cta_rank, 3] = p_copy_bytes
         layout_output[cta_rank, 4] = v_copy_bytes
         layout_output[cta_rank, 5] = N_TILE
@@ -295,9 +283,7 @@ def ordinary_pv_kernel(
             )
             t_acc = accumulator[(None, None), 0, 0]
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(
-                    tcgen05.copy.Repetition(output_cols // 4)
-                ),
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(output_cols // 4)),
                 cutlass.Float32,
             )
             tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, t_acc)
@@ -370,16 +356,14 @@ def ordinary_pv_probe(
         stages,
     )
     if cutlass.const_expr(
-        cute.size_in_bytes(cutlass.Float8E4M3FN, p_layout)
-        != ORDINARY_P_SMEM_BYTES
+        cute.size_in_bytes(cutlass.Float8E4M3FN, p_layout) != ORDINARY_P_SMEM_BYTES
     ):
         raise ValueError(
             "ordinary P SMEM footprint changed: "
             f"{cute.size_in_bytes(cutlass.Float8E4M3FN, p_layout)}"
         )
     if cutlass.const_expr(
-        cute.size_in_bytes(cutlass.Float8E4M3FN, v_layout)
-        != ORDINARY_V_SMEM_BYTES
+        cute.size_in_bytes(cutlass.Float8E4M3FN, v_layout) != ORDINARY_V_SMEM_BYTES
     ):
         raise ValueError(
             "ordinary V SMEM footprint changed: "
@@ -557,8 +541,7 @@ def williams_orders(windows: int) -> list[tuple[str, ...]]:
                 continue
             observed = sum(
                 sum(
-                    order[position] == first
-                    and order[position + 1] == second
+                    order[position] == first and order[position + 1] == second
                     for position in range(len(CONDITIONS) - 1)
                 )
                 for order in orders
@@ -678,32 +661,24 @@ def audit_compiled_wrapper(arm: str, latent_tile: int, wrapper) -> dict[str, obj
     mixed_opcode_count = ptx.count(
         "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.block32"
     )
-    ordinary_opcode_count = ptx.count(
-        "tcgen05.mma.cta_group::2.kind::f8f6f4 ["
-    )
+    ordinary_opcode_count = ptx.count("tcgen05.mma.cta_group::2.kind::f8f6f4 [")
     scale_store_pattern = "tcgen05.st.sync.aligned.32x32b.x4.b32"
     scale_store_offsets = [
         match.start() for match in re.finditer(re.escape(scale_store_pattern), ptx)
     ]
     scale_wait_offsets = [
         match.start()
-        for match in re.finditer(
-            re.escape("tcgen05.wait::st.sync.aligned;"), ptx
-        )
+        for match in re.finditer(re.escape("tcgen05.wait::st.sync.aligned;"), ptx)
     ]
-    tma_offsets = [
-        match.start() for match in re.finditer("cp.async.bulk.tensor", ptx)
-    ]
+    tma_offsets = [match.start() for match in re.finditer("cp.async.bulk.tensor", ptx)]
     mbarrier_init_offsets = [
         match.start() for match in re.finditer("mbarrier.init.shared.b64", ptx)
     ]
     regular_cluster_arrive_offsets = [
-        match.start()
-        for match in re.finditer(r"barrier\.cluster\.arrive;", ptx)
+        match.start() for match in re.finditer(r"barrier\.cluster\.arrive;", ptx)
     ]
     cluster_wait_offsets = [
-        match.start()
-        for match in re.finditer(r"barrier\.cluster\.wait;", ptx)
+        match.start() for match in re.finditer(r"barrier\.cluster\.wait;", ptx)
     ]
 
     schedule = "native"
@@ -742,7 +717,9 @@ def audit_compiled_wrapper(arm: str, latent_tile: int, wrapper) -> dict[str, obj
             schedule = "tma_before_scale_store"
         else:
             if min(tma_offsets) <= max(
-                scale_wait_offsets + regular_cluster_arrive_offsets + cluster_wait_offsets
+                scale_wait_offsets
+                + regular_cluster_arrive_offsets
+                + cluster_wait_offsets
             ):
                 raise AssertionError(
                     f"{arm}/tile{latent_tile} does not serialize TMA after publication"
@@ -821,8 +798,7 @@ def summarize_timings(
         )
         ratio["formal_faster"] = ratio["paired_log_ci95"][1] < 1.0
         ratio["formal_parity_1p05"] = (
-            ratio["ratio_of_means"] <= 1.05
-            and ratio["paired_log_ci95"][1] <= 1.05
+            ratio["ratio_of_means"] <= 1.05 and ratio["paired_log_ci95"][1] <= 1.05
         )
         ratios[name] = ratio
 
@@ -845,13 +821,8 @@ def make_inputs(nodes: int, clusters: int):
     row = torch.arange(ROWS, dtype=torch.int64).view(ROWS, 1)
     token = torch.arange(TOKENS, dtype=torch.int64).view(1, TOKENS)
     latent = torch.arange(LATENT, dtype=torch.int64).view(1, LATENT)
-    p_base = (
-        ((((row + 1) * (token + 3) * 17) % 7) - 3).float() * 0.25
-    )
-    v_base = (
-        ((((token.T + 5) * (latent + 7) * 19 + latent * 3) % 5) - 2).float()
-        * 0.5
-    )
+    p_base = ((((row + 1) * (token + 3) * 17) % 7) - 3).float() * 0.25
+    v_base = ((((token.T + 5) * (latent + 7) * 19 + latent * 3) % 5) - 2).float() * 0.5
     row_sign = walsh_sign(
         sample_ids.remainder(ROWS),
         torch.arange(ROWS, dtype=torch.int64),
@@ -866,18 +837,12 @@ def make_inputs(nodes: int, clusters: int):
     v_reference = v_base.unsqueeze(0) * latent_sign.unsqueeze(1)
 
     p_cute = mixed_l0.to_cute_tensor(p_reference, cutlass.Float8E4M3FN)
-    mixed_v_cute = mixed_l0.to_cute_tensor(
-        v_reference, cutlass.Float4E2M1FN
-    )
-    native_v_cute = mixed_l0.to_cute_tensor(
-        v_reference, cutlass.Float8E4M3FN
-    )
+    mixed_v_cute = mixed_l0.to_cute_tensor(v_reference, cutlass.Float4E2M1FN)
+    native_v_cute = mixed_l0.to_cute_tensor(v_reference, cutlass.Float8E4M3FN)
 
     expected_base = p_base @ v_base
     expected_rows = (
-        expected_base.unsqueeze(0)
-        * row_sign.unsqueeze(2)
-        * latent_sign.unsqueeze(1)
+        expected_base.unsqueeze(0) * row_sign.unsqueeze(2) * latent_sign.unsqueeze(1)
     )
     expected_pair = torch.stack(
         (
@@ -888,13 +853,17 @@ def make_inputs(nodes: int, clusters: int):
     ).reshape(samples * CLUSTER_SHAPE_MNK[0], LATENT, ROWS_PER_CTA)
     ctas = clusters * CLUSTER_SHAPE_MNK[0]
     expected_full = expected_pair.reshape(nodes, ctas, LATENT, ROWS_PER_CTA)
-    expected = torch.stack(
-        (
-            expected_full[:, :, :OUTPUT_CHUNK, :],
-            expected_full[:, :, OUTPUT_CHUNK:, :],
-        ),
-        dim=1,
-    ).contiguous().cuda()
+    expected = (
+        torch.stack(
+            (
+                expected_full[:, :, :OUTPUT_CHUNK, :],
+                expected_full[:, :, OUTPUT_CHUNK:, :],
+            ),
+            dim=1,
+        )
+        .contiguous()
+        .cuda()
+    )
     return p_cute, mixed_v_cute, native_v_cute, expected
 
 
@@ -924,9 +893,7 @@ def main() -> None:
         parser.error("--audit-generated requires --arm all")
     scored_benchmark = args.benchmark and args.windows == 30
     if scored_benchmark and (
-        args.nodes != 100
-        or args.warmup_cycles != 10
-        or args.clusters not in (128, 512)
+        args.nodes != 100 or args.warmup_cycles != 10 or args.clusters not in (128, 512)
     ):
         parser.error(
             "a 30-window scored benchmark requires --nodes 100, "
@@ -1016,9 +983,7 @@ def main() -> None:
             f"max_abs={max_abs}"
         )
 
-    default_stream = cuda_driver.CUstream(
-        torch.cuda.current_stream().cuda_stream
-    )
+    default_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     graphs: dict[str, torch.cuda.CUDAGraph] = {}
     for arm in selected_conditions:
         outputs.fill_(float("nan"))
