@@ -161,6 +161,26 @@ What it supports:
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 
+### Packed TurboQuant MLA Decode (`tokenspeed_mla_decode_tq_e2m1`)
+
+This separate, fail-closed API consumes a native packed cache without creating
+a dense cache shadow. Its initial SM100 owner supports page size 32, MLA
+dimensions 512/64, eight local query heads, and q1 or q5 causal decode. The
+cache ABI is three tensors: uint8 packed fixed E2M1 latent values
+`[num_pages, 32, 256]`, BF16 per-token scales `[num_pages, 32]`, and BF16
+reciprocal-RoPE `[num_pages, 32, 64]`. Query latent is E4M3 while query RoPE is
+BF16. The BF16 output remains in the caller's signed-WHT basis; callers must
+apply their matching inverse transform before an original-basis consumer.
+Block-table width must be a multiple of four pages, with valid page indices in
+the tile-padding entries. Reconstruction scales must come from the matched N10
+writer and stay within its positive finite `224 * 2**16` carrier bound.
+
+The API rejects DCP, custom/tree masks, other dimensions, and other page sizes.
+Warm each production shape once before CUDA graph capture, then pass a
+preallocated `out` (and `lse_out` when requested). The q1 owner elides the
+redundant causal mask because the single query is aligned to the end of its
+cache; q5 retains the causal mask.
+
 ## Minimal Usage
 
 ### 1) Decode
