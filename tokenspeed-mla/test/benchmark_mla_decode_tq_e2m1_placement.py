@@ -410,6 +410,18 @@ def _check_outputs_written(output: torch.Tensor, lse: torch.Tensor | None) -> No
         raise AssertionError("reader left NaN poison in the LSE output")
 
 
+def _check_output_capacity_slack(
+    byte_views: dict[int, torch.Tensor], active_bytes: int
+) -> None:
+    for target_class, byte_view in byte_views.items():
+        slack = byte_view[active_bytes:]
+        if slack.numel() and not torch.all(slack == GUARD_VALUE).item():
+            raise AssertionError(
+                "reader wrote beyond active output into capacity slack: "
+                f"class={target_class}"
+            )
+
+
 def main():
     if NUM_CLASSES != 64:
         raise RuntimeError("placement class geometry changed unexpectedly")
@@ -433,6 +445,23 @@ def main():
     warm_traversals = int(os.environ.get("TQ_PLACEMENT_WARM_TRAVERSALS", "12"))
     timing = os.environ.get("TQ_PLACEMENT_TIMING", "1") == "1"
     return_lse = os.environ.get("TQ_PLACEMENT_RETURN_LSE", "0") == "1"
+    output_capacity_value = os.environ.get(
+        "TQ_PLACEMENT_OUTPUT_CAPACITY_TOKENS"
+    )
+    output_capacity_tokens = (
+        query_len
+        if output_capacity_value is None
+        else int(output_capacity_value)
+    )
+    if output_capacity_tokens < query_len:
+        raise ValueError(
+            "output capacity tokens must cover the active query length"
+        )
+    if owner == "output" and timing and output_capacity_value is None:
+        raise ValueError(
+            "scored output timing requires explicit "
+            "TQ_PLACEMENT_OUTPUT_CAPACITY_TOKENS"
+        )
     target_classes_value = os.environ.get("TQ_PLACEMENT_TARGET_CLASSES")
     target_classes = (
         list(range(0, PERIOD, CLASS_STEP))
@@ -474,16 +503,19 @@ def main():
     )
     output_shape = (1, query_len, HEADS, LATENT)
     output_bytes = math.prod(output_shape) * 2
+    output_capacity_bytes = output_capacity_tokens * HEADS * LATENT * 2
     fixed_workspace = torch.empty(
         workspace_capacity, dtype=torch.int8, device="cuda"
     )[:workspace_required]
-    fixed_output = torch.empty(output_shape, dtype=torch.bfloat16, device="cuda")
     lse = (
         torch.empty((1, query_len, HEADS), dtype=torch.float32, device="cuda")
         if return_lse
         else None
     )
     if owner == "workspace":
+        fixed_output = torch.empty(
+            output_shape, dtype=torch.bfloat16, device="cuda"
+        )
         parent, byte_views, records = _make_class_views(
             payload_bytes=workspace_required,
             capacity_bytes=workspace_capacity,
@@ -494,16 +526,19 @@ def main():
         workspaces = byte_views
         outputs = {target: fixed_output for target in byte_views}
     else:
+        fixed_output = None
         parent, byte_views, records = _make_class_views(
-            payload_bytes=output_bytes,
-            capacity_bytes=output_bytes,
+            payload_bytes=output_capacity_bytes,
+            capacity_bytes=output_capacity_bytes,
             permutation_seed=permutation_seed,
             target_classes=target_classes,
             dtype=torch.uint8,
         )
         workspaces = {target: fixed_workspace for target in byte_views}
         outputs = {
-            target: byte_view.view(torch.bfloat16).view(output_shape)
+            target: byte_view[:output_bytes]
+            .view(torch.bfloat16)
+            .view(output_shape)
             for target, byte_view in byte_views.items()
         }
         for target, output in outputs.items():
@@ -544,7 +579,7 @@ def main():
             f"{artifacts['cubin_sha256']} != {expected_cubin_sha256}"
         )
     config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "owner": owner,
         "allocation_model": allocation_model,
         "query_len": query_len,
@@ -554,6 +589,8 @@ def main():
         "workspace_capacity": workspace_capacity,
         "production_capacity": production_capacity,
         "output_bytes": output_bytes,
+        "output_capacity_tokens": output_capacity_tokens,
+        "output_capacity_bytes": output_capacity_bytes,
         "period": PERIOD,
         "class_step": CLASS_STEP,
         "num_classes": len(target_classes),
@@ -569,7 +606,9 @@ def main():
         "timing": timing,
         "input_pointers": input_pointers,
         "fixed_workspace_ptr": fixed_workspace.data_ptr(),
-        "fixed_output_ptr": fixed_output.data_ptr(),
+        "fixed_output_ptr": (
+            fixed_output.data_ptr() if fixed_output is not None else None
+        ),
         "harness_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
         "reader_source": str(reader_path),
         "reader_sha256": reader_sha256,
@@ -614,6 +653,8 @@ def main():
         if lse is not None and not torch.equal(lse, reference_lse):
             raise AssertionError(f"captured LSE mismatch class={target_class}")
     _check_guards(parent, records)
+    if owner == "output":
+        _check_output_capacity_slack(byte_views, output_bytes)
     if not timing:
         print(
             "TQ_PLACEMENT_PARITY "
@@ -698,6 +739,8 @@ def main():
         if lse is not None and not torch.equal(lse, reference_lse):
             raise AssertionError(f"post-timing LSE mismatch class={target_class}")
     _check_guards(parent, records)
+    if owner == "output":
+        _check_output_capacity_slack(byte_views, output_bytes)
     _gpu_state("after")
 
 
