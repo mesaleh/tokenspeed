@@ -3,6 +3,7 @@
 """Correctness and contract gates for the public packed E2M1 MLA reader."""
 
 import math
+import struct
 
 import cutlass
 import pytest
@@ -52,6 +53,85 @@ _E2M1 = torch.tensor(
     ],
     dtype=torch.float32,
 )
+
+
+def _f32_from_bits(bits: int) -> float:
+    return struct.unpack(">f", struct.pack(">I", bits))[0]
+
+
+def _f32_bits(value: float) -> int:
+    return struct.unpack(">I", struct.pack(">f", value))[0]
+
+
+def _loop_carrier(value: float) -> tuple[int, int, int]:
+    scale = 2.0**-16
+    exponent = -16
+    for _ in range(32):
+        if value > 224.0 * scale:
+            scale *= 2.0
+            exponent += 1
+    return exponent, _f32_bits(scale), _f32_bits(1.0 / scale)
+
+
+def _bit_carrier(bits: int) -> tuple[int, int, int]:
+    biased_exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exponent = biased_exponent - 134 + (mantissa > 0x600000)
+    exponent = max(-16, min(16, exponent))
+    return exponent, (exponent + 127) << 23, (127 - exponent) << 23
+
+
+def test_carrier_exponent_selector_is_exhaustively_exact():
+    writer_limit = 224.0 * 2.0**16
+    counts = {
+        "zero_or_subnormal": 0,
+        "positive_legal": 0,
+        "positive_out_of_range": 0,
+        "negative": 0,
+        "nonfinite": 0,
+    }
+    admitted = 0
+
+    for bf16 in range(1 << 16):
+        bits = bf16 << 16
+        sign = bf16 >> 15
+        biased_exponent = (bits >> 23) & 0xFF
+        value = _f32_from_bits(bits)
+        if sign:
+            counts["negative"] += 1
+            continue
+        if biased_exponent == 0xFF:
+            counts["nonfinite"] += 1
+            continue
+        if biased_exponent == 0:
+            counts["zero_or_subnormal"] += 1
+        elif value <= writer_limit:
+            counts["positive_legal"] += 1
+        else:
+            counts["positive_out_of_range"] += 1
+            continue
+        admitted += 1
+        assert _bit_carrier(bits) == _loop_carrier(value)
+
+    assert admitted == 19_297
+    assert sum(counts.values()) == 1 << 16
+    assert counts == {
+        "zero_or_subnormal": 128,
+        "positive_legal": 19_169,
+        "positive_out_of_range": 13_343,
+        "negative": 32_768,
+        "nonfinite": 128,
+    }
+
+    for exponent in range(-16, 17):
+        boundary_bits = _f32_bits(224.0 * 2.0**exponent)
+        assert boundary_bits & 0xFFFF == 0
+        boundary_bf16 = boundary_bits >> 16
+        for neighbor in range(
+            max(0, boundary_bf16 - 1), min(0x7F80, boundary_bf16 + 2)
+        ):
+            bits = neighbor << 16
+            assert _bit_carrier(bits) == _loop_carrier(_f32_from_bits(bits))
 
 
 def _pack(codes: torch.Tensor) -> torch.Tensor:
