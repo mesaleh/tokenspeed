@@ -259,6 +259,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tq_s1_scale_tma: bool = False,
         tq_s1_scale_stages: int = 0,
         tq_s1_k_rope_stages: int = 0,
+        tq_s1_packed_p_scale_math: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -285,6 +286,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param tq_s1_k_rope_stages: Experimental TQ M64 key-RoPE pipeline
             depth; zero preserves the default depth
         :type tq_s1_k_rope_stages: int
+        :param tq_s1_packed_p_scale_math: Apply the TQ probability scale and
+            carrier reciprocal with ordered packed FP32x2 multiplies
+        :type tq_s1_packed_p_scale_math: bool
         """
 
         self.latent_dim = 512
@@ -315,6 +319,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tq_s1_scale_tma = tq_s1_scale_tma
         self.tq_s1_scale_stages = tq_s1_scale_stages
         self.tq_s1_k_rope_stages = tq_s1_k_rope_stages
+        self.tq_s1_packed_p_scale_math = tq_s1_packed_p_scale_math
         if (
             self.tq_s1_scale_ceiling or self.tq_s1_scale_diag or self.tq_s1_scale_tma
         ) and not self.use_tq_e2m1:
@@ -335,6 +340,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError("S1 scale stages must be one of 0, 2, 3, or 4")
         if self.tq_s1_scale_stages and not self.tq_s1_scale_tma:
             raise ValueError("S1 scale-stage override requires paged scale TMA")
+        if self.tq_s1_packed_p_scale_math and not self.tq_s1_scale_tma:
+            raise ValueError("S1 packed P-scale math requires paged scale TMA")
         if self.tq_s1_k_rope_stages not in (0, 1, 2):
             raise ValueError("S1 key-RoPE stages must be one of 0, 1, or 2")
         if self.use_tq_e2m1 and (cp_world != 1 or mma_qk_tiler_mn[0] != 64):
@@ -4185,42 +4192,88 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Quantize.  E2M1 PV consumes P*scale/G so its accumulator is kept in
         # units of the current exact power-of-two carrier G.
         if cutlass.const_expr(self.use_tq_e2m1):
-            for i in cutlass.range_constexpr(cute.size(tTR_rS)):
-                token = tTR_tS[i][1]
-                token_scale = cutlass.Float32(1.0)
-                if cutlass.const_expr(not self.tq_s1_scale_ceiling):
-                    if cutlass.const_expr(self.tq_s1_scale_diag):
-                        logical_token = k_index * self.mma_qk_tiler[1] + token
-                        if cute.elem_less(logical_token, common_params.K):
-                            token_scale = common_params.mScaleDiag[
-                                logical_token,
-                                common_params.blk_coord[2],
-                            ].to(cutlass.Float32)
-                        else:
-                            token_scale = cutlass.Float32(0.0)
-                    elif cutlass.const_expr(self.tq_s1_scale_tma):
-                        logical_token = k_index * self.mma_qk_tiler[1] + token
-                        loaded_scale = softmax_params.sScale[
-                            token,
-                            0,
-                            0,
-                            load_scale_consumer_state.index,
-                        ].to(cutlass.Float32)
-                        token_scale = cutlass.Float32(
-                            cutlass.select_(
-                                cute.elem_less(logical_token, common_params.K),
-                                loaded_scale,
-                                cutlass.Float32(0.0),
-                            )
+            if cutlass.const_expr(self.tq_s1_packed_p_scale_math):
+                assert cute.size(tTR_rS) % 2 == 0
+                for i in cutlass.range_constexpr(0, cute.size(tTR_rS), 2):
+                    token0 = tTR_tS[i][1]
+                    logical_token0 = k_index * self.mma_qk_tiler[1] + token0
+                    loaded_scale0 = softmax_params.sScale[
+                        token0,
+                        0,
+                        0,
+                        load_scale_consumer_state.index,
+                    ].to(cutlass.Float32)
+                    token_scale0 = cutlass.Float32(
+                        cutlass.select_(
+                            cute.elem_less(logical_token0, common_params.K),
+                            loaded_scale0,
+                            cutlass.Float32(0.0),
                         )
-                    else:
-                        s_scale = softmax_params.sScale[
-                            None, load_scale_consumer_state.index
-                        ]
-                        token_scale = s_scale[token].to(cutlass.Float32)
-                tTR_rS[i] = (tTR_rAcc[i] * token_scale * carrier_reciprocal).to(
-                    self.q_dtype
-                )
+                    )
+
+                    token1 = tTR_tS[i + 1][1]
+                    logical_token1 = k_index * self.mma_qk_tiler[1] + token1
+                    loaded_scale1 = softmax_params.sScale[
+                        token1,
+                        0,
+                        0,
+                        load_scale_consumer_state.index,
+                    ].to(cutlass.Float32)
+                    token_scale1 = cutlass.Float32(
+                        cutlass.select_(
+                            cute.elem_less(logical_token1, common_params.K),
+                            loaded_scale1,
+                            cutlass.Float32(0.0),
+                        )
+                    )
+
+                    scaled0, scaled1 = cute.arch.mul_packed_f32x2(
+                        (tTR_rAcc[i], tTR_rAcc[i + 1]),
+                        (token_scale0, token_scale1),
+                    )
+                    scaled0, scaled1 = cute.arch.mul_packed_f32x2(
+                        (scaled0, scaled1),
+                        (carrier_reciprocal, carrier_reciprocal),
+                    )
+                    tTR_rS[i] = scaled0.to(self.q_dtype)
+                    tTR_rS[i + 1] = scaled1.to(self.q_dtype)
+            else:
+                for i in cutlass.range_constexpr(cute.size(tTR_rS)):
+                    token = tTR_tS[i][1]
+                    token_scale = cutlass.Float32(1.0)
+                    if cutlass.const_expr(not self.tq_s1_scale_ceiling):
+                        if cutlass.const_expr(self.tq_s1_scale_diag):
+                            logical_token = k_index * self.mma_qk_tiler[1] + token
+                            if cute.elem_less(logical_token, common_params.K):
+                                token_scale = common_params.mScaleDiag[
+                                    logical_token,
+                                    common_params.blk_coord[2],
+                                ].to(cutlass.Float32)
+                            else:
+                                token_scale = cutlass.Float32(0.0)
+                        elif cutlass.const_expr(self.tq_s1_scale_tma):
+                            logical_token = k_index * self.mma_qk_tiler[1] + token
+                            loaded_scale = softmax_params.sScale[
+                                token,
+                                0,
+                                0,
+                                load_scale_consumer_state.index,
+                            ].to(cutlass.Float32)
+                            token_scale = cutlass.Float32(
+                                cutlass.select_(
+                                    cute.elem_less(logical_token, common_params.K),
+                                    loaded_scale,
+                                    cutlass.Float32(0.0),
+                                )
+                            )
+                        else:
+                            s_scale = softmax_params.sScale[
+                                None, load_scale_consumer_state.index
+                            ]
+                            token_scale = s_scale[token].to(cutlass.Float32)
+                    tTR_rS[i] = (
+                        tTR_rAcc[i] * token_scale * carrier_reciprocal
+                    ).to(self.q_dtype)
         else:
             tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
 
