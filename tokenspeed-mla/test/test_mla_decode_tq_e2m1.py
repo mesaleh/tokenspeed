@@ -17,6 +17,7 @@ from tokenspeed_mla.mla_decode_tq_e2m1 import (
     _MMA_QK_TILER,
     _NUM_HEADS,
     _get_compiled_tq_e2m1_kernel,
+    _use_packed_p_scale_math,
     tokenspeed_mla_decode_tq_e2m1,
 )
 from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
@@ -79,6 +80,14 @@ def _bit_carrier(bits: int) -> tuple[int, int, int]:
     exponent = biased_exponent - 134 + (mantissa > 0x600000)
     exponent = max(-16, min(16, exponent))
     return exponent, (exponent + 127) << 23, (127 - exponent) << 23
+
+
+def test_packed_p_scale_routing_is_q5_only():
+    assert _use_packed_p_scale_math(1) is False
+    assert _use_packed_p_scale_math(5) is True
+    for unsupported in (0, 2, 4, 6):
+        with pytest.raises(ValueError, match="supports only q_len 1 or 5"):
+            _use_packed_p_scale_math(unsupported)
 
 
 def test_carrier_exponent_selector_is_exhaustively_exact():

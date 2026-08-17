@@ -55,6 +55,16 @@ _MMA_QK_TILER = (64, 128)
 _MMA_PV_TILER = (64, 256)
 
 
+def _use_packed_p_scale_math(query_len: int) -> bool:
+    """Select packed P-scale arithmetic only for q5 verification."""
+    if query_len not in _SUPPORTED_QUERY_LENGTHS:
+        raise ValueError(
+            "TurboQuant E2M1 MLA packed P-scale routing supports only "
+            f"q_len 1 or 5, got {query_len}"
+        )
+    return query_len == 5
+
+
 def _require_tensor(
     name: str,
     tensor: torch.Tensor,
@@ -387,6 +397,7 @@ def _get_compiled_tq_e2m1_kernel(
                 tq_s1_scale_tma=True,
                 tq_s1_scale_stages=3,
                 tq_s1_k_rope_stages=2,
+                tq_s1_packed_p_scale_math=_use_packed_p_scale_math(query_len),
             )
             stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True
