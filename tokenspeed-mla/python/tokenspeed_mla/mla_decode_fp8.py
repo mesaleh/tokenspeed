@@ -3967,17 +3967,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ],
                 )
 
-                # Smallest exact power-of-two carrier satisfying scale <= 224*G.
-                carrier_scale = cutlass.Float32(2.0**-16)
-                carrier_exp = cutlass.Int32(-16)
-                for _ in cutlass.range_constexpr(32):
-                    if scale_max > cutlass.Float32(224.0) * carrier_scale:
-                        carrier_scale = carrier_scale * cutlass.Float32(2.0)
-                        carrier_exp = carrier_exp + cutlass.Int32(1)
-                # Carrier scale is exactly 2**carrier_exp. Construct its inverse
-                # directly from the normalized FP32 exponent field. This avoids
-                # both the per-element divisions created by the unrolled P loop
-                # and duplicate RCPs across inlined softmax control-flow bodies.
+                # The smallest power-of-two carrier satisfying scale <= 224*G
+                # is exact from the FP32 exponent and its 1.75 mantissa boundary:
+                #   ceil(log2(scale / 224)) = E - 7 + (mantissa > 0x600000).
+                # Scales arrive from BF16 and promote exactly to non-negative
+                # FP32.  Zero/subnormal values clip to the writer's -16 floor.
+                scale_bits = scale_max.bitcast(cutlass.Int32)
+                carrier_exp = (
+                    (scale_bits >> cutlass.Int32(23))
+                    & cutlass.Int32(0xFF)
+                ) - cutlass.Int32(134)
+                if (scale_bits & cutlass.Int32(0x7FFFFF)) > cutlass.Int32(
+                    0x600000
+                ):
+                    carrier_exp = carrier_exp + cutlass.Int32(1)
+                if carrier_exp < cutlass.Int32(-16):
+                    carrier_exp = cutlass.Int32(-16)
+                if carrier_exp > cutlass.Int32(16):
+                    carrier_exp = cutlass.Int32(16)
+                # Both carrier powers are normal FP32 values; construct their
+                # bits directly and avoid floating multiply/divide chains.
+                carrier_scale_bits = cutlass.Uint32(
+                    (carrier_exp + cutlass.Int32(127)) << cutlass.Int32(23)
+                )
+                carrier_scale = carrier_scale_bits.bitcast(cutlass.Float32)
                 carrier_reciprocal_bits = cutlass.Uint32(
                     (cutlass.Int32(127) - carrier_exp) << cutlass.Int32(23)
                 )
