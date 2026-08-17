@@ -118,7 +118,12 @@ def main() -> None:
         raise ValueError("R8_RETURN_LSE must be 0 or 1")
     return_lse = return_lse_value == "1"
     output_dir = Path(os.environ["R8_OUTPUT_DIR"]).resolve()
+    if output_dir == source_root or source_root in output_dir.parents:
+        raise ValueError("R8_OUTPUT_DIR must be outside the immutable source tree")
     output_dir.mkdir(parents=True, exist_ok=True)
+    # CUTE_DSL_KEEP writes compiler intermediates to the current directory.
+    # Keep those evidence files outside the immutable source checkout.
+    os.chdir(output_dir)
 
     tensors = benchmark._build_fixture(
         query_len,
