@@ -357,9 +357,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if self.tq_s1_packed_p_scale_math and not self.tq_s1_scale_tma:
             raise ValueError("S1 packed P-scale math requires paged scale TMA")
         if self.tq_s1_early_final_pcor and not (
-            self.use_tq_e2m1
-            and self.tq_s1_scale_tma
-            and self.tq_s1_packed_p_scale_math
+            self.use_tq_e2m1 and self.tq_s1_scale_tma and self.tq_s1_packed_p_scale_math
         ):
             raise ValueError(
                 "S1 early final correction publication requires the packed "
