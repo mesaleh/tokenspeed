@@ -15,15 +15,14 @@ from pathlib import Path
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
-from cutlass.cute.runtime import from_dlpack
-
 from benchmark_mla_decode_tq_e2m1_public import (
     HEADS,
     LATENT,
     ROPE,
     _build_cache,
 )
+from cutlass import Float32, Int32
+from cutlass.cute.runtime import from_dlpack
 from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
 from tokenspeed_mla.utils import get_max_active_clusters, get_num_sm
 
@@ -111,11 +110,7 @@ def _compile(
         _as_cute_tensor(tensors["reciprocal_rope"], cutlass.BFloat16, 2, 16),
         _as_cute_tensor(tensors["block_tables"], cutlass.Int32, 1, 4),
         _as_cute_tensor(output, cutlass.BFloat16, 3, 16),
-        (
-            _as_cute_tensor(lse, cutlass.Float32, 2, 4)
-            if lse is not None
-            else None
-        ),
+        (_as_cute_tensor(lse, cutlass.Float32, 2, 4) if lse is not None else None),
         (
             _as_cute_tensor(workspace, cutlass.Int8, 0, 32)
             if workspace is not None
@@ -280,9 +275,7 @@ def _run(
         block_tables = torch.cat(
             (
                 block_tables,
-                block_tables[:, -1:].expand(
-                    -1, padded_pages - block_tables.shape[1]
-                ),
+                block_tables[:, -1:].expand(-1, padded_pages - block_tables.shape[1]),
             ),
             dim=1,
         ).contiguous()
@@ -293,14 +286,10 @@ def _run(
     torch.manual_seed(20260816 + query_len)
     tensors = {
         "query_latent": (
-            torch.randint(
-                -4, 5, (1, query_len, HEADS, LATENT), device="cuda"
-            )
-            / 2.0
+            torch.randint(-4, 5, (1, query_len, HEADS, LATENT), device="cuda") / 2.0
         ).to(torch.float8_e4m3fn),
         "query_rope": (
-            torch.randint(-4, 5, (1, query_len, HEADS, ROPE), device="cuda")
-            / 2.0
+            torch.randint(-4, 5, (1, query_len, HEADS, ROPE), device="cuda") / 2.0
         ).to(torch.bfloat16),
         "packed": packed,
         "scale": scale,
@@ -318,9 +307,7 @@ def _run(
         )
     compiled_roles = {}
     for name in order:
-        compiled_roles[name] = _compile(
-            owners[name], tensors, query_len, return_lse
-        )
+        compiled_roles[name] = _compile(owners[name], tensors, query_len, return_lse)
     control_call, control_output, control_lse, control_compiled = compiled_roles[
         "control"
     ]
@@ -369,9 +356,13 @@ def _run(
     samples = {"control": [], "candidate": []}
     graphs = {"control": control_graph, "candidate": candidate_graph}
     for window in range(windows):
-        order = ("control", "candidate") if window % 2 == 0 else (
-            "candidate",
-            "control",
+        order = (
+            ("control", "candidate")
+            if window % 2 == 0
+            else (
+                "candidate",
+                "control",
+            )
         )
         for name in order:
             samples[name].append(_measure(graphs[name], replays))
@@ -406,9 +397,7 @@ def main():
     if Path(control_source).resolve() == Path(candidate_source).resolve():
         raise ValueError("control and candidate source paths must differ")
     control_owner = _load_owner("mla_decode_fp8_carrier_control", control_source)
-    candidate_owner = _load_owner(
-        "mla_decode_fp8_carrier_candidate", candidate_source
-    )
+    candidate_owner = _load_owner("mla_decode_fp8_carrier_candidate", candidate_source)
     replays = int(os.environ.get("TQ_CARRIER_REPLAYS", "500"))
     windows = int(os.environ.get("TQ_CARRIER_WINDOWS", "30"))
     if windows not in (10, 30):

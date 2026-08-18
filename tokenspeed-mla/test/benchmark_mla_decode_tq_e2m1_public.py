@@ -7,13 +7,11 @@ import os
 import statistics
 
 import torch
-
 from tokenspeed_mla import (
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_tq_e2m1,
 )
 from tokenspeed_mla.utils import get_num_sm
-
 
 PAGE_SIZE = 32
 LATENT = 512
@@ -53,9 +51,7 @@ def _build_cache(batch: int, seq_len: int):
     packed = torch.empty(
         (num_pages, PAGE_SIZE, LATENT // 2), dtype=torch.uint8, device=device
     )
-    scale = torch.empty(
-        (num_pages, PAGE_SIZE), dtype=torch.bfloat16, device=device
-    )
+    scale = torch.empty((num_pages, PAGE_SIZE), dtype=torch.bfloat16, device=device)
     reciprocal_rope = torch.empty(
         (num_pages, PAGE_SIZE, ROPE), dtype=torch.bfloat16, device=device
     )
@@ -77,13 +73,9 @@ def _build_cache(batch: int, seq_len: int):
         end = min(begin + chunk, num_tokens)
         token = torch.arange(begin, end, device=device)[:, None]
         low = ((token * 5 + (pair_dim * 2) * 3 + 1) % 15 + 1).to(torch.uint8)
-        high = ((token * 5 + (pair_dim * 2 + 1) * 3 + 1) % 15 + 1).to(
-            torch.uint8
-        )
+        high = ((token * 5 + (pair_dim * 2 + 1) * 3 + 1) % 15 + 1).to(torch.uint8)
         packed_flat[begin:end] = low | (high << 4)
-        token_scale = torch.pow(2.0, (-8 + token[:, 0] % 7).float()).to(
-            torch.bfloat16
-        )
+        token_scale = torch.pow(2.0, (-8 + token[:, 0] % 7).float()).to(torch.bfloat16)
         scale_flat[begin:end] = token_scale
         dense_flat[begin:end, :LATENT:2] = (
             lut[low.long()] * token_scale[:, None].float()
@@ -92,9 +84,9 @@ def _build_cache(batch: int, seq_len: int):
             lut[high.long()] * token_scale[:, None].float()
         ).to(torch.float8_e4m3fn)
         raw_rope = (((token * 7 + rope_dim * 11 + 3) % 9) - 4) / 2.0
-        reciprocal_rope_flat[begin:end] = (
-            raw_rope / token_scale[:, None].float()
-        ).to(torch.bfloat16)
+        reciprocal_rope_flat[begin:end] = (raw_rope / token_scale[:, None].float()).to(
+            torch.bfloat16
+        )
         dense_flat[begin:end, LATENT:] = raw_rope.to(torch.float8_e4m3fn)
 
     rows = []
@@ -166,11 +158,7 @@ def _run_shape(
         (query_latent, query_rope.to(torch.float8_e4m3fn)), dim=-1
     ).contiguous()
     candidate_workspace = torch.empty(
-        get_num_sm(torch.device("cuda"))
-        * HEADS
-        * query_len
-        * (LATENT + 1)
-        * 4,
+        get_num_sm(torch.device("cuda")) * HEADS * query_len * (LATENT + 1) * 4,
         dtype=torch.int8,
         device="cuda",
     )

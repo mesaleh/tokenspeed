@@ -4,14 +4,10 @@
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 import unittest
+from pathlib import Path
 
-
-SOURCE = (
-    Path(__file__).resolve().parents[2]
-    / "python/tokenspeed_mla/mla_decode_fp8.py"
-)
+SOURCE = Path(__file__).resolve().parents[2] / "python/tokenspeed_mla/mla_decode_fp8.py"
 HELPER = "named_barrier_sync_unaligned"
 
 
@@ -58,7 +54,9 @@ class UnalignedHandoffSourceTest(unittest.TestCase):
         ]
         self.assertEqual(len(helpers), 1)
         helper = helpers[0]
-        self.assertEqual([dotted_name(item) for item in helper.decorator_list], ["cute.jit"])
+        self.assertEqual(
+            [dotted_name(item) for item in helper.decorator_list], ["cute.jit"]
+        )
         calls = [
             node
             for node in ast.walk(helper)
