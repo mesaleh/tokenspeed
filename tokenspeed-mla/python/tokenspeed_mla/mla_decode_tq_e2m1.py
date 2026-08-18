@@ -37,13 +37,11 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
-
 from tokenspeed_mla.mla_decode_fp8 import (
     BlackwellMultiHeadLatentAttentionForwardFP8,
 )
 from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
 from tokenspeed_mla.utils import get_max_active_clusters, get_num_sm
-
 
 _PAGE_SIZE = 32
 _LATENT_DIM = 512
@@ -53,6 +51,18 @@ _NUM_HEADS = 8
 _SUPPORTED_QUERY_LENGTHS = (1, 5)
 _MMA_QK_TILER = (64, 128)
 _MMA_PV_TILER = (64, 256)
+
+
+def _use_packed_p_scale_math(batch: int, query_len: int) -> bool:
+    """Select packed P-scale arithmetic only for B1 q5 verification."""
+    if batch <= 0:
+        raise ValueError(f"query batch must be positive, got {batch}")
+    if query_len not in _SUPPORTED_QUERY_LENGTHS:
+        raise ValueError(
+            "TurboQuant E2M1 MLA packed P-scale routing supports only "
+            f"q_len 1 or 5, got {query_len}"
+        )
+    return batch == 1 and query_len == 5
 
 
 def _require_tensor(
@@ -125,8 +135,7 @@ def _validate_inputs(
         raise ValueError(f"query batch must be positive, got {batch}")
     if query_len not in _SUPPORTED_QUERY_LENGTHS:
         raise ValueError(
-            "TurboQuant E2M1 MLA decode supports only q_len 1 or 5, "
-            f"got {query_len}"
+            "TurboQuant E2M1 MLA decode supports only q_len 1 or 5, " f"got {query_len}"
         )
     if num_heads != _NUM_HEADS or latent_dim != _LATENT_DIM:
         raise ValueError(
@@ -281,9 +290,7 @@ def _validate_inputs(
             raise ValueError("lse_out requires return_lse=True")
 
     writable = tuple(
-        tensor
-        for tensor in (out, lse_out, workspace_buffer)
-        if tensor is not None
+        tensor for tensor in (out, lse_out, workspace_buffer) if tensor is not None
     )
     readonly = (
         query_latent,
@@ -313,12 +320,8 @@ _COMPILE_LOCK = threading.Lock()
 _MAX_COMPILED_VARIANTS = 128
 
 
-def _as_cute_tensor(
-    tensor: torch.Tensor, dtype, leading_dim: int, assumed_align: int
-):
-    result = from_dlpack(
-        tensor, assumed_align=assumed_align, enable_tvm_ffi=True
-    )
+def _as_cute_tensor(tensor: torch.Tensor, dtype, leading_dim: int, assumed_align: int):
+    result = from_dlpack(tensor, assumed_align=assumed_align, enable_tvm_ffi=True)
     result.element_type = dtype
     return result.mark_layout_dynamic(leading_dim=leading_dim)
 
@@ -362,7 +365,7 @@ def _get_compiled_tq_e2m1_kernel(
                 "safety bound"
             )
 
-        query_len = query_latent.shape[1]
+        batch, query_len = query_latent.shape[:2]
         with torch.cuda.device(query_latent.device):
             kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
                 acc_dtype=cutlass.Float32,
@@ -387,15 +390,12 @@ def _get_compiled_tq_e2m1_kernel(
                 tq_s1_scale_tma=True,
                 tq_s1_scale_stages=3,
                 tq_s1_k_rope_stages=2,
+                tq_s1_packed_p_scale_math=_use_packed_p_scale_math(batch, query_len),
             )
-            stream = cute.runtime.make_fake_stream(
-                use_tvm_ffi_env_stream=True
-            )
+            stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             compiled = cute.compile(
                 kernel,
-                _as_cute_tensor(
-                    query_latent, cutlass.Float8E4M3FN, 3, 16
-                ),
+                _as_cute_tensor(query_latent, cutlass.Float8E4M3FN, 3, 16),
                 _as_cute_tensor(query_rope, cutlass.BFloat16, 3, 16),
                 _as_cute_tensor(packed_latent, cutlass.Uint8, 2, 16),
                 _as_cute_tensor(reciprocal_rope, cutlass.BFloat16, 2, 16),
@@ -419,9 +419,7 @@ def _get_compiled_tq_e2m1_kernel(
                 Float32(1.0),
                 stream,
                 enable_pdl,
-                _as_cute_tensor(
-                    reconstruction_scale, cutlass.BFloat16, 1, 16
-                ),
+                _as_cute_tensor(reconstruction_scale, cutlass.BFloat16, 1, 16),
                 options="--enable-tvm-ffi --opt-level 3",
             )
         _COMPILED_KERNELS[key] = compiled
@@ -567,9 +565,7 @@ def tokenspeed_mla_decode_tq_e2m1(
     workspace = None if workspace_size == 0 else workspace_buffer[:workspace_size]
 
     output = (
-        out
-        if out is not None
-        else torch.empty_like(query_latent, dtype=torch.bfloat16)
+        out if out is not None else torch.empty_like(query_latent, dtype=torch.bfloat16)
     )
     lse = None
     if return_lse:

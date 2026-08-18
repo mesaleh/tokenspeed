@@ -9,7 +9,6 @@ import cutlass
 import pytest
 import torch
 from cutlass import Float32, Int32
-
 from tokenspeed_mla.mla_decode_fp8 import (
     BlackwellMultiHeadLatentAttentionForwardFP8,
 )
@@ -17,15 +16,14 @@ from tokenspeed_mla.mla_decode_tq_e2m1 import (
     _MMA_QK_TILER,
     _NUM_HEADS,
     _get_compiled_tq_e2m1_kernel,
+    _use_packed_p_scale_math,
     tokenspeed_mla_decode_tq_e2m1,
 )
 from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
 from tokenspeed_mla.utils import get_num_sm
 
-
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (10, 0),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="packed E2M1 MLA decode requires SM100",
 )
 
@@ -79,6 +77,18 @@ def _bit_carrier(bits: int) -> tuple[int, int, int]:
     exponent = biased_exponent - 134 + (mantissa > 0x600000)
     exponent = max(-16, min(16, exponent))
     return exponent, (exponent + 127) << 23, (127 - exponent) << 23
+
+
+def test_packed_p_scale_routing_is_b1_q5_only():
+    for batch in (1, 2, 4, 8):
+        assert _use_packed_p_scale_math(batch, 1) is False
+        assert _use_packed_p_scale_math(batch, 5) is (batch == 1)
+    for unsupported_batch in (0, -1):
+        with pytest.raises(ValueError, match="query batch must be positive"):
+            _use_packed_p_scale_math(unsupported_batch, 5)
+    for unsupported_query_len in (0, 2, 4, 6):
+        with pytest.raises(ValueError, match="supports only q_len 1 or 5"):
+            _use_packed_p_scale_math(1, unsupported_query_len)
 
 
 def test_carrier_exponent_selector_is_exhaustively_exact():
@@ -167,17 +177,18 @@ def _inputs(query_len: int, seq_len: int, batch: int = 2):
     dim = torch.arange(_LATENT, device=device)[None, :]
     codes = ((token * 5 + dim * 3 + 1) % 15 + 1).to(torch.uint8)
     packed = _pack(codes.view(num_pages, _PAGE_SIZE, _LATENT)).contiguous()
-    levels = _E2M1.to(device)[codes.long()].view(
-        num_pages, _PAGE_SIZE, _LATENT
-    )
+    levels = _E2M1.to(device)[codes.long()].view(num_pages, _PAGE_SIZE, _LATENT)
 
     flat_scale = torch.pow(2.0, (-8 + token[:, 0] % 7).float())
     scale = flat_scale.to(torch.bfloat16).view(num_pages, _PAGE_SIZE).contiguous()
     rope_dim = torch.arange(_ROPE, device=device)[None, :]
     raw_rope = (((token * 7 + rope_dim * 11 + 3) % 9) - 4) / 2.0
     reciprocal_rope = (
-        raw_rope / scale.view(-1, 1).float()
-    ).to(torch.bfloat16).view(num_pages, _PAGE_SIZE, _ROPE).contiguous()
+        (raw_rope / scale.view(-1, 1).float())
+        .to(torch.bfloat16)
+        .view(num_pages, _PAGE_SIZE, _ROPE)
+        .contiguous()
+    )
 
     rows = []
     for request in range(batch):
@@ -230,9 +241,9 @@ def _reference(inputs: dict[str, torch.Tensor], query_len: int):
         levels = inputs["_levels"][pages].reshape(-1, _LATENT)[:length]
         scale = inputs["reconstruction_scale"][pages].reshape(-1).float()[:length]
         latent = levels * scale[:, None]
-        reciprocal_rope = inputs["reciprocal_rope"][pages].reshape(
-            -1, _ROPE
-        )[:length].float()
+        reciprocal_rope = (
+            inputs["reciprocal_rope"][pages].reshape(-1, _ROPE)[:length].float()
+        )
         rope = reciprocal_rope * scale[:, None]
         request_results = []
         request_lses = []
@@ -250,9 +261,7 @@ def _reference(inputs: dict[str, torch.Tensor], query_len: int):
             )
             score *= inputs["softmax_scale"]
             request_results.append(torch.softmax(score, dim=-1) @ latent[:causal_bound])
-            request_lses.append(
-                torch.logsumexp(score, dim=-1) * math.log2(math.e)
-            )
+            request_lses.append(torch.logsumexp(score, dim=-1) * math.log2(math.e))
         results.append(torch.stack(request_results))
         lses.append(torch.stack(request_lses))
     return torch.stack(results), torch.stack(lses)
@@ -279,9 +288,7 @@ def _direct_call(inputs, out, lse, return_lse):
         cutlass.Float32,
     )
     workspace = (
-        None
-        if workspace_size == 0
-        else inputs["workspace_buffer"][:workspace_size]
+        None if workspace_size == 0 else inputs["workspace_buffer"][:workspace_size]
     )
     compiled = _get_compiled_tq_e2m1_kernel(
         query_latent=inputs["query_latent"],
@@ -319,9 +326,12 @@ def _direct_call(inputs, out, lse, return_lse):
         )
 
 
-@pytest.mark.parametrize("query_len,seq_len", [(1, 33), (1, 257), (5, 257)])
-def test_public_matches_direct_owner_and_reference(query_len, seq_len):
-    inputs = _inputs(query_len, seq_len)
+@pytest.mark.parametrize(
+    "query_len,seq_len,batch",
+    [(1, 33, 2), (1, 257, 2), (5, 257, 1), (5, 257, 2)],
+)
+def test_public_matches_direct_owner_and_reference(query_len, seq_len, batch):
+    inputs = _inputs(query_len, seq_len, batch=batch)
     shape = inputs["query_latent"].shape
     direct_out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
     public_out = torch.empty_like(direct_out)
@@ -363,9 +373,9 @@ def test_public_fail_closed_contract():
         tokenspeed_mla_decode_tq_e2m1(**bad)
 
 
-@pytest.mark.parametrize("query_len", [1, 5])
-def test_public_cuda_graph_replay_is_allocation_stable(query_len):
-    inputs = _inputs(query_len=query_len, seq_len=257, batch=2)
+@pytest.mark.parametrize("query_len,batch", [(1, 2), (5, 1), (5, 2)])
+def test_public_cuda_graph_replay_is_allocation_stable(query_len, batch):
+    inputs = _inputs(query_len=query_len, seq_len=257, batch=batch)
     public_inputs = {
         key: value for key, value in inputs.items() if not key.startswith("_")
     }
