@@ -282,7 +282,7 @@ def _reference(inputs: dict[str, torch.Tensor], query_len: int):
     return torch.stack(results), torch.stack(lses)
 
 
-def _direct_call(inputs, out, lse, return_lse):
+def _direct_call(inputs, out, lse, return_lse, split_override=None):
     query_len = inputs["query_latent"].shape[1]
     batch = inputs["query_latent"].shape[0]
     fold = get_mla_decode_fold_sq_factor(_NUM_HEADS, query_len, 64)
@@ -294,6 +294,8 @@ def _direct_call(inputs, out, lse, return_lse):
         get_num_sm(inputs["query_latent"].device),
         1,
     )
+    if split_override is not None:
+        split = split_override
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
         _NUM_HEADS * fold,
         query_len // fold,
@@ -339,6 +341,29 @@ def _direct_call(inputs, out, lse, return_lse):
             Float32(1.0),
             inputs["reconstruction_scale"],
         )
+
+
+@pytest.mark.parametrize("split", [1, 2, 3, 7, 64])
+def test_early_final_pcor_forced_split_tails_match_reference(split):
+    # One more K tile than the split count plus an N128 tail makes every split
+    # exercise the moved local-final publication, including uneven ownership.
+    inputs = _inputs(query_len=5, seq_len=split * 128 + 33, batch=1)
+    shape = inputs["query_latent"].shape
+    observed = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    observed_lse = torch.empty(shape[:-1], dtype=torch.float32, device="cuda")
+
+    _direct_call(
+        inputs,
+        observed,
+        observed_lse,
+        return_lse=True,
+        split_override=split,
+    )
+    torch.cuda.synchronize()
+
+    expected, expected_lse = _reference(inputs, query_len=5)
+    torch.testing.assert_close(observed.float(), expected, atol=0.75, rtol=0.35)
+    torch.testing.assert_close(observed_lse, expected_lse, atol=0.2, rtol=0.02)
 
 
 @pytest.mark.parametrize(
