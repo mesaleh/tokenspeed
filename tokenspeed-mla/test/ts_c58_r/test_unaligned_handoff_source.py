@@ -101,14 +101,10 @@ class UnalignedHandoffSourceTest(unittest.TestCase):
         ]
         self.assertEqual(allocator_waits, [])
 
-        conversion_waits = [
-            node
-            for node in ast.walk(self.tree)
-            if isinstance(node, ast.Call)
-            and dotted_name(node.func)
-            == "self.tq4_conversion_sync_bar.arrive_and_wait"
-        ]
-        self.assertEqual(len(conversion_waits), 5)
+        # Later kernels removed the old TQ conversion barrier entirely.  The
+        # repair's invariant is narrower: only the three TMEM pointer handoff
+        # waits use the explicit unaligned helper.  The exact helper-call count
+        # above keeps future barrier changes from being swept into this fix.
 
 
 if __name__ == "__main__":
