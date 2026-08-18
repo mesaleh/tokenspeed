@@ -52,9 +52,7 @@ def test_transform_rejects_wrong_dimension(dimension: int) -> None:
 def test_sign_identity_is_sealed(which: str) -> None:
     class MutatedMath(FakeMath):
         @staticmethod
-        def make_sign_contract(
-            device: torch.device | str, dim: int
-        ) -> SimpleNamespace:
+        def make_sign_contract(device: torch.device | str, dim: int) -> SimpleNamespace:
             result = FakeMath.make_sign_contract(device, dim)
             setattr(result, f"{which}_sha256", "0" * 64)
             return result

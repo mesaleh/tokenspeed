@@ -150,15 +150,11 @@ def _transform_dot_self_test(q0_math: ModuleType) -> dict[str, Any]:
         "signs2_sha256": EXPECTED_SIGNS2_SHA256,
         "maximum_absolute_error": maximum_absolute_error,
         "scaled_absolute_error": scaled_absolute_error,
-        "maximum_scaled_absolute_error": (
-            MAX_TRANSFORM_DOT_SCALED_ABSOLUTE_ERROR
-        ),
+        "maximum_scaled_absolute_error": (MAX_TRANSFORM_DOT_SCALED_ABSOLUTE_ERROR),
     }
 
 
-def _install_r28(
-    r26: ModuleType, q0_math: ModuleType
-) -> None:
+def _install_r28(r26: ModuleType, q0_math: ModuleType) -> None:
     def prepare(
         key_rope_bf16: torch.Tensor,
         token_scale_bf16: torch.Tensor,
@@ -177,8 +173,7 @@ def _install_r28(
             )
         if token_scale_bf16.dtype != torch.bfloat16:
             raise EvidenceError(
-                "R28 scale must originate as BF16, got "
-                f"{token_scale_bf16.dtype}"
+                "R28 scale must originate as BF16, got " f"{token_scale_bf16.dtype}"
             )
         if key_rope_bf16.ndim != 2 or key_rope_bf16.shape[1] != TRANSFORM_DIMENSION:
             raise EvidenceError(
@@ -361,7 +356,9 @@ def _install_r28(
         if n8["mse"] != float(n8_surface["candidate_mse"]) or n8[
             "attention_kl"
         ] != float(n8_surface["candidate_attention_kl"]):
-            raise EvidenceError(f"accepted N8 cell did not reproduce: {layer_id}:{label}")
+            raise EvidenceError(
+                f"accepted N8 cell did not reproduce: {layer_id}:{label}"
+            )
         exact = r26._quality_arm(
             score=exact_score, label="R28 exact transformed reciprocal", **arm_args
         )
@@ -475,9 +472,7 @@ def _finalize_result(
             if "r26" in surface:
                 surface["r28"] = surface.pop("r26")
             if "r26_to_n8_mse_ratio" in surface:
-                surface["r28_to_n8_mse_ratio"] = surface.pop(
-                    "r26_to_n8_mse_ratio"
-                )
+                surface["r28_to_n8_mse_ratio"] = surface.pop("r26_to_n8_mse_ratio")
             if "r26_to_n8_attention_kl_ratio" in surface:
                 surface["r28_to_n8_attention_kl_ratio"] = surface.pop(
                     "r26_to_n8_attention_kl_ratio"
