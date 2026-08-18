@@ -16,6 +16,7 @@ from tokenspeed_mla.mla_decode_tq_e2m1 import (
     _MMA_QK_TILER,
     _NUM_HEADS,
     _get_compiled_tq_e2m1_kernel,
+    _use_early_final_pcor,
     _use_packed_p_scale_math,
     tokenspeed_mla_decode_tq_e2m1,
 )
@@ -89,6 +90,20 @@ def test_packed_p_scale_routing_is_b1_q5_only():
     for unsupported_query_len in (0, 2, 4, 6):
         with pytest.raises(ValueError, match="supports only q_len 1 or 5"):
             _use_packed_p_scale_math(1, unsupported_query_len)
+
+
+def test_early_final_pcor_routing_matches_packed_b1_q5_owner():
+    for batch in (1, 2, 4, 8):
+        for query_len in (1, 5):
+            assert _use_early_final_pcor(batch, query_len) is (
+                batch == 1 and query_len == 5
+            )
+    for unsupported_batch in (0, -1):
+        with pytest.raises(ValueError, match="query batch must be positive"):
+            _use_early_final_pcor(unsupported_batch, 5)
+    for unsupported_query_len in (0, 2, 4, 6):
+        with pytest.raises(ValueError, match="supports only q_len 1 or 5"):
+            _use_early_final_pcor(1, unsupported_query_len)
 
 
 def test_carrier_exponent_selector_is_exhaustively_exact():

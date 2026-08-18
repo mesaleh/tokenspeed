@@ -65,6 +65,11 @@ def _use_packed_p_scale_math(batch: int, query_len: int) -> bool:
     return batch == 1 and query_len == 5
 
 
+def _use_early_final_pcor(batch: int, query_len: int) -> bool:
+    """Select early final correction publication only for its q5/B1 owner."""
+    return _use_packed_p_scale_math(batch, query_len)
+
+
 def _require_tensor(
     name: str,
     tensor: torch.Tensor,
@@ -366,6 +371,8 @@ def _get_compiled_tq_e2m1_kernel(
             )
 
         batch, query_len = query_latent.shape[:2]
+        use_packed_p_scale_math = _use_packed_p_scale_math(batch, query_len)
+        use_early_final_pcor = _use_early_final_pcor(batch, query_len)
         with torch.cuda.device(query_latent.device):
             kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
                 acc_dtype=cutlass.Float32,
@@ -390,7 +397,8 @@ def _get_compiled_tq_e2m1_kernel(
                 tq_s1_scale_tma=True,
                 tq_s1_scale_stages=3,
                 tq_s1_k_rope_stages=2,
-                tq_s1_packed_p_scale_math=_use_packed_p_scale_math(batch, query_len),
+                tq_s1_packed_p_scale_math=use_packed_p_scale_math,
+                tq_s1_early_final_pcor=use_early_final_pcor,
             )
             stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             compiled = cute.compile(

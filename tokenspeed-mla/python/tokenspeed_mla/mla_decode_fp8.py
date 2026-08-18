@@ -269,6 +269,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tq_s1_scale_stages: int = 0,
         tq_s1_k_rope_stages: int = 0,
         tq_s1_packed_p_scale_math: bool = False,
+        tq_s1_early_final_pcor: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -298,6 +299,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param tq_s1_packed_p_scale_math: Apply the TQ probability scale and
             carrier reciprocal with ordered packed FP32x2 multiplies
         :type tq_s1_packed_p_scale_math: bool
+        :param tq_s1_early_final_pcor: Publish final-tile correction metadata
+            as soon as the final row sum is complete
+        :type tq_s1_early_final_pcor: bool
         """
 
         self.latent_dim = 512
@@ -329,6 +333,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tq_s1_scale_stages = tq_s1_scale_stages
         self.tq_s1_k_rope_stages = tq_s1_k_rope_stages
         self.tq_s1_packed_p_scale_math = tq_s1_packed_p_scale_math
+        self.tq_s1_early_final_pcor = tq_s1_early_final_pcor
         if (
             self.tq_s1_scale_ceiling or self.tq_s1_scale_diag or self.tq_s1_scale_tma
         ) and not self.use_tq_e2m1:
@@ -351,6 +356,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError("S1 scale-stage override requires paged scale TMA")
         if self.tq_s1_packed_p_scale_math and not self.tq_s1_scale_tma:
             raise ValueError("S1 packed P-scale math requires paged scale TMA")
+        if self.tq_s1_early_final_pcor and not (
+            self.use_tq_e2m1
+            and self.tq_s1_scale_tma
+            and self.tq_s1_packed_p_scale_math
+        ):
+            raise ValueError(
+                "S1 early final correction publication requires the packed "
+                "TurboQuant paged-scale path"
+            )
         if self.tq_s1_k_rope_stages not in (0, 1, 2):
             raise ValueError("S1 key-RoPE stages must be one of 0, 1, or 2")
         if self.use_tq_e2m1 and (cp_world != 1 or mma_qk_tiler_mn[0] != 64):
@@ -366,6 +380,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.use_m64_ws = not self.use_2cta_instrs
         if self.tq_s1_k_rope_stages and not (self.use_tq_e2m1 and self.use_m64_ws):
             raise ValueError("S1 key-RoPE stage override requires TurboQuant M64 WS")
+        if self.tq_s1_early_final_pcor and not self.use_m64_ws:
+            raise ValueError("S1 early final correction publication requires M64 WS")
         # Warps 0-1 handle first N half; warps 2-3 handle second N half.
         self.warps_in_n = 2
         self.num_compute_warps = 4
@@ -4209,6 +4225,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
         row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
+        # Final-tile correction metadata depends on the current row sum, but
+        # not on quantized/shared P or its MMA commit. Publish it at the first
+        # exact point so correction warps can reach their independent MMA-O
+        # wait while P production continues.
+        if cutlass.const_expr(self.tq_s1_early_final_pcor):
+            if cutlass.const_expr(is_local_last_tile):
+                p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                    common_params,
+                    softmax_params,
+                    correction_factor,
+                    row_sum,
+                    row_max,
+                    row_max_new,
+                    tAcc,
+                    tidx,
+                    p_cor_producer_state,
+                    previous_carrier_scale == carrier_scale,
+                    carrier_exp,
+                )
+
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
 
         # Quantize.  E2M1 PV consumes P*scale/G so its accumulator is kept in
@@ -4365,19 +4401,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # split kv case
         if cutlass.const_expr(is_local_last_tile):
-            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
-                common_params,
-                softmax_params,
-                correction_factor,
-                row_sum,
-                row_max,
-                row_max_new,
-                tAcc,
-                tidx,
-                p_cor_producer_state,
-                previous_carrier_scale == carrier_scale,
-                carrier_exp,
-            )
+            if cutlass.const_expr(not self.tq_s1_early_final_pcor):
+                p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                    common_params,
+                    softmax_params,
+                    correction_factor,
+                    row_sum,
+                    row_max,
+                    row_max_new,
+                    tAcc,
+                    tidx,
+                    p_cor_producer_state,
+                    previous_carrier_scale == carrier_scale,
+                    carrier_exp,
+                )
 
         # store correction factor/row_sum/row_max to tmem for correction warp
         common_params.p_cor_pipeline.producer_acquire(
