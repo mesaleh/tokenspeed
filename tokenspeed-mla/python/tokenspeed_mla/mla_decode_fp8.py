@@ -62,7 +62,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import builtin, llvm, nvvm
 from cutlass.cute.arch import Arch
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Boolean, Int32
+from cutlass.cute.typing import Boolean, Int32, Int64
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -149,6 +149,71 @@ def tcgen05_mma_ws_f8f6f4_one(
             idesc,
             enable_input_d,
         )
+
+
+@cute.jit
+def tcgen05_mma_ws_f8f6f4_packed_b_one(
+    tCrA: cute.Tensor,
+    packed_b: cute.Tensor,
+    k_block: int,
+    tCtC: cute.Tensor,
+    idesc_val: Int32,
+    accumulate: Boolean,
+):
+    """Issue one WS K32 mixed MMA from an expanded packed-E2M1 B tile."""
+    d = builtin.unrealized_conversion_cast([Int32.mlir_type], [tCtC.iterator.value])
+    d = llvm.inttoptr(llvm.PointerType.get(6), d)
+    a = tcgen05.smem_descriptor_to_int(tCrA.iterator).ir_value()
+    # No-swizzle K-major B is blocked as (N/8, K/16, N%8, K%16).
+    # Advancing one logical K32 MMA block therefore skips two 128-byte
+    # K16 panels, rather than 32 bytes of a row-major representation.
+    address = Int32((packed_b.iterator + k_block * 256).toint())
+    b = Int64(
+        nvvm.tcgen05_mma_smem_desc(
+            Int32(address >> Int32(4)).ir_value(),
+            Int32(8).ir_value(),
+            Int32(32).ir_value(),
+            cutlass.Int8(0).ir_value(),
+            Boolean(False).ir_value(),
+            cutlass.Int8(0).ir_value(),
+        )
+    )
+    with cute.arch.elect_one():
+        nvvm.tcgen05_mma_ws(
+            nvvm.Tcgen05MMAKind.F8F6F4,
+            d,
+            a,
+            b.ir_value(),
+            idesc_val.ir_value(),
+            accumulate.ir_value(),
+        )
+
+
+@cute.jit
+def expand_r31_e2m1_smem_in_place(packed_b: cute.Tensor):
+    """Expand compact K64 rows to SM100's data-plus-padding E2M1 layout."""
+    lane = cute.arch.lane_idx()
+    byte_ptr = cute.recast_ptr(packed_b.iterator, dtype=cutlass.Uint8)
+    u64_ptr = cute.recast_ptr(byte_ptr, dtype=cutlass.Uint64)
+    values = cute.make_rmem_tensor(cute.make_layout(16), cutlass.Uint64)
+
+    # Snapshot all 4 KiB before storing: the K-major panel permutation has
+    # destinations on both sides of their compact source positions.
+    for batch in cutlass.range_constexpr(16):
+        group_linear = batch * 32 + lane
+        values[batch] = (u64_ptr + group_linear).load()
+    cute.arch.sync_warp()
+
+    # Each 16-value E2M1 group is 8B data plus 8B mandatory padding.  The
+    # no-swizzle K-major physical order is N8 x K16 blocked, not row-major.
+    for batch in cutlass.range_constexpr(16):
+        group_linear = batch * 32 + lane
+        row = group_linear // 4
+        group = group_linear % 4
+        destination = (row // 8) * 64 + group * 16 + (row % 8) * 2
+        (u64_ptr + destination).store(values[batch])
+        (u64_ptr + destination + 1).store(cutlass.Uint64(0))
+    cute.arch.sync_warp()
 
 
 @cute.jit
@@ -711,16 +776,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             c_latent = _reinterpret_3d_kv(c_latent)
         c_rope = _reinterpret_3d_kv(c_rope)
         if cutlass.const_expr(self.use_tq_r31_rope):
-            # The persistent ABI pads each 64-value residual row to 64 bytes:
-            # 32 packed data bytes followed by 32 zero bytes. Recast that row
-            # as 128 logical E2M1 values so CUTLASS 4.6 can use its proven K128
-            # TMA-unpack path; only the first two K32 MMA blocks are consumed.
-            residual_cache_dim = self.rope_dim * 2
+            # Keep the persistent ABI compact: 64 E2M1 values occupy 32 bytes.
+            # The MMA warp expands the tile to SM100's data-plus-padding SMEM
+            # representation after the raw uint8 TMA load completes.
+            residual_cache_dim = self.rope_dim // 2
             c_rope_residual = cute.make_tensor(
-                cute.recast_ptr(
-                    c_rope_residual.iterator,
-                    dtype=cutlass.Float4E2M1FN,
-                ),
+                c_rope_residual.iterator,
                 cute.make_layout(
                     (
                         c_rope_residual.shape[1],
@@ -1003,25 +1064,43 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kc_rope_residual_smem_layout_staged = None
         kc_rope_residual_smem_layout_for_tma = None
         if cutlass.const_expr(self.use_tq_r31_rope):
-            residual_cache_dim = self.rope_dim * 2
-            kc_rope_residual_smem_layout_staged = sm100_utils.make_smem_layout_b(
-                qk_tiled_mma,
-                self.mma_qk_tiler,
-                self.k_smem_dtype,
-                self.load_k_rope_smem_stage,
-            )
-            residual_tma_layout_staged = sm100_utils.make_smem_layout(
-                OperandMajorMode.K,
-                (
-                    self.mma_qk_tiler[0] // qk_tiled_mma.thr_id.shape,
-                    residual_cache_dim,
+            residual_cache_bytes = self.rope_dim // 2
+            residual_smem_bytes = self.rope_dim
+            kc_rope_residual_smem_layout_staged = cute.make_composed_layout(
+                cute.make_swizzle(0, 4, 3),
+                0,
+                cute.make_layout(
+                    (
+                        self.mma_qk_tiler[1],
+                        residual_smem_bytes,
+                        self.load_k_rope_smem_stage,
+                    ),
+                    stride=(
+                        residual_smem_bytes,
+                        1,
+                        self.mma_qk_tiler[1] * residual_smem_bytes,
+                    ),
                 ),
-                self.k_smem_dtype,
-                self.load_k_rope_smem_stage,
+            )
+            residual_tma_layout_staged = cute.make_composed_layout(
+                cute.make_swizzle(0, 4, 3),
+                0,
+                cute.make_layout(
+                    (
+                        self.mma_qk_tiler[1],
+                        residual_cache_bytes,
+                        self.load_k_rope_smem_stage,
+                    ),
+                    stride=(
+                        residual_cache_bytes,
+                        1,
+                        self.mma_qk_tiler[1] * residual_smem_bytes,
+                    ),
+                ),
             )
             kc_rope_residual_smem_layout_for_tma = cute.tiled_divide(
                 residual_tma_layout_staged,
-                (kc_page_tile_size, residual_cache_dim),
+                (kc_page_tile_size, residual_cache_bytes),
             )
 
         p_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -1124,10 +1203,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tma_load_op,
                 c_rope_residual,
                 kc_rope_residual_smem_layout,
-                (self.mma_qk_rope_tiler[1], self.rope_dim * 2),
+                (self.mma_qk_rope_tiler[1], self.rope_dim // 2),
                 qk_tiled_mma,
                 is_k_load=True,
-                unpack_e2m1=True,
             )
 
         # TMA load for c latent transpose
@@ -1207,14 +1285,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             kc_rope_copy_size = cute.size_in_bytes(
                 self.rope_dtype,
                 cute.select(kc_rope_smem_layout_staged, mode=[0, 1, 2]),
-            ) * cute.size(qk_tiled_mma.thr_id.shape) + cute.size_in_bytes(
-                cutlass.Float4E2M1FN,
-                cute.select(
-                    kc_rope_residual_smem_layout_staged,
-                    mode=[0, 1, 2],
-                ),
-            ) * cute.size(
-                qk_tiled_mma.thr_id.shape
+            ) * cute.size(qk_tiled_mma.thr_id.shape) + (
+                self.mma_qk_tiler[1] * (self.rope_dim // 2) * cutlass.Uint8.width // 8
             )
         vc_copy_size = (
             cute.size_in_bytes(
@@ -2656,7 +2728,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(self.use_tq_r31_rope):
             gKRResidual = cute.tiled_divide(
                 k_params.mKRResidual,
-                (page_tile_size, self.rope_dim * 2),
+                (page_tile_size, self.rope_dim // 2),
             )
             tSgKRResidual = (
                 gKRResidual[
@@ -3003,21 +3075,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 tma_bar_ptr=tma_bar_ptr,
                             )
             if cutlass.const_expr(self.use_tq_r31_rope):
+                residual_stage_base = cute.domain_offset(
+                    (0, 0, k_rope_stage),
+                    k_params.sKC_rope_residual_full,
+                )
                 for k in cutlass.range_constexpr(page_per_tile):
-                    residual_page_base = cute.domain_offset(
-                        (
-                            (k * self.page_size, 0),
-                            0,
-                            0,
-                            k_rope_stage,
-                        ),
-                        k_params.sKC_rope_residual_full,
+                    residual_page = cute.make_tensor(
+                        residual_stage_base.iterator
+                        + k * self.page_size * (self.rope_dim // 2),
+                        k_params.sKC_rope_residual.layout,
                     )
                     tResidualS, tResidualG = cpasync.tma_partition(
                         k_params.tma_atom_c_rope_residual,
                         0,
                         cute.make_layout(1),
-                        residual_page_base,
+                        residual_page,
                         k_params.tSgKRResidual,
                     )
                     cute.copy(
@@ -3222,11 +3294,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tSrQ_rope = common_params.tiled_mma_rope.make_fragment_A(qk_params.sQ_rope)
         tSrKC = tiled_mma_qk.make_fragment_B(qk_params.sKC)
         tSrKC_rope = common_params.tiled_mma_rope.make_fragment_B(qk_params.sKC_rope)
-        tSrKC_rope_residual = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
-            tSrKC_rope_residual = tiled_mma_qk.make_fragment_B(
-                qk_params.sKC_rope_residual
-            )
         tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
         tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
 
@@ -3277,7 +3344,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         qk_params.tSrQ_rope = tSrQ_rope
         qk_params.tSrKC = tSrKC
         qk_params.tSrKC_rope = tSrKC_rope
-        qk_params.tSrKC_rope_residual = tSrKC_rope_residual
         qk_params.tStS_staged = tStS_staged
         pv_params.tOrP = tOrP
         pv_params.tOrVC = tOrVC
@@ -3450,6 +3516,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_k_rope_pipeline = common_params.load_k_rope_pipeline
             load_k_rope_pipeline.consumer_wait(load_k_rope_consumer_state)
             if cutlass.const_expr(self.use_tq_r31_rope):
+                residual_stage = qk_params.sKC_rope_residual[
+                    None,
+                    None,
+                    k_rope_stage,
+                ]
+                expand_r31_e2m1_smem_in_place(residual_stage)
+                cute.arch.fence_view_async_shared()
                 for q_stage in cutlass.range_constexpr(2):
                     for k_block in cutlass.range_constexpr(
                         self.rope_dim // common_params.tiled_mma_rope.shape_mnk[2]
@@ -3469,14 +3542,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
                 for q_stage in cutlass.range_constexpr(2, 4):
                     for k_block in cutlass.range_constexpr(self.rope_dim // 32):
-                        tcgen05_mma_ws_f8f6f4_one(
+                        tcgen05_mma_ws_f8f6f4_packed_b_one(
                             qk_params.tSrQ_rope[None, None, k_block, q_stage],
-                            qk_params.tSrKC_rope_residual[
-                                None,
-                                None,
-                                k_block,
-                                k_rope_stage,
-                            ],
+                            residual_stage,
+                            k_block,
                             tStS,
                             Int32(_IDESC_F8E4M3_E2M1_F32_M64_N128_KMAJ_1CTA),
                             Boolean(True),

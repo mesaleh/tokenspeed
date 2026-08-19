@@ -84,12 +84,15 @@ def main() -> None:
         )
         / 8.0
     ).to(torch.float8_e4m3fn)
-    query_rope_values = torch.randint(
-        -8,
-        9,
-        (batch, query_len, HEADS, (4 if use_r31 else 1) * ROPE_DIM),
-        device=device,
-    ) / 8.0
+    query_rope_values = (
+        torch.randint(
+            -8,
+            9,
+            (batch, query_len, HEADS, (4 if use_r31 else 1) * ROPE_DIM),
+            device=device,
+        )
+        / 8.0
+    )
     query_rope = query_rope_values.to(
         torch.float8_e4m3fn if use_r31 else torch.bfloat16
     )
@@ -101,15 +104,16 @@ def main() -> None:
         device=device,
     )
     packed_latent = _pack(latent_codes).contiguous()
-    cache_rope_values = torch.randint(
-        -8,
-        9,
-        (pages, PAGE_SIZE, ROPE_DIM),
-        device=device,
-    ) / 8.0
-    high_rope = cache_rope_values.to(
-        torch.float8_e4m3fn if use_r31 else torch.bfloat16
+    cache_rope_values = (
+        torch.randint(
+            -8,
+            9,
+            (pages, PAGE_SIZE, ROPE_DIM),
+            device=device,
+        )
+        / 8.0
     )
+    high_rope = cache_rope_values.to(torch.float8_e4m3fn if use_r31 else torch.bfloat16)
     residual_codes = torch.randint(
         0,
         16,
@@ -124,11 +128,7 @@ def main() -> None:
         high_rope.zero_()
     elif component != "both":
         raise ValueError(f"unsupported R31I_COMPONENT={component!r}")
-    residual_payload = _pack(residual_codes)
-    residual_rope = torch.cat(
-        (residual_payload, torch.zeros_like(residual_payload)),
-        dim=-1,
-    ).contiguous()
+    residual_rope = _pack(residual_codes).contiguous()
     scale = torch.ones(
         (pages, PAGE_SIZE),
         dtype=torch.bfloat16,
