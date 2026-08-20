@@ -2,6 +2,7 @@
 
 """Compile and smoke-test R31's packed RoPE inside the production M64 reader."""
 
+import hashlib
 import math
 import os
 import statistics
@@ -66,7 +67,19 @@ def main() -> None:
 
     device = torch.device("cuda")
     batch = 1
-    query_len = 1
+    query_len = int(os.environ.get("R31I_QUERY_LEN", "1"))
+    if query_len not in (1, 5):
+        raise ValueError(f"unsupported R31I_QUERY_LEN={query_len}")
+    fold_sq_factor = int(os.environ.get("R31I_FOLD_SQ", "1"))
+    if (
+        fold_sq_factor <= 0
+        or query_len % fold_sq_factor != 0
+        or HEADS * fold_sq_factor > 64
+    ):
+        raise ValueError(
+            f"invalid R31I_FOLD_SQ={fold_sq_factor} for query_len={query_len}"
+        )
+    is_causal = os.environ.get("R31I_CAUSAL", "0") == "1"
     seq_len = int(os.environ.get("R31I_SEQ_LEN", "129"))
     mode = os.environ.get("R31I_MODE", "r31")
     if mode not in ("r31", "n10"):
@@ -160,8 +173,8 @@ def main() -> None:
         is_persistent=False,
         is_var_seq=True,
         is_var_split_kv=False,
-        fold_sq_factor=1,
-        is_causal=False,
+        fold_sq_factor=fold_sq_factor,
+        is_causal=is_causal,
         num_heads=HEADS,
         seq_len_q=query_len,
         cp_world=1,
@@ -171,6 +184,9 @@ def main() -> None:
         tq_s1_scale_stages=3,
         tq_s1_k_rope_stages=(
             int(os.environ.get("R31I_ROPE_STAGES", "1")) if use_r31 else 2
+        ),
+        tq_r31_async_expand=(
+            os.environ.get("R31I_ASYNC_EXPAND", "0") == "1" if use_r31 else False
         ),
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -271,14 +287,23 @@ def main() -> None:
     else:
         score += torch.einsum("bqhd,kd->bqhk", query_rope.float(), high)
     score *= 1.0 / math.sqrt(LATENT_DIM + ROPE_DIM)
+    if is_causal:
+        for query_index in range(query_len):
+            upper = max(0, seq_len - query_len + 1 + query_index)
+            score[:, query_index, :, upper:] = float("-inf")
     expected = torch.softmax(score, dim=-1) @ latent
     expected_lse = torch.logsumexp(score, dim=-1) * math.log2(math.e)
     torch.testing.assert_close(output.float(), expected, atol=0.75, rtol=0.35)
     torch.testing.assert_close(lse, expected_lse, atol=0.2, rtol=0.02)
+    output_sha256 = hashlib.sha256(
+        output.view(torch.uint16).cpu().numpy().tobytes()
+    ).hexdigest()
+    lse_sha256 = hashlib.sha256(lse.cpu().numpy().tobytes()).hexdigest()
     print(
         f"PASS mode={mode} integrated_reader=True "
         f"output_abs_max={output.float().abs().max().item():.6f} "
-        f"lse_abs_max={lse.abs().max().item():.6f}"
+        f"lse_abs_max={lse.abs().max().item():.6f} "
+        f"output_sha256={output_sha256} lse_sha256={lse_sha256}"
     )
     if os.environ.get("R31I_BENCH") == "1":
         replays = int(os.environ.get("R31I_REPLAYS", "100"))

@@ -336,6 +336,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tq_s1_k_rope_stages: int = 0,
         tq_s1_packed_p_scale_math: bool = False,
         tq_s1_early_final_pcor: bool = False,
+        tq_r31_async_expand: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -368,6 +369,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param tq_s1_early_final_pcor: Publish final-tile correction metadata
             as soon as the final row sum is complete
         :type tq_s1_early_final_pcor: bool
+        :param tq_r31_async_expand: Let the otherwise idle warp expand the
+            compact R31 residual stage while the MMA warp consumes latent K
+        :type tq_r31_async_expand: bool
         """
 
         self.latent_dim = 512
@@ -401,6 +405,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tq_s1_k_rope_stages = tq_s1_k_rope_stages
         self.tq_s1_packed_p_scale_math = tq_s1_packed_p_scale_math
         self.tq_s1_early_final_pcor = tq_s1_early_final_pcor
+        self.tq_r31_async_expand = tq_r31_async_expand
         if self.use_tq_r31_rope and not self.use_tq_e2m1:
             raise ValueError("R31 RoPE requires TurboQuant E2M1 latent cache")
         if (
@@ -434,6 +439,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
         if self.tq_s1_k_rope_stages not in (0, 1, 2):
             raise ValueError("S1 key-RoPE stages must be one of 0, 1, or 2")
+        if self.tq_r31_async_expand and not self.use_tq_r31_rope:
+            raise ValueError("R31 asynchronous expansion requires the R31 RoPE path")
         if self.use_tq_e2m1 and (cp_world != 1 or mma_qk_tiler_mn[0] != 64):
             raise ValueError("TurboQuant E2M1 K0 only supports cp_world=1 M64")
         if mma_qk_tiler_mn[0] == 128:
@@ -447,6 +454,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.use_m64_ws = not self.use_2cta_instrs
         if self.tq_s1_k_rope_stages and not (self.use_tq_e2m1 and self.use_m64_ws):
             raise ValueError("S1 key-RoPE stage override requires TurboQuant M64 WS")
+        if self.tq_r31_async_expand and self.tq_s1_k_rope_stages != 1:
+            raise ValueError(
+                "R31 asynchronous expansion requires one key-RoPE pipeline stage"
+            )
         if self.tq_s1_early_final_pcor and not self.use_m64_ws:
             raise ValueError("S1 early final correction publication requires M64 WS")
         # Warps 0-1 handle first N half; warps 2-3 handle second N half.
@@ -1343,6 +1354,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_k_rope_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_k_rope_pipeline_stage * 2
             ]
+            r31_expand_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64,
+                (2 if cutlass.const_expr(self.tq_r31_async_expand) else 0),
+            ]
             load_v_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_v_pipeline_stage * 2
             ]
@@ -1783,6 +1798,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
         else:
             load_k_rope_pipeline = load_k_pipeline
+        r31_expand_pipeline = None
+        if cutlass.const_expr(self.tq_r31_async_expand):
+            r31_expand_pipeline = self.make_and_init_r31_expand_pipeline(
+                storage.r31_expand_mbar_ptr.data_ptr(),
+                cta_layout_vmnk,
+            )
         load_v_pipeline = self.make_and_init_load_qkv_pipeline(
             storage.load_v_mbar_ptr.data_ptr(),
             cta_layout_vmnk,
@@ -2130,6 +2151,51 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_v_pipeline.producer_tail(load_v_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
+        #  R31 compact-RoPE expansion warp
+        # ///////////////////////////////////////////////////////////////////////////////
+        if cutlass.const_expr(self.tq_r31_async_expand):
+            if warp_idx == self.empty_warp_ids[0]:
+                # This warp owns the real single-stage RoPE consumer state.  It
+                # expands the next compact residual tile while the MMA warp
+                # consumes latent K.  A single-stage thread pipeline prevents
+                # both early MMA reads and producer overwrite before the mixed
+                # RoPE MMAs finish.
+                load_k_rope_expand_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer,
+                    self.load_k_rope_pipeline_stage,
+                )
+                expand_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, 1
+                )
+                r31_expand_pipeline.producer_acquire(expand_producer_state)
+                tile_sched = create_mla_static_tile_scheduler(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                while work_tile.is_valid_tile:
+                    blk_coord = work_tile.tile_idx
+                    _, k_tile_count, _ = self.get_k_tile_count(
+                        split_kv, cache_seqs, block_split_kvs, blk_coord
+                    )
+                    while k_tile_count > 0:
+                        load_k_rope_pipeline.consumer_wait(load_k_rope_expand_state)
+                        residual_stage = sKC_rope_residual[None, None, 0]
+                        expand_r31_e2m1_smem_in_place(residual_stage)
+                        cute.arch.fence_view_async_shared()
+                        r31_expand_pipeline.producer_commit(expand_producer_state)
+                        expand_producer_state.advance()
+                        # With one stage, acquiring the next producer state is
+                        # also the done wait for the tile just committed.
+                        r31_expand_pipeline.producer_acquire(expand_producer_state)
+                        load_k_rope_pipeline.consumer_release(
+                            load_k_rope_expand_state
+                        )
+                        load_k_rope_expand_state.advance()
+                        k_tile_count -= 1
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+        # ///////////////////////////////////////////////////////////////////////////////
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
@@ -2188,6 +2254,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
                         load_k_rope_pipeline=load_k_rope_pipeline,
+                        r31_expand_pipeline=r31_expand_pipeline,
                         load_v_pipeline=load_v_pipeline,
                         tmem_ptr=tmem_ptr,
                         is_leader_cta=is_leader_cta,
@@ -3514,15 +3581,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 load_k_consumer_state.advance()
 
             load_k_rope_pipeline = common_params.load_k_rope_pipeline
-            load_k_rope_pipeline.consumer_wait(load_k_rope_consumer_state)
+            if cutlass.const_expr(self.tq_r31_async_expand):
+                common_params.r31_expand_pipeline.consumer_wait(
+                    load_k_rope_consumer_state
+                )
+            else:
+                load_k_rope_pipeline.consumer_wait(load_k_rope_consumer_state)
             if cutlass.const_expr(self.use_tq_r31_rope):
                 residual_stage = qk_params.sKC_rope_residual[
                     None,
                     None,
                     k_rope_stage,
                 ]
-                expand_r31_e2m1_smem_in_place(residual_stage)
-                cute.arch.fence_view_async_shared()
+                if cutlass.const_expr(not self.tq_r31_async_expand):
+                    expand_r31_e2m1_smem_in_place(residual_stage)
+                    cute.arch.fence_view_async_shared()
                 for q_stage in cutlass.range_constexpr(2):
                     for k_block in cutlass.range_constexpr(
                         self.rope_dim // common_params.tiled_mma_rope.shape_mnk[2]
@@ -3593,8 +3666,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 Boolean(True),
                             )
                         tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
-            load_k_rope_pipeline.consumer_release(load_k_rope_consumer_state)
-            load_k_rope_consumer_state.advance()
+            if cutlass.const_expr(self.tq_r31_async_expand):
+                common_params.r31_expand_pipeline.consumer_release(
+                    load_k_rope_consumer_state
+                )
+                load_k_rope_consumer_state.advance()
+            else:
+                load_k_rope_pipeline.consumer_release(load_k_rope_consumer_state)
+                load_k_rope_consumer_state.advance()
         else:
             load_k_pipeline.consumer_wait(load_k_consumer_state)
             for q_stage in range(self.iterations_qk_latent):
@@ -5378,6 +5457,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, consumer_threads
             ),
+            defer_sync=True,
+        )
+
+    def make_and_init_r31_expand_pipeline(
+        self, barrier_storage, cta_layout_vmnk
+    ) -> pipeline.PipelineAsyncUmma:
+        """Create the warp-11 expansion to QK-UMMA completion pipeline."""
+
+        return pipeline.PipelineAsyncUmma.create(
+            barrier_storage=barrier_storage,
+            num_stages=1,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.threads_per_warp
+            ),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, len([self.mma_warp_id])
+            ),
+            cta_layout_vmnk=cta_layout_vmnk,
             defer_sync=True,
         )
 
