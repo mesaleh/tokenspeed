@@ -89,6 +89,58 @@ except ImportError:
         get_mla_decode_fold_sq_factor,
     )
 
+
+# Flattened by CuTe at the kernel ABI boundary. Keeping the complete producer
+# state in one typed tuple lets the stock one-owner launch and the mixed-owner
+# launch share the exact same device implementation.
+SplitKVKernelArgs = tuple[
+    cute.TiledMma,
+    cute.TiledMma,
+    cute.TiledMma,
+    cute.TiledMma,
+    cute.TiledMma,
+    Optional[cute.CopyAtom],
+    cute.Tensor,
+    Optional[cute.CopyAtom],
+    cute.Tensor,
+    Optional[cute.CopyAtom],
+    cute.Tensor,
+    Optional[cute.CopyAtom],
+    cute.Tensor,
+    Optional[cute.CopyAtom],
+    Optional[cute.Tensor],
+    Optional[cute.CopyAtom],
+    cute.Tensor,
+    Optional[cute.CopyAtom],
+    Optional[cute.Tensor],
+    Optional[cute.Tensor],
+    Optional[cute.Tensor],
+    cute.Tensor,
+    Optional[cute.Tensor],
+    Optional[cute.Tensor],
+    Optional[cute.Tensor],
+    Optional[cute.Tensor],
+    cutlass.Int32,
+    cute.Tensor,
+    cute.Tensor,
+    Optional[cute.Tensor],
+    cutlass.Float32,
+    cutlass.Float32,
+    cute.ComposedLayout,
+    cute.ComposedLayout,
+    cute.ComposedLayout,
+    cute.ComposedLayout,
+    Optional[cute.ComposedLayout],
+    cute.ComposedLayout,
+    cute.ComposedLayout,
+    Optional[cute.ComposedLayout],
+    Optional[cute.ComposedLayout],
+    Optional[cute.ComposedLayout],
+    Optional[cute.ComposedLayout],
+    cute.Layout,
+    MLAStaticTileSchedulerParams,
+]
+
 # Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
 # For how to construct the Instruction Descriptor value.
 # Note: this is a WAR for WS mode MMA, need to be replaced when CuTe DSL supports.
@@ -338,6 +390,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tq_s1_early_final_pcor: bool = False,
         tq_r31_async_expand: bool = False,
         producer_only: bool = False,
+        use_runtime_causal_bound: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -373,6 +426,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param tq_r31_async_expand: Let the otherwise idle warp expand the
             compact R31 residual stage while the MMA warp consumes latent K
         :type tq_r31_async_expand: bool
+        :param use_runtime_causal_bound: For causal cp_world=1 kernels, derive
+            each request's visible key bound from causal_seqs. A value of
+            cache_seq + seq_len_q - 1 represents a non-causal segment.
+        :type use_runtime_causal_bound: bool
         :param producer_only: Publish split-KV partials to caller-owned
             workspace without launching the ordinary reduction kernel
         :type producer_only: bool
@@ -399,6 +456,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         self.cp_world = cp_world
+        self.use_runtime_causal_bound = use_runtime_causal_bound
         self.use_tq_e2m1 = use_tq_e2m1
         self.use_tq_r31_rope = use_tq_r31_rope
         self.tq_debug_trace = tq_debug_trace
@@ -411,6 +469,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tq_s1_early_final_pcor = tq_s1_early_final_pcor
         self.tq_r31_async_expand = tq_r31_async_expand
         self.producer_only = producer_only
+        if self.use_runtime_causal_bound and not self.is_causal:
+            raise ValueError("runtime causal bounds require a causal kernel")
+        if self.use_runtime_causal_bound and self.cp_world != 1:
+            raise ValueError("runtime causal bounds currently require cp_world=1")
         if self.use_tq_r31_rope and not self.use_tq_e2m1:
             raise ValueError("R31 RoPE requires TurboQuant E2M1 latent cache")
         if (
@@ -625,6 +687,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         c_scale: Optional[cute.Tensor] = None,
         c_scale_diag: Optional[cute.Tensor] = None,
         c_rope_residual: Optional[cute.Tensor] = None,
+        prepare_only: cutlass.Constexpr = False,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -1458,7 +1521,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         softmax_scale_log2 = softmax_scale * LOG2_E
 
-        self.split_kv_kernel(
+        split_kv_kernel_args = (
             qk_tiled_mma,
             rope_tiled_mma,
             pv_tiled_mma,
@@ -1504,6 +1567,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             vc_smem_layout_for_tma,
             cta_layout_vmnk,
             tile_sched_params,
+        )
+        if cutlass.const_expr(prepare_only):
+            return split_kv_kernel_args, grid, SplitKVKernelSharedStorage
+
+        self.split_kv_kernel(
+            split_kv_kernel_args,
             SplitKVKernelSharedStorage,
         ).launch(
             grid=grid,
@@ -1626,52 +1695,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     @cute.kernel
     def split_kv_kernel(
         self,
-        tiled_mma_qk: cute.TiledMma,
-        tiled_mma_rope: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
-        tiled_mma_ws_epi: cute.TiledMma,
-        tiled_mma_ws_splitn_epi: cute.TiledMma,
-        tma_atom_q_latent: Optional[cute.CopyAtom],
-        mQL: cute.Tensor,
-        tma_atom_q_rope: Optional[cute.CopyAtom],
-        mQR: cute.Tensor,
-        tma_atom_c_latent: Optional[cute.CopyAtom],
-        mCL: cute.Tensor,
-        tma_atom_c_rope: Optional[cute.CopyAtom],
-        mKR: cute.Tensor,
-        tma_atom_c_rope_residual: Optional[cute.CopyAtom],
-        mKRResidual: Optional[cute.Tensor],
-        tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
-        mCLT: cute.Tensor,
-        tma_atom_c_scale: Optional[cute.CopyAtom],
-        mScaleTma: Optional[cute.Tensor],
-        mScale: Optional[cute.Tensor],
-        mScaleDiag: Optional[cute.Tensor],
-        mPT: cute.Tensor,
-        mO: Optional[cute.Tensor],
-        mLSE: Optional[cute.Tensor],
-        mAccO: Optional[cute.Tensor],
-        mAccLSE: Optional[cute.Tensor],
-        split_kv: cutlass.Int32,
-        cache_seqs: cute.Tensor,
-        causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
-        block_split_kvs: cute.Tensor,
-        softmax_scale_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
-        q_latent_smem_layout_staged: cute.ComposedLayout,
-        q_rope_smem_layout_staged: cute.ComposedLayout,
-        kc_latent_smem_layout_staged: cute.ComposedLayout,
-        kc_rope_smem_layout_staged: cute.ComposedLayout,
-        kc_rope_residual_smem_layout_staged: Optional[cute.ComposedLayout],
-        p_smem_layout_staged: cute.ComposedLayout,
-        vc_smem_layout_staged: cute.ComposedLayout,
-        kc_latent_smem_layout_for_tma: Optional[cute.ComposedLayout],
-        kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
-        kc_rope_residual_smem_layout_for_tma: Optional[cute.ComposedLayout],
-        vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
-        cta_layout_vmnk: cute.Layout,
-        tile_sched_params: MLAStaticTileSchedulerParams,
+        kernel_args: SplitKVKernelArgs,
         SharedStorage: cutlass.Constexpr,
+    ):
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        self._split_kv_kernel_impl(
+            kernel_args,
+            storage,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+        )
+
+    @cute.jit
+    def _split_kv_kernel_impl(
+        self,
+        kernel_args: SplitKVKernelArgs,
+        storage,
+        physical_block_idx,
+        physical_grid_dim,
     ):
         """The device split_kv kernel implementation of the Multi-Head Latent Attention.
 
@@ -1749,10 +1791,58 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type SharedStorage: cutlass.Constexpr
         """
 
+        (
+            tiled_mma_qk,
+            tiled_mma_rope,
+            tiled_mma_pv,
+            tiled_mma_ws_epi,
+            tiled_mma_ws_splitn_epi,
+            tma_atom_q_latent,
+            mQL,
+            tma_atom_q_rope,
+            mQR,
+            tma_atom_c_latent,
+            mCL,
+            tma_atom_c_rope,
+            mKR,
+            tma_atom_c_rope_residual,
+            mKRResidual,
+            tma_atom_c_latent_transpose,
+            mCLT,
+            tma_atom_c_scale,
+            mScaleTma,
+            mScale,
+            mScaleDiag,
+            mPT,
+            mO,
+            mLSE,
+            mAccO,
+            mAccLSE,
+            split_kv,
+            cache_seqs,
+            causal_seqs,
+            block_split_kvs,
+            softmax_scale_log2,
+            output_scale,
+            q_latent_smem_layout_staged,
+            q_rope_smem_layout_staged,
+            kc_latent_smem_layout_staged,
+            kc_rope_smem_layout_staged,
+            kc_rope_residual_smem_layout_staged,
+            p_smem_layout_staged,
+            vc_smem_layout_staged,
+            kc_latent_smem_layout_for_tma,
+            kc_rope_smem_layout_for_tma,
+            kc_rope_residual_smem_layout_for_tma,
+            vc_smem_layout_for_tma,
+            cta_layout_vmnk,
+            tile_sched_params,
+        ) = kernel_args
+
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, _, _ = physical_block_idx
         mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
@@ -1770,10 +1860,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
             cpasync.prefetch_descriptor(tma_atom_q_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
-
-        # Alloc
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
@@ -1993,7 +2079,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     pipeline.PipelineUserType.Producer, self.load_scale_stage
                 )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, physical_block_idx, physical_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -2101,7 +2187,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Producer, self.load_v_pipeline_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, physical_block_idx, physical_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -2176,7 +2262,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
                 r31_expand_pipeline.producer_acquire(expand_producer_state)
                 tile_sched = create_mla_static_tile_scheduler(
-                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                    tile_sched_params, physical_block_idx, physical_grid_dim
                 )
                 work_tile = tile_sched.initial_work_tile_info()
                 while work_tile.is_valid_tile:
@@ -2237,7 +2323,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, physical_block_idx, physical_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -2354,7 +2440,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, physical_block_idx, physical_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -2434,7 +2520,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, physical_block_idx, physical_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -4492,9 +4578,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         else:
                             q_tok = common_params.blk_coord[1]
                         if cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
-                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                            if cutlass.const_expr(self.use_runtime_causal_bound):
+                                k_bound = min(
+                                    common_params.K,
+                                    common_params.K_causal
+                                    - (self.seq_len_q - 1)
+                                    + q_tok,
+                                )
+                            else:
+                                # Preserve the stock non-DCP causal path.
+                                k_bound = (
+                                    common_params.K - (self.seq_len_q - 1) + q_tok
+                                )
                         else:
                             # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
                             # the context (key c -> global position c*cp_world + dcp_rank). The
@@ -4563,9 +4658,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
                         # Int32 __rsub__ quirks when self.seq_len_q==1.
                         if cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
-                            k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                            if cutlass.const_expr(self.use_runtime_causal_bound):
+                                k_bound = min(
+                                    common_params.K,
+                                    common_params.K_causal
+                                    - (self.seq_len_q - 1)
+                                    + q_tok,
+                                )
+                            else:
+                                # Preserve the stock non-DCP causal path.
+                                k_bound = (
+                                    common_params.K - (self.seq_len_q - 1) + q_tok
+                                )
                         else:
                             # DCP (cp_world>1): this rank holds a strided 1/cp_world slice of
                             # the context (key c -> global position c*cp_world + dcp_rank). The
