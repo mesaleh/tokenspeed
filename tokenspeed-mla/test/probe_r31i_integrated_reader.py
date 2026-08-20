@@ -322,6 +322,7 @@ def main() -> None:
                 max_seq_len=seq_len,
                 softmax_scale=1.0 / math.sqrt(LATENT_DIM + ROPE_DIM),
                 out=public_output,
+                enable_pdl=os.environ.get("R31I_PDL", "0") == "1",
                 return_lse=True,
                 lse_out=public_lse,
             )
