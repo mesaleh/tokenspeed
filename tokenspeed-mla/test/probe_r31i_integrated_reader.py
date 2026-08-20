@@ -308,7 +308,11 @@ def main() -> None:
             dtype=torch.int8,
             device=device,
         )
+
         def public_launch():
+            public_kwargs = {}
+            if os.environ.get("R31I_PUBLIC_EXPLICIT_CAUSAL") == "1":
+                public_kwargs["causal_mask"] = is_causal
             return tokenspeed_mla_decode_tq_r31(
                 query_latent=query_latent,
                 query_rope=query_rope,
@@ -325,6 +329,7 @@ def main() -> None:
                 enable_pdl=os.environ.get("R31I_PDL", "0") == "1",
                 return_lse=True,
                 lse_out=public_lse,
+                **public_kwargs,
             )
 
         observed, observed_lse = public_launch()

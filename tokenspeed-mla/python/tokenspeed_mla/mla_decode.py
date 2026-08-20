@@ -368,12 +368,13 @@ def tokenspeed_mla_decode(
     causal_mask: bool = True,
     enable_pdl: bool = False,
     return_lse: bool = False,  # also return log-sum-exp (DCP cross-rank merge)
+    lse_out: Optional[torch.Tensor] = None,
     causal_seqs: Optional[
         torch.Tensor
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
     cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
     Parameters
@@ -424,6 +425,13 @@ def tokenspeed_mla_decode(
         attention each rank computes over its KV slice into the full result.
         Default False keeps the original single-tensor return and emits no
         LSE code in the compiled kernel.
+    lse_out : Optional[torch.Tensor]
+        Optional pre-allocated contiguous FP32 tensor ``[B, q_len, H]`` for
+        the returned base-2 LSE. Requires ``return_lse=True`` and avoids a
+        per-launch allocation in graph-stable segmented-attention callers.
+        Caller-owned storage is not initialized by this wrapper; callers whose
+        kernel shape can leave positions unwritten must initialize those
+        positions before launch.
     causal_seqs : Optional[torch.Tensor]
         DCP support. Per-request *global* causal bound [B] (int32) -- the full
         context length, the SAME value on every rank. Under DCP each rank holds a
@@ -534,6 +542,21 @@ def tokenspeed_mla_decode(
         o_k = torch.empty(
             (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
         )
+    if lse_out is not None and not return_lse:
+        raise ValueError("lse_out requires return_lse=True")
+    if lse_out is not None:
+        expected_lse_shape = (B, q_len, H)
+        if tuple(lse_out.shape) != expected_lse_shape:
+            raise ValueError(
+                f"lse_out must have shape {expected_lse_shape}, got "
+                f"{tuple(lse_out.shape)}"
+            )
+        if lse_out.dtype != torch.float32:
+            raise ValueError(f"lse_out must be FP32, got {lse_out.dtype}")
+        if lse_out.device != query.device:
+            raise ValueError(f"lse_out must be on {query.device}, got {lse_out.device}")
+        if not lse_out.is_contiguous():
+            raise ValueError("lse_out must be contiguous")
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
@@ -626,10 +649,15 @@ def tokenspeed_mla_decode(
         compute_capability=compute_capability,
     )
 
-    # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
-    # (not empty) so any kernel-unwritten positions are a known value, not garbage.
+    # DCP/segmented attention: use caller-owned graph-stable storage as-is when
+    # provided. Otherwise retain the zero-initialized legacy allocation so any
+    # kernel-unwritten positions are known values rather than garbage.
     if return_lse:
-        lse_real = torch.zeros((B, q_len, H), dtype=torch.float32, device=query.device)
+        lse_real = (
+            lse_out
+            if lse_out is not None
+            else torch.zeros((B, q_len, H), dtype=torch.float32, device=query.device)
+        )
     else:
         lse_real = None
 

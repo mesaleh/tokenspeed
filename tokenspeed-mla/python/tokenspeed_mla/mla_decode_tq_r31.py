@@ -312,6 +312,7 @@ def _get_compiled_tq_r31_kernel(
     workspace: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
     fold_sq_factor: int,
+    causal_mask: bool,
     enable_pdl: bool,
 ) -> Callable:
     """Compile/cache a shape-specialized compact R31 kernel."""
@@ -325,6 +326,7 @@ def _get_compiled_tq_r31_kernel(
         tuple(block_tables.shape),
         workspace is not None,
         lse is not None,
+        causal_mask,
         enable_pdl,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
@@ -357,7 +359,7 @@ def _get_compiled_tq_r31_kernel(
                 is_var_seq=True,
                 is_var_split_kv=False,
                 fold_sq_factor=fold_sq_factor,
-                is_causal=query_len > 1,
+                is_causal=causal_mask,
                 num_heads=_NUM_HEADS,
                 seq_len_q=query_len,
                 cp_world=1,
@@ -421,6 +423,7 @@ def tokenspeed_mla_decode_tq_r31(
     output_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     *,
+    causal_mask: Optional[bool] = None,
     enable_pdl: bool = False,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
@@ -433,7 +436,10 @@ def tokenspeed_mla_decode_tq_r31(
     ``residual_rope`` respectively have shapes ``[pages,32,256]``,
     ``[pages,32]``, ``[pages,32,64]``, and ``[pages,32,32]``. The remaining
     scheduling, output, and CUDA-graph contracts match
-    :func:`tokenspeed_mla_decode_tq_e2m1`.
+    :func:`tokenspeed_mla_decode_tq_e2m1`. By default q5 is causal and q1 is
+    non-causal, preserving the original standalone decode behavior. Pass
+    ``causal_mask=False`` when the cache is an entirely historical prefix of a
+    segmented q5 attention operation.
     """
     for name, value in (
         ("softmax_scale", softmax_scale),
@@ -447,6 +453,8 @@ def tokenspeed_mla_decode_tq_r31(
         raise TypeError("enable_pdl must be a bool")
     if not isinstance(return_lse, bool):
         raise TypeError("return_lse must be a bool")
+    if causal_mask is not None and not isinstance(causal_mask, bool):
+        raise TypeError("causal_mask must be a bool or None")
 
     batch, query_len = _validate_r31_inputs(
         query_latent,
@@ -463,6 +471,7 @@ def tokenspeed_mla_decode_tq_r31(
         lse_out,
         return_lse,
     )
+    resolved_causal_mask = query_len > 1 if causal_mask is None else causal_mask
 
     fold_sq_factor = get_mla_decode_fold_sq_factor(
         _NUM_HEADS, query_len, _MMA_QK_TILER[0]
@@ -520,6 +529,7 @@ def tokenspeed_mla_decode_tq_r31(
         workspace=workspace,
         seq_lens=seq_lens,
         fold_sq_factor=fold_sq_factor,
+        causal_mask=resolved_causal_mask,
         enable_pdl=enable_pdl,
     )
 

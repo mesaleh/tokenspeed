@@ -75,6 +75,7 @@ def _decode(
     cp_world=1,
     cp_rank=0,
     lse=False,
+    lse_out=None,
 ):
     from tokenspeed_mla import tokenspeed_mla_decode
 
@@ -90,6 +91,7 @@ def _decode(
         softmax_scale=1.0 / (D**0.5),
         output_scale=1.0,
         return_lse=lse,
+        lse_out=lse_out,
         causal_seqs=causal_seqs,
         cp_world=cp_world,
         cp_rank=cp_rank,
@@ -203,6 +205,84 @@ def test_return_lse_toggles_output_shape():
     assert o.shape == (1, Q, H, KV_LORA)
     assert lse.shape == (1, Q, H)
     torch.testing.assert_close(o, out, rtol=0, atol=0)  # LSE path must not alter output
+
+
+def test_return_lse_uses_caller_owned_storage():
+    torch.manual_seed(5)
+    dtype, length = torch.float8_e4m3fn, 64
+    workspace = _workspace()
+    query = torch.randn(1, Q, H, D, device="cuda").to(dtype)
+    cache, block_table = _paged(torch.randn(length, D, device="cuda").to(dtype), dtype)
+    storage = torch.full((1, Q, H), float("nan"), dtype=torch.float32, device="cuda")
+
+    _, observed = _decode(
+        query,
+        cache,
+        block_table,
+        length,
+        workspace,
+        dtype,
+        lse=True,
+        lse_out=storage,
+    )
+
+    assert observed.data_ptr() == storage.data_ptr()
+    assert torch.isfinite(observed).all()
+
+
+def test_lse_out_requires_return_lse():
+    torch.manual_seed(6)
+    dtype, length = torch.float8_e4m3fn, 64
+    workspace = _workspace()
+    query = torch.randn(1, Q, H, D, device="cuda").to(dtype)
+    cache, block_table = _paged(torch.randn(length, D, device="cuda").to(dtype), dtype)
+    storage = torch.empty((1, Q, H), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="requires return_lse"):
+        _decode(
+            query,
+            cache,
+            block_table,
+            length,
+            workspace,
+            dtype,
+            lse_out=storage,
+        )
+
+
+@pytest.mark.parametrize(
+    "storage,match",
+    [
+        (lambda: torch.empty((1, Q, H + 1), device="cuda"), "must have shape"),
+        (
+            lambda: torch.empty((1, Q, H), dtype=torch.bfloat16, device="cuda"),
+            "must be FP32",
+        ),
+        (
+            lambda: torch.empty((1, Q, H * 2), device="cuda")[..., ::2],
+            "must be contiguous",
+        ),
+        (lambda: torch.empty((1, Q, H), device="cpu"), "must be on"),
+    ],
+)
+def test_lse_out_rejects_invalid_storage(storage, match):
+    torch.manual_seed(7)
+    dtype, length = torch.float8_e4m3fn, 64
+    workspace = _workspace()
+    query = torch.randn(1, Q, H, D, device="cuda").to(dtype)
+    cache, block_table = _paged(torch.randn(length, D, device="cuda").to(dtype), dtype)
+
+    with pytest.raises(ValueError, match=match):
+        _decode(
+            query,
+            cache,
+            block_table,
+            length,
+            workspace,
+            dtype,
+            lse=True,
+            lse_out=storage(),
+        )
 
 
 def test_dcp_rejects_non_fp8_dtype():
