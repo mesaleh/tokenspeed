@@ -4,6 +4,7 @@
 
 import argparse
 import json
+from types import SimpleNamespace
 
 import cutlass
 import torch
@@ -50,6 +51,45 @@ def run(fixture_path: str) -> dict[str, object]:
     cold_scale = _cuda_tensor(fixture["cold_scale"])
     cold_residual_rope = _cuda_tensor(fixture["cold_residual_rope"])
     reference_workspace = _cuda_tensor(fixture["reference_workspace"])
+    arena_layout = str(fixture.get("arena_layout", "contiguous"))
+    if arena_layout not in ("contiguous", "layer-sharded"):
+        raise ValueError(f"unsupported arena layout {arena_layout!r}")
+    arena_backing = []
+    if arena_layout == "layer-sharded":
+        cold_state = SimpleNamespace(
+            packed_cold=cold_cache,
+            cold_scale=cold_scale,
+            cold_high=cold_high_rope,
+            cold_residual=cold_residual_rope,
+        )
+        arena_backing.append(
+            benchmark._move_cold_to_layer_sharded_arena(cold_state)
+        )
+        cold_cache = cold_state.packed_cold
+        cold_scale = cold_state.cold_scale
+        cold_high_rope = cold_state.cold_high
+        cold_residual_rope = cold_state.cold_residual
+        hot_cache, hot_arena = benchmark._move_hot_to_layer_sharded_arena(
+            hot_cache
+        )
+        arena_backing.append(hot_arena)
+        arena_metadata = benchmark._arena_metadata(
+            cold_state, hot_cache, arena_layout
+        )
+    else:
+        arena_metadata = {
+            "arena_layout": arena_layout,
+            "hot_cache_stride": tuple(hot_cache.stride()),
+            "cold_cache_strides": {
+                "packed": tuple(cold_cache.stride()),
+                "scale": tuple(cold_scale.stride()),
+                "high": tuple(cold_high_rope.stride()),
+                "residual": tuple(cold_residual_rope.stride()),
+            },
+        }
+    arena_metadata["arena_bytes_allocated"] = sum(
+        backing.numel() * backing.element_size() for backing in arena_backing
+    )
 
     rows = batch * query_len * benchmark.HEADS
     hot_workspace_bytes = rows * hot_splits * (benchmark.LATENT + 1) * 4
@@ -184,14 +224,20 @@ def run(fixture_path: str) -> dict[str, object]:
             atol=0,
         )
 
+    schema = (
+        "r31-r5-f2-exact-arena-sanitizer-v1"
+        if arena_layout == "layer-sharded"
+        else "r31-r5-f1-mixed-native-sanitizer-v1"
+    )
     return {
-        "schema": "r31-r5-f1-mixed-native-sanitizer-v1",
+        "schema": schema,
         "fixture": fixture_path,
         "shape": {
             "batch": batch,
             "query_len": query_len,
             "hot_splits": hot_splits,
             "cold_splits": cold_splits,
+            **arena_metadata,
         },
         "active_workspace_bit_exact": True,
     }

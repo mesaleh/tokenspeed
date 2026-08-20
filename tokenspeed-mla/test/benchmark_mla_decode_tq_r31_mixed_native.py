@@ -43,6 +43,137 @@ QK_TILER = (64, 128)
 PV_TILER = (64, 256)
 WRITER_DELTA_US = 1.7013013164202375
 Q5_COMPONENT_CEILINGS_US = {1: 13.5067, 5: 29.2079, 8: 37.5659}
+NUM_LAYERS = 61
+ARENA_LAYER = 17
+R31_TOKEN_BYTES = 354
+
+
+def _as_arena_component(
+    raw: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    page_stride_bytes: int,
+    offset_bytes: int,
+) -> torch.Tensor:
+    itemsize = source.element_size()
+    if page_stride_bytes % itemsize or offset_bytes % itemsize:
+        raise AssertionError("arena component offset/stride must align to dtype")
+    view = torch.as_strided(
+        raw.view(source.dtype),
+        size=source.shape,
+        stride=(page_stride_bytes // itemsize, *source.stride()[1:]),
+        storage_offset=offset_bytes // itemsize,
+    )
+    view.copy_(source)
+    return view
+
+
+def _move_cold_to_layer_sharded_arena(state) -> torch.Tensor:
+    """Move one R31 layer into its exact full-context arena envelope."""
+
+    num_pages = state.packed_cold.shape[0]
+    layer_bytes = PAGE * R31_TOKEN_BYTES
+    layer_base = ARENA_LAYER * (num_pages + 1) * layer_bytes
+    raw = torch.empty(
+        NUM_LAYERS * (num_pages + 1) * layer_bytes,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    packed_offset = layer_base
+    scale_offset = packed_offset + PAGE * (LATENT // 2)
+    high_offset = scale_offset + PAGE * 2
+    residual_offset = high_offset + PAGE * ROPE
+    state.packed_cold = _as_arena_component(
+        raw,
+        state.packed_cold,
+        page_stride_bytes=layer_bytes,
+        offset_bytes=packed_offset,
+    )
+    state.cold_scale = _as_arena_component(
+        raw,
+        state.cold_scale,
+        page_stride_bytes=layer_bytes,
+        offset_bytes=scale_offset,
+    )
+    state.cold_high = _as_arena_component(
+        raw,
+        state.cold_high,
+        page_stride_bytes=layer_bytes,
+        offset_bytes=high_offset,
+    )
+    state.cold_residual = _as_arena_component(
+        raw,
+        state.cold_residual,
+        page_stride_bytes=layer_bytes,
+        offset_bytes=residual_offset,
+    )
+    return raw
+
+
+def _move_hot_to_layer_sharded_arena(
+    source: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Move one FP8 layer into its exact full-context arena envelope."""
+
+    num_pages = source.shape[0]
+    layer_bytes = PAGE * (LATENT + ROPE)
+    layer_base = ARENA_LAYER * (num_pages + 1) * layer_bytes
+    raw = torch.empty(
+        NUM_LAYERS * (num_pages + 1) * layer_bytes,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    return (
+        _as_arena_component(
+            raw,
+            source,
+            page_stride_bytes=layer_bytes,
+            offset_bytes=layer_base,
+        ),
+        raw,
+    )
+
+
+def _arena_metadata(state, hot_cache: torch.Tensor, layout: str) -> dict[str, object]:
+    metadata = {
+        "arena_layout": layout,
+        "hot_cache_stride": tuple(hot_cache.stride()),
+        "cold_cache_strides": {
+            "packed": tuple(state.packed_cold.stride()),
+            "scale": tuple(state.cold_scale.stride()),
+            "high": tuple(state.cold_high.stride()),
+            "residual": tuple(state.cold_residual.stride()),
+        },
+    }
+    if layout == "layer-sharded":
+        expected = {
+            "hot": (PAGE * (LATENT + ROPE), LATENT + ROPE, 1),
+            "packed": (PAGE * R31_TOKEN_BYTES, LATENT // 2, 1),
+            "scale": (PAGE * R31_TOKEN_BYTES // 2, 1),
+            "high": (PAGE * R31_TOKEN_BYTES, ROPE, 1),
+            "residual": (PAGE * R31_TOKEN_BYTES, ROPE // 2, 1),
+        }
+        actual = {
+            "hot": tuple(hot_cache.stride()),
+            **metadata["cold_cache_strides"],
+        }
+        if actual != expected:
+            raise AssertionError(
+                f"layer-sharded arena stride contract mismatch: {actual} != {expected}"
+            )
+        cold_storage = state.packed_cold.untyped_storage().data_ptr()
+        if any(
+            component.untyped_storage().data_ptr() != cold_storage
+            for component in (
+                state.cold_scale,
+                state.cold_high,
+                state.cold_residual,
+            )
+        ):
+            raise AssertionError("R31 components must share one cold arena backing")
+        metadata["exact_stride_contract"] = True
+        metadata["cold_components_share_storage"] = True
+    return metadata
 
 
 def _capture(function) -> torch.cuda.CUDAGraph:
@@ -171,6 +302,7 @@ def run(
     correctness_only: bool = False,
     sanitizer_fixture: str | None = None,
     causal_owner: str = "hot",
+    arena_layout: str = "contiguous",
 ) -> dict[str, object]:
     global BATCH, QUERY_LEN, HOT_SPLITS, COLD_SPLITS
     BATCH = batch
@@ -179,6 +311,8 @@ def run(
     COLD_SPLITS = cold_splits
     if causal_owner not in ("hot", "cold"):
         raise ValueError(f"unknown causal owner {causal_owner!r}")
+    if arena_layout not in ("contiguous", "layer-sharded"):
+        raise ValueError(f"unknown arena layout {arena_layout!r}")
     fixture.BATCH = batch
     fixture.QUERY_LEN = query_len
     fixture.HOT_CAPACITY = 2_560 * batch
@@ -189,6 +323,15 @@ def run(
     state, config, dense_query, dense_cache, dense_table, dense_seq = (
         fixture._build_state("balanced")
     )
+    contiguous_cold = (
+        state.packed_cold,
+        state.cold_scale,
+        state.cold_high,
+        state.cold_residual,
+    )
+    arena_backing = []
+    if arena_layout == "layer-sharded":
+        arena_backing.append(_move_cold_to_layer_sharded_arena(state))
     torch.manual_seed(0xA173100)
     source = (
         torch.randn(BATCH, SEQ_LEN, LATENT + ROPE, device="cuda") * 0.1
@@ -217,6 +360,14 @@ def run(
         (rotated_hot_latent, hot_source[..., LATENT:]), dim=-1
     ).to(torch.float8_e4m3fn)
     hot_cache = hot_cache.view(-1, PAGE, LATENT + ROPE)
+    contiguous_hot_cache = hot_cache
+    if arena_layout == "layer-sharded":
+        hot_cache, hot_arena = _move_hot_to_layer_sharded_arena(hot_cache)
+        arena_backing.append(hot_arena)
+    arena_metadata = _arena_metadata(state, hot_cache, arena_layout)
+    arena_metadata["arena_bytes_allocated"] = sum(
+        backing.numel() * backing.element_size() for backing in arena_backing
+    )
     hot_query = torch.cat(
         (
             state.r31_query_latent,
@@ -238,12 +389,37 @@ def run(
     reference_workspace = torch.empty_like(shared_workspace)
     reference_hot_workspace = reference_workspace[:hot_workspace_bytes]
     reference_cold_workspace = reference_workspace[hot_workspace_bytes:]
+    contiguous_workspace = (
+        torch.empty_like(shared_workspace)
+        if arena_layout == "layer-sharded"
+        else None
+    )
+    contiguous_hot_workspace = (
+        contiguous_workspace[:hot_workspace_bytes]
+        if contiguous_workspace is not None
+        else None
+    )
+    contiguous_cold_workspace = (
+        contiguous_workspace[hot_workspace_bytes:]
+        if contiguous_workspace is not None
+        else None
+    )
     output_sentinel = torch.empty(
         BATCH, QUERY_LEN, HEADS, LATENT, dtype=torch.bfloat16, device="cuda"
     )
     reference_output = torch.empty_like(output_sentinel)
     reference_lse = torch.empty(
         BATCH, QUERY_LEN, HEADS, dtype=torch.float32, device="cuda"
+    )
+    contiguous_output = (
+        torch.empty_like(output_sentinel)
+        if arena_layout == "layer-sharded"
+        else None
+    )
+    contiguous_lse = (
+        torch.empty_like(reference_lse)
+        if arena_layout == "layer-sharded"
+        else None
     )
     mixed_output = torch.empty_like(output_sentinel)
     mixed_lse = torch.empty_like(reference_lse)
@@ -348,6 +524,60 @@ def run(
             reference_lse,
         )
 
+    def contiguous_oracle_launch() -> None:
+        if (
+            contiguous_workspace is None
+            or contiguous_hot_workspace is None
+            or contiguous_cold_workspace is None
+            or contiguous_output is None
+            or contiguous_lse is None
+        ):
+            raise AssertionError("contiguous oracle requires layer-sharded mode")
+        packed_cold, cold_scale, cold_high, cold_residual = contiguous_cold
+        tokenspeed_mla_decode(
+            query=hot_query,
+            kv_cache=contiguous_hot_cache,
+            workspace_buffer=contiguous_hot_workspace,
+            kv_lora_rank=LATENT,
+            qk_rope_head_dim=ROPE,
+            block_tables=state.hot_table,
+            seq_lens=state.hot_seq,
+            max_seq_len=hot_max_seq_len,
+            softmax_scale=SOFTMAX_SCALE,
+            out=output_sentinel,
+            causal_mask=causal_owner == "hot",
+            enable_pdl=True,
+            split_kv_override=HOT_SPLITS,
+            producer_only=True,
+        )
+        tokenspeed_mla_decode_tq_r31(
+            query_latent=state.r31_query_latent,
+            query_rope=state.r31_query_rope,
+            packed_latent=packed_cold,
+            reconstruction_scale=cold_scale,
+            high_rope=cold_high,
+            residual_rope=cold_residual,
+            workspace_buffer=contiguous_cold_workspace,
+            block_tables=state.prefix_table,
+            seq_lens=state.prefix_seq,
+            max_seq_len=cold_max_seq_len,
+            softmax_scale=SOFTMAX_SCALE,
+            out=output_sentinel,
+            causal_mask=causal_owner == "cold",
+            enable_pdl=True,
+            split_kv_override=COLD_SPLITS,
+            producer_only=True,
+        )
+        reduce_mla_mixed_workspace(
+            contiguous_workspace,
+            state.hot_seq,
+            state.prefix_seq,
+            HOT_SPLITS,
+            COLD_SPLITS,
+            contiguous_output,
+            contiguous_lse,
+        )
+
     hot_stream = torch.cuda.Stream()
     cold_stream = torch.cuda.Stream()
     fork_event = torch.cuda.Event()
@@ -424,11 +654,17 @@ def run(
 
     reference_workspace.view(torch.float32).fill_(float("nan"))
     shared_workspace.view(torch.float32).fill_(float("nan"))
+    if contiguous_workspace is not None:
+        contiguous_workspace.view(torch.float32).fill_(float("nan"))
+        contiguous_oracle_launch()
     reference_launch()
     mixed_launch()
     torch.cuda.synchronize()
     torch.testing.assert_close(mixed_output, reference_output, rtol=0, atol=0)
     torch.testing.assert_close(mixed_lse, reference_lse, rtol=0, atol=0)
+    if contiguous_output is not None and contiguous_lse is not None:
+        torch.testing.assert_close(mixed_output, contiguous_output, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_lse, contiguous_lse, rtol=0, atol=0)
     if not torch.isfinite(mixed_output).all() or not torch.isfinite(mixed_lse).all():
         raise AssertionError("mixed producer consumed a poisoned workspace slot")
 
@@ -440,6 +676,7 @@ def run(
                 "hot_splits": HOT_SPLITS,
                 "cold_splits": COLD_SPLITS,
                 "causal_owner": causal_owner,
+                "arena_layout": arena_layout,
                 "hot_query": hot_query.cpu(),
                 "hot_cache": hot_cache.cpu(),
                 "hot_table": state.hot_table.cpu(),
@@ -454,14 +691,23 @@ def run(
                 "cold_causal_seq": cold_causal_seq.cpu(),
                 "cold_scale": state.cold_scale.cpu(),
                 "cold_residual_rope": state.cold_residual.cpu(),
-                "reference_workspace": reference_workspace.cpu(),
+                "reference_workspace": (
+                    contiguous_workspace
+                    if contiguous_workspace is not None
+                    else reference_workspace
+                ).cpu(),
             },
             sanitizer_fixture,
         )
 
     if correctness_only:
+        schema = (
+            "r31-r5-f2-exact-arena-correctness-v1"
+            if arena_layout == "layer-sharded"
+            else "r31-r5-f1-mixed-native-correctness-v1"
+        )
         return {
-            "schema": "r31-r5-f1-mixed-native-correctness-v1",
+            "schema": schema,
             "shape": {
                 "batch": BATCH,
                 "query_len": QUERY_LEN,
@@ -469,9 +715,13 @@ def run(
                 "hot_splits": HOT_SPLITS,
                 "cold_splits": COLD_SPLITS,
                 "causal_owner": causal_owner,
+                **arena_metadata,
             },
             "correctness": {
                 "bit_exact_vs_two_producers": True,
+                "bit_exact_vs_contiguous_oracle": (
+                    True if arena_layout == "layer-sharded" else None
+                ),
                 "poisoned_unwritten_slots_ignored": True,
             },
         }
@@ -512,8 +762,13 @@ def run(
     component_ceiling_us = (
         Q5_COMPONENT_CEILINGS_US[BATCH] if QUERY_LEN == 5 else None
     )
+    schema = (
+        "r31-r5-f2-exact-arena-v1"
+        if arena_layout == "layer-sharded"
+        else "r31-r5-f1-mixed-native-v1"
+    )
     return {
-        "schema": "r31-r5-f1-mixed-native-v1",
+        "schema": schema,
         "shape": {
             "batch": BATCH,
             "query_len": QUERY_LEN,
@@ -521,9 +776,13 @@ def run(
             "hot_splits": HOT_SPLITS,
             "cold_splits": COLD_SPLITS,
             "causal_owner": causal_owner,
+            **arena_metadata,
         },
         "correctness": {
             "bit_exact_vs_two_producers": True,
+            "bit_exact_vs_contiguous_oracle": (
+                True if arena_layout == "layer-sharded" else None
+            ),
             "poisoned_unwritten_slots_ignored": True,
         },
         "timing": timing,
@@ -555,6 +814,11 @@ def main() -> None:
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--sanitizer-fixture")
     parser.add_argument("--causal-owner", choices=("hot", "cold"), default="hot")
+    parser.add_argument(
+        "--arena-layout",
+        choices=("contiguous", "layer-sharded"),
+        default="contiguous",
+    )
     args = parser.parse_args()
     print(
         json.dumps(
@@ -568,6 +832,7 @@ def main() -> None:
                 args.correctness_only,
                 args.sanitizer_fixture,
                 args.causal_owner,
+                args.arena_layout,
             ),
             indent=2,
             sort_keys=True,

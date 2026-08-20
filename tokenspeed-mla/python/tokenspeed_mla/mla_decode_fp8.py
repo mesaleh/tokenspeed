@@ -832,7 +832,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cute.recast_ptr(c_latent.iterator, dtype=cutlass.Float4E2M1FN),
                 cute.make_layout(
                     (c_latent.shape[1], self.latent_dim, c_latent.shape[0]),
-                    stride=(self.latent_dim, 1, c_latent.shape[1] * self.latent_dim),
+                    # The persistent input is byte-addressed. Recasting uint8
+                    # to E2M1 doubles byte strides into logical nibble units.
+                    # Preserve the real page pitch for elastic-arena views.
+                    stride=(
+                        c_latent_packed.stride[1] * 2,
+                        1,
+                        c_latent_packed.stride[0] * 2,
+                    ),
                 ),
             )
             c_scale = cute.make_tensor(
@@ -868,9 +875,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         c_rope_residual.shape[0],
                     ),
                     stride=(
-                        residual_cache_dim,
+                        c_rope_residual.stride[1],
                         1,
-                        c_rope_residual.shape[1] * residual_cache_dim,
+                        c_rope_residual.stride[0],
                     ),
                 ),
             )
@@ -970,8 +977,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                     stride=(
                         1,
-                        self.latent_dim,
-                        c_latent_packed.shape[1] * self.latent_dim,
+                        c_latent_packed.stride[1] * 2,
+                        c_latent_packed.stride[0] * 2,
                     ),
                 ),
             )

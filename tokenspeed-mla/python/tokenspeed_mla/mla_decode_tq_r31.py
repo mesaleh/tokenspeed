@@ -60,6 +60,71 @@ _QUERY_ROPE_DIM = _QUERY_ROPE_PLANES * _ROPE_DIM
 _PACKED_ROPE_DIM = _ROPE_DIM // 2
 
 
+def _require_paged_component(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    row_width: int,
+    alignment: int,
+) -> None:
+    """Validate a contiguous-row, page-strided persistent cache component.
+
+    The elastic R31 arena stores every component contiguously inside one
+    layer/page envelope. CuTe receives the real page stride through DLPack;
+    no gather or dense shadow is required.
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    is_scalar_row = row_width == 1 and tensor.ndim == 2
+    is_vector_row = tensor.ndim == 3
+    if not (is_scalar_row or is_vector_row):
+        expected_ndim = "2D" if row_width == 1 else "3D"
+        raise ValueError(
+            f"{name} must be {expected_ndim}, got shape {tuple(tensor.shape)}"
+        )
+    if tensor.shape[1] != _PAGE_SIZE or (
+        is_vector_row and tensor.shape[2] != row_width
+    ):
+        expected_shape = (
+            f"[num_pages,{_PAGE_SIZE}]"
+            if is_scalar_row
+            else f"[num_pages,{_PAGE_SIZE},{row_width}]"
+        )
+        raise ValueError(
+            f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+        )
+    expected_inner = (1,) if is_scalar_row else (row_width, 1)
+    if tuple(tensor.stride()[1:]) != expected_inner:
+        raise ValueError(
+            f"{name} rows must be contiguous with inner strides "
+            f"{expected_inner}, got {tensor.stride()}"
+        )
+    minimum_page_stride = _PAGE_SIZE * row_width
+    if tensor.stride(0) < minimum_page_stride:
+        raise ValueError(
+            f"{name} page stride must be at least {minimum_page_stride}, "
+            f"got {tensor.stride(0)}"
+        )
+    page_stride_bytes = tensor.stride(0) * tensor.element_size()
+    if page_stride_bytes % alignment:
+        raise ValueError(
+            f"{name} page stride must be {alignment}-byte aligned, "
+            f"got {page_stride_bytes} bytes"
+        )
+    if tensor.numel() and tensor.data_ptr() % alignment:
+        raise ValueError(
+            f"{name} must be {alignment}-byte aligned, got address "
+            f"0x{tensor.data_ptr():x}"
+        )
+
+
 def _validate_r31_inputs(
     query_latent: torch.Tensor,
     query_rope: torch.Tensor,
@@ -119,12 +184,12 @@ def _validate_r31_inputs(
             f"got {tuple(query_rope.shape)}"
         )
 
-    _require_tensor(
+    _require_paged_component(
         "packed_latent",
         packed_latent,
         dtype=torch.uint8,
-        ndim=3,
         device=device,
+        row_width=_PACKED_LATENT_DIM,
         alignment=16,
     )
     num_pages, page_size, packed_dim = packed_latent.shape
@@ -137,12 +202,12 @@ def _validate_r31_inputs(
             f"{tuple(packed_latent.shape)}"
         )
 
-    _require_tensor(
+    _require_paged_component(
         "reconstruction_scale",
         reconstruction_scale,
         dtype=torch.bfloat16,
-        ndim=2,
         device=device,
+        row_width=1,
         alignment=16,
     )
     expected_scale = (num_pages, _PAGE_SIZE)
@@ -152,12 +217,12 @@ def _validate_r31_inputs(
             f"got {tuple(reconstruction_scale.shape)}"
         )
 
-    _require_tensor(
+    _require_paged_component(
         "high_rope",
         high_rope,
         dtype=torch.float8_e4m3fn,
-        ndim=3,
         device=device,
+        row_width=_ROPE_DIM,
         alignment=16,
     )
     expected_high_rope = (num_pages, _PAGE_SIZE, _ROPE_DIM)
@@ -167,12 +232,12 @@ def _validate_r31_inputs(
             f"got {tuple(high_rope.shape)}"
         )
 
-    _require_tensor(
+    _require_paged_component(
         "residual_rope",
         residual_rope,
         dtype=torch.uint8,
-        ndim=3,
         device=device,
+        row_width=_PACKED_ROPE_DIM,
         alignment=16,
     )
     expected_residual_rope = (num_pages, _PAGE_SIZE, _PACKED_ROPE_DIM)
@@ -321,8 +386,12 @@ def _get_compiled_tq_r31_kernel(
         tuple(query_latent.shape),
         tuple(query_rope.shape),
         tuple(packed_latent.shape),
+        tuple(packed_latent.stride()),
+        tuple(reconstruction_scale.stride()),
         tuple(high_rope.shape),
+        tuple(high_rope.stride()),
         tuple(residual_rope.shape),
+        tuple(residual_rope.stride()),
         tuple(block_tables.shape),
         workspace is not None,
         lse is not None,
