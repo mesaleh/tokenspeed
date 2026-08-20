@@ -35,9 +35,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from tokenspeed_mla.mla_decode_fp8 import (
-    BlackwellMultiHeadLatentAttentionForwardFP8,
-)
+from tokenspeed_mla.mla_decode import _resolve_split_kv_override
+from tokenspeed_mla.mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from tokenspeed_mla.mla_decode_tq_e2m1 import (
     _LATENT_DIM,
     _MMA_PV_TILER,
@@ -314,6 +313,7 @@ def _get_compiled_tq_r31_kernel(
     fold_sq_factor: int,
     causal_mask: bool,
     enable_pdl: bool,
+    producer_only: bool,
 ) -> Callable:
     """Compile/cache a shape-specialized compact R31 kernel."""
     key = (
@@ -328,6 +328,7 @@ def _get_compiled_tq_r31_kernel(
         lse is not None,
         causal_mask,
         enable_pdl,
+        producer_only,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
     if compiled is not None:
@@ -371,6 +372,7 @@ def _get_compiled_tq_r31_kernel(
                 tq_s1_packed_p_scale_math=use_packed_p_scale_math,
                 tq_s1_early_final_pcor=use_early_final_pcor,
                 tq_r31_async_expand=True,
+                producer_only=producer_only,
             )
             stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             compiled = cute.compile(
@@ -427,6 +429,8 @@ def tokenspeed_mla_decode_tq_r31(
     enable_pdl: bool = False,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
+    split_kv_override: Optional[int] = None,
+    producer_only: bool = False,
 ):
     """Decode MLA attention directly from the compact 354-byte R31 cache.
 
@@ -440,6 +444,10 @@ def tokenspeed_mla_decode_tq_r31(
     non-causal, preserving the original standalone decode behavior. Pass
     ``causal_mask=False`` when the cache is an entirely historical prefix of a
     segmented q5 attention operation.
+
+    ``producer_only=True`` is the mixed-cache stage-1 contract: it publishes
+    split partials to ``workspace_buffer``, requires caller-owned ``out``, does
+    not write ``out`` or a final LSE, and returns ``None``.
     """
     for name, value in (
         ("softmax_scale", softmax_scale),
@@ -478,7 +486,7 @@ def tokenspeed_mla_decode_tq_r31(
     )
     effective_heads = _NUM_HEADS * fold_sq_factor
     effective_query_len = query_len // fold_sq_factor
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
+    inferred_split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
         batch,
         effective_query_len,
         max_seq_len,
@@ -486,6 +494,22 @@ def tokenspeed_mla_decode_tq_r31(
         get_num_sm(query_latent.device),
         1,
     )
+    split_kv = _resolve_split_kv_override(
+        inferred_split_kv,
+        split_kv_override,
+        max_seq_len=max_seq_len,
+        tile_size=_MMA_QK_TILER[1],
+        max_split_kv=64,
+    )
+    if not isinstance(producer_only, bool):
+        raise TypeError("producer_only must be a bool")
+    if producer_only:
+        if split_kv <= 1:
+            raise ValueError("producer-only shared workspace requires split_kv > 1")
+        if return_lse:
+            raise ValueError("producer-only R31 MLA does not emit a final LSE")
+        if out is None:
+            raise ValueError("producer-only R31 MLA requires caller-owned out storage")
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
         effective_heads,
         effective_query_len,
@@ -531,6 +555,7 @@ def tokenspeed_mla_decode_tq_r31(
         fold_sq_factor=fold_sq_factor,
         causal_mask=resolved_causal_mask,
         enable_pdl=enable_pdl,
+        producer_only=producer_only,
     )
 
     import tvm_ffi
@@ -555,6 +580,9 @@ def tokenspeed_mla_decode_tq_r31(
             None,
             residual_rope,
         )
+
+    if producer_only:
+        return None
 
     if return_lse:
         return output, lse

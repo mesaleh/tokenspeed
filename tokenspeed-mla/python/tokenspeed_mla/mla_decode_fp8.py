@@ -337,6 +337,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tq_s1_packed_p_scale_math: bool = False,
         tq_s1_early_final_pcor: bool = False,
         tq_r31_async_expand: bool = False,
+        producer_only: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -372,6 +373,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param tq_r31_async_expand: Let the otherwise idle warp expand the
             compact R31 residual stage while the MMA warp consumes latent K
         :type tq_r31_async_expand: bool
+        :param producer_only: Publish split-KV partials to caller-owned
+            workspace without launching the ordinary reduction kernel
+        :type producer_only: bool
         """
 
         self.latent_dim = 512
@@ -406,6 +410,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.tq_s1_packed_p_scale_math = tq_s1_packed_p_scale_math
         self.tq_s1_early_final_pcor = tq_s1_early_final_pcor
         self.tq_r31_async_expand = tq_r31_async_expand
+        self.producer_only = producer_only
         if self.use_tq_r31_rope and not self.use_tq_e2m1:
             raise ValueError("R31 RoPE requires TurboQuant E2M1 latent cache")
         if (
@@ -885,6 +890,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.acc_dtype,
             workspace,
         )
+        if cutlass.const_expr(self.producer_only and acc_o is None):
+            raise ValueError("producer-only MLA requires split-KV workspace")
 
         if cutlass.const_expr(self.use_tq_e2m1):
             # PV presents the same physical [page, token, latent-pair]
@@ -1507,7 +1514,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             min_blocks_per_mp=1,
             use_pdl=use_pdl,
         )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(acc_o is not None and not self.producer_only):
             self.reduction_kernel(
                 o,
                 lse,

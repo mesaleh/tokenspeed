@@ -27,6 +27,7 @@ and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
 import functools
+import numbers
 from typing import Callable, Optional, Tuple
 
 import cutlass
@@ -88,6 +89,32 @@ def _get_split_kv_and_workspace_size(
             )
         )
     return split_kv, workspace_size
+
+
+def _resolve_split_kv_override(
+    inferred_split_kv: int,
+    split_kv_override: Optional[int],
+    *,
+    max_seq_len: int,
+    tile_size: int,
+    max_split_kv: int,
+) -> int:
+    """Resolve a bounded advanced-caller split-KV override."""
+    if split_kv_override is None:
+        return inferred_split_kv
+    if isinstance(split_kv_override, bool) or not isinstance(
+        split_kv_override, numbers.Integral
+    ):
+        raise TypeError("split_kv_override must be an integer or None")
+    resolved = int(split_kv_override)
+    available_tiles = (max_seq_len + tile_size - 1) // tile_size
+    upper_bound = min(max_split_kv, available_tiles)
+    if not 1 <= resolved <= upper_bound:
+        raise ValueError(
+            "split_kv_override must be in [1, "
+            f"{upper_bound}] for max_seq_len={max_seq_len}, got {resolved}"
+        )
+    return resolved
 
 
 @functools.cache
@@ -162,6 +189,7 @@ def _get_compiled_mla_kernel(
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
     compute_capability: tuple[int, int] = (0, 0),
+    producer_only: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -170,8 +198,11 @@ def _get_compiled_mla_kernel(
     block_split_kvs, softmax_scale_scalar, output_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
+    ``producer_only`` is a compile-time specialization that omits reduction.
     """
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    if producer_only and not is_fp8:
+        raise ValueError("producer-only shared workspace requires FP8 MLA")
     mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
         num_heads,
         seq_len_q,
@@ -210,6 +241,7 @@ def _get_compiled_mla_kernel(
     if is_fp8:
         # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
+        kernel_kwargs["producer_only"] = producer_only
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -374,7 +406,9 @@ def tokenspeed_mla_decode(
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
     cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    split_kv_override: Optional[int] = None,
+    producer_only: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
     Parameters
@@ -449,6 +483,13 @@ def tokenspeed_mla_decode(
         bound is ``ceil((causal_seqs - cp_rank) / cp_world)``; the wrapper folds
         ``cp_rank`` in for you, so callers pass the same global ``causal_seqs`` on
         every rank. Must be 0 when ``cp_world == 1``.
+    split_kv_override : Optional[int]
+        Advanced-caller declared split count. ``None`` preserves the incumbent
+        wave-aware heuristic.
+    producer_only : bool
+        Emit split partials into ``workspace_buffer`` without reduction. This
+        requires FP8, ``split_kv > 1``, and caller-owned ``out``; ``out`` is not
+        written and the function returns ``None``.
 
     Returns
     -------
@@ -508,7 +549,7 @@ def tokenspeed_mla_decode(
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
-    split_kv, workspace_size = _get_split_kv_and_workspace_size(
+    inferred_split_kv, inferred_workspace_size = _get_split_kv_and_workspace_size(
         B,
         q_len_eff,
         H_eff,
@@ -518,6 +559,36 @@ def tokenspeed_mla_decode(
         q_dtype,
         mma_qk_tiler_mn,
     )
+    max_split_kv = 64 if is_fp8 and mma_qk_tiler_mn[0] == 64 else 32
+    split_kv = _resolve_split_kv_override(
+        inferred_split_kv,
+        split_kv_override,
+        max_seq_len=max_seq_len,
+        tile_size=mma_qk_tiler_mn[1],
+        max_split_kv=max_split_kv,
+    )
+    if not isinstance(producer_only, bool):
+        raise TypeError("producer_only must be a bool")
+    if producer_only:
+        if not is_fp8:
+            raise ValueError("producer-only shared workspace requires FP8 MLA")
+        if split_kv <= 1:
+            raise ValueError("producer-only shared workspace requires split_kv > 1")
+        if return_lse:
+            raise ValueError("producer-only MLA does not emit a final LSE")
+        if out is None:
+            raise ValueError("producer-only MLA requires caller-owned out storage")
+    if split_kv == inferred_split_kv:
+        workspace_size = inferred_workspace_size
+    else:
+        KernelClass = (
+            BlackwellMultiHeadLatentAttentionForwardFP8
+            if is_fp8
+            else BlackwellMultiHeadLatentAttentionForwardFP16
+        )
+        workspace_size = KernelClass.get_workspace_size(
+            H_eff, q_len_eff, kv_lora_rank, B, split_kv, cutlass.Float32
+        )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -527,6 +598,8 @@ def tokenspeed_mla_decode(
         f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
         f"need {workspace_size} bytes"
     )
+    if workspace_size and workspace_buffer.data_ptr() % 32:
+        raise ValueError("workspace_buffer must be at least 32-byte aligned")
     is_workspace_size_zero = workspace_size == 0
     if is_workspace_size_zero:
         workspace_bytes = None
@@ -647,6 +720,7 @@ def tokenspeed_mla_decode(
         use_pdl=enable_pdl,
         return_lse=return_lse,
         compute_capability=compute_capability,
+        producer_only=producer_only,
     )
 
     # DCP/segmented attention: use caller-owned graph-stable storage as-is when
@@ -691,6 +765,9 @@ def tokenspeed_mla_decode(
 
     with tvm_ffi.use_torch_stream():
         compiled_kernel(*call_args)
+
+    if producer_only:
+        return None
 
     # DCP: return (o, lse) tuple when LSE was requested.
     o_result = out if out is not None else o_k
