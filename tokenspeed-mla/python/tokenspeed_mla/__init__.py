@@ -28,6 +28,9 @@ try:
     from tokenspeed_mla.mla_decode_tq_e2m1 import (
         tokenspeed_mla_decode_tq_e2m1,
     )
+    from tokenspeed_mla.mla_decode_tq_r31 import (
+        tokenspeed_mla_decode_tq_r31,
+    )
     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
         mla_kv_pack_quantize_fp8,
     )
@@ -47,6 +50,7 @@ except ImportError as exc:
 
     tokenspeed_mla_decode = _unavailable
     tokenspeed_mla_decode_tq_e2m1 = _unavailable
+    tokenspeed_mla_decode_tq_r31 = _unavailable
     tokenspeed_mla_prefill = _unavailable
     mla_kv_pack_quantize_fp8 = _unavailable
     get_num_sm = _unavailable
@@ -56,6 +60,7 @@ except ImportError as exc:
 __all__ = [
     "tokenspeed_mla_decode",
     "tokenspeed_mla_decode_tq_e2m1",
+    "tokenspeed_mla_decode_tq_r31",
     "tokenspeed_mla_prefill",
     "mla_kv_pack_quantize_fp8",
     "get_num_sm",

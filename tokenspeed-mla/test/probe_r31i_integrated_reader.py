@@ -15,7 +15,8 @@ from cutlass.cute.runtime import from_dlpack
 from tokenspeed_mla.mla_decode_fp8 import (
     BlackwellMultiHeadLatentAttentionForwardFP8,
 )
-from tokenspeed_mla.utils import get_max_active_clusters
+from tokenspeed_mla.mla_decode_tq_r31 import tokenspeed_mla_decode_tq_r31
+from tokenspeed_mla.utils import get_max_active_clusters, get_num_sm
 
 PAGE_SIZE = 32
 LATENT_DIM = 512
@@ -247,6 +248,8 @@ def main() -> None:
             residual_rope if use_r31 else None,
         )
 
+    benchmark_launch = launch
+
     with tvm_ffi.use_torch_stream():
         launch()
     torch.cuda.synchronize()
@@ -295,10 +298,45 @@ def main() -> None:
     expected_lse = torch.logsumexp(score, dim=-1) * math.log2(math.e)
     torch.testing.assert_close(output.float(), expected, atol=0.75, rtol=0.35)
     torch.testing.assert_close(lse, expected_lse, atol=0.2, rtol=0.02)
+    hash_output = output
+    hash_lse = lse
+    if use_r31 and os.environ.get("R31I_PUBLIC") == "1":
+        public_output = torch.empty_like(output)
+        public_lse = torch.empty_like(lse)
+        workspace = torch.empty(
+            get_num_sm(device) * HEADS * query_len * (LATENT_DIM + 1) * 4,
+            dtype=torch.int8,
+            device=device,
+        )
+        def public_launch():
+            return tokenspeed_mla_decode_tq_r31(
+                query_latent=query_latent,
+                query_rope=query_rope,
+                packed_latent=packed_latent,
+                reconstruction_scale=scale,
+                high_rope=high_rope,
+                residual_rope=residual_rope,
+                workspace_buffer=workspace,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=seq_len,
+                softmax_scale=1.0 / math.sqrt(LATENT_DIM + ROPE_DIM),
+                out=public_output,
+                return_lse=True,
+                lse_out=public_lse,
+            )
+
+        observed, observed_lse = public_launch()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(observed.float(), expected, atol=0.75, rtol=0.35)
+        torch.testing.assert_close(observed_lse, expected_lse, atol=0.2, rtol=0.02)
+        hash_output = observed
+        hash_lse = observed_lse
+        benchmark_launch = public_launch
     output_sha256 = hashlib.sha256(
-        output.view(torch.uint16).cpu().numpy().tobytes()
+        hash_output.view(torch.uint16).cpu().numpy().tobytes()
     ).hexdigest()
-    lse_sha256 = hashlib.sha256(lse.cpu().numpy().tobytes()).hexdigest()
+    lse_sha256 = hashlib.sha256(hash_lse.cpu().numpy().tobytes()).hexdigest()
     print(
         f"PASS mode={mode} integrated_reader=True "
         f"output_abs_max={output.float().abs().max().item():.6f} "
@@ -310,10 +348,10 @@ def main() -> None:
         windows = int(os.environ.get("R31I_WINDOWS", "10"))
         with tvm_ffi.use_torch_stream():
             graph = torch.cuda.CUDAGraph()
-            launch()
+            benchmark_launch()
             torch.cuda.synchronize()
             with torch.cuda.graph(graph):
-                launch()
+                benchmark_launch()
         torch.cuda.synchronize()
 
         def measure() -> float:
