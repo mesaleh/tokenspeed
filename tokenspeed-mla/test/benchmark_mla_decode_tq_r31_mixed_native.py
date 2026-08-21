@@ -18,6 +18,7 @@ from tokenspeed_mla import (
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_tq_r31,
     tokenspeed_mla_decode_tq_r31_mixed,
+    tokenspeed_mla_decode_tq_r31_mixed_split_query,
 )
 from tokenspeed_mla.mla_decode_fp8 import (
     BlackwellMultiHeadLatentAttentionForwardFP8,
@@ -420,6 +421,10 @@ def run(
     public_workspace = torch.empty_like(shared_workspace)
     public_output = torch.empty_like(output_sentinel)
     public_lse = torch.empty_like(reference_lse)
+    split_query_workspace = torch.empty_like(shared_workspace)
+    split_query_output = torch.empty_like(output_sentinel)
+    split_query_lse = torch.empty_like(reference_lse)
+    hot_query_rope = hot_query[..., LATENT:].contiguous()
     baseline_workspace = torch.empty(
         rows * 64 * (LATENT + 1) * 4, dtype=torch.int8, device="cuda"
     )
@@ -676,20 +681,42 @@ def run(
     def public_launch() -> None:
         tokenspeed_mla_decode_tq_r31_mixed(**public_kwargs)
 
+    split_query_kwargs = {
+        key: value
+        for key, value in public_kwargs.items()
+        if key not in {"hot_query", "cold_query_latent"}
+    }
+    split_query_kwargs.update(
+        {
+            "query_latent": state.r31_query_latent,
+            "hot_query_rope": hot_query_rope,
+            "workspace_buffer": split_query_workspace,
+            "out": split_query_output,
+            "lse_out": split_query_lse,
+        }
+    )
+
+    def split_query_launch() -> None:
+        tokenspeed_mla_decode_tq_r31_mixed_split_query(**split_query_kwargs)
+
     reference_workspace.view(torch.float32).fill_(float("nan"))
     shared_workspace.view(torch.float32).fill_(float("nan"))
     public_workspace.view(torch.float32).fill_(float("nan"))
+    split_query_workspace.view(torch.float32).fill_(float("nan"))
     if contiguous_workspace is not None:
         contiguous_workspace.view(torch.float32).fill_(float("nan"))
         contiguous_oracle_launch()
     reference_launch()
     mixed_launch()
     public_launch()
+    split_query_launch()
     torch.cuda.synchronize()
     torch.testing.assert_close(mixed_output, reference_output, rtol=0, atol=0)
     torch.testing.assert_close(mixed_lse, reference_lse, rtol=0, atol=0)
     torch.testing.assert_close(public_output, mixed_output, rtol=0, atol=0)
     torch.testing.assert_close(public_lse, mixed_lse, rtol=0, atol=0)
+    torch.testing.assert_close(split_query_output, mixed_output, rtol=0, atol=0)
+    torch.testing.assert_close(split_query_lse, mixed_lse, rtol=0, atol=0)
     if contiguous_output is not None and contiguous_lse is not None:
         torch.testing.assert_close(mixed_output, contiguous_output, rtol=0, atol=0)
         torch.testing.assert_close(mixed_lse, contiguous_lse, rtol=0, atol=0)
@@ -699,6 +726,7 @@ def run(
     steady_allocated_before = torch.cuda.memory_allocated()
     for _ in range(8):
         public_launch()
+        split_query_launch()
     torch.cuda.synchronize()
     steady_allocated_after = torch.cuda.memory_allocated()
     if steady_allocated_after != steady_allocated_before:
@@ -744,6 +772,53 @@ def run(
         overrides = {key: value for key, value in case.items() if key != "error"}
         try:
             tokenspeed_mla_decode_tq_r31_mixed(**(public_kwargs | overrides))
+        except (TypeError, ValueError) as exc:
+            if case["error"] not in str(exc):
+                raise AssertionError(
+                    f"{case_name} raised unexpected error: {exc}"
+                ) from exc
+        else:
+            raise AssertionError(f"{case_name} did not fail closed")
+
+    padded_heads = torch.empty(
+        BATCH,
+        QUERY_LEN,
+        HEADS * 2,
+        ROPE,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )[:, :, :HEADS]
+    unaligned_storage = torch.empty(
+        BATCH * QUERY_LEN * HEADS * (ROPE + 1),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    unaligned_head_stride = torch.as_strided(
+        unaligned_storage,
+        (BATCH, QUERY_LEN, HEADS, ROPE),
+        (
+            QUERY_LEN * HEADS * (ROPE + 1),
+            HEADS * (ROPE + 1),
+            ROPE + 1,
+            1,
+        ),
+    )
+    split_fail_closed_cases = {
+        "split_query_padded_token_stride": {
+            "hot_query_rope": padded_heads,
+            "error": "must be row-major",
+        },
+        "split_query_unaligned_outer_stride": {
+            "hot_query_rope": unaligned_head_stride,
+            "error": "outer strides must be 16-byte aligned",
+        },
+    }
+    for case_name, case in split_fail_closed_cases.items():
+        overrides = {key: value for key, value in case.items() if key != "error"}
+        try:
+            tokenspeed_mla_decode_tq_r31_mixed_split_query(
+                **(split_query_kwargs | overrides)
+            )
         except (TypeError, ValueError) as exc:
             if case["error"] not in str(exc):
                 raise AssertionError(
@@ -804,11 +879,14 @@ def run(
             "correctness": {
                 "bit_exact_vs_two_producers": True,
                 "bit_exact_public_api_vs_direct_mixed": True,
+                "bit_exact_split_query_api_vs_direct_mixed": True,
                 "bit_exact_vs_contiguous_oracle": (
                     True if arena_layout == "layer-sharded" else None
                 ),
                 "poisoned_unwritten_slots_ignored": True,
-                "fail_closed_validation_cases": sorted(fail_closed_cases),
+                "fail_closed_validation_cases": sorted(
+                    fail_closed_cases | split_fail_closed_cases
+                ),
                 "steady_state_cuda_allocation_delta_bytes": 0,
             },
         }
@@ -818,6 +896,7 @@ def run(
     concurrent_graph = _capture(concurrent_reference_launch)
     mixed_graph = _capture(mixed_launch)
     public_graph = _capture(public_launch)
+    split_query_graph = _capture(split_query_launch)
     producer_graph = _capture(mixed_producer_launch)
     for _ in range(10):
         _measure(baseline_graph, replays)
@@ -825,12 +904,14 @@ def run(
         _measure(concurrent_graph, replays)
         _measure(mixed_graph, replays)
         _measure(public_graph, replays)
+        _measure(split_query_graph, replays)
     samples = {
         "baseline": [],
         "reference": [],
         "concurrent": [],
         "mixed": [],
         "public": [],
+        "split_query": [],
     }
     graph_by_name = {
         "baseline": baseline_graph,
@@ -838,10 +919,25 @@ def run(
         "concurrent": concurrent_graph,
         "mixed": mixed_graph,
         "public": public_graph,
+        "split_query": split_query_graph,
     }
     orders = (
-        ("baseline", "reference", "concurrent", "mixed", "public"),
-        ("public", "mixed", "concurrent", "reference", "baseline"),
+        (
+            "baseline",
+            "reference",
+            "concurrent",
+            "mixed",
+            "public",
+            "split_query",
+        ),
+        (
+            "split_query",
+            "public",
+            "mixed",
+            "concurrent",
+            "reference",
+            "baseline",
+        ),
     )
     for window in range(windows):
         for name in orders[window % len(orders)]:
@@ -875,17 +971,23 @@ def run(
         "correctness": {
             "bit_exact_vs_two_producers": True,
             "bit_exact_public_api_vs_direct_mixed": True,
+            "bit_exact_split_query_api_vs_direct_mixed": True,
             "bit_exact_vs_contiguous_oracle": (
                 True if arena_layout == "layer-sharded" else None
             ),
             "poisoned_unwritten_slots_ignored": True,
-            "fail_closed_validation_cases": sorted(fail_closed_cases),
+            "fail_closed_validation_cases": sorted(
+                fail_closed_cases | split_fail_closed_cases
+            ),
             "steady_state_cuda_allocation_delta_bytes": 0,
         },
         "timing": timing,
         "mixed_minus_reference_us": delta_us,
         "public_minus_mixed_us": (
             timing["public"]["mean_us"] - timing["mixed"]["mean_us"]
+        ),
+        "split_query_minus_public_us": (
+            timing["split_query"]["mean_us"] - timing["public"]["mean_us"]
         ),
         "mixed_minus_concurrent_us": (
             timing["mixed"]["mean_us"] - timing["concurrent"]["mean_us"]

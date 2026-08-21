@@ -88,6 +88,54 @@ def _require_page_rows(
         )
 
 
+def _require_query_component(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    width: int,
+) -> tuple[int, int]:
+    """Validate contiguous or row-padded FP8 query storage."""
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"{name} must have dtype {torch.float8_e4m3fn}, got {tensor.dtype}"
+        )
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tensor.ndim != 4:
+        raise ValueError(f"{name} must be 4D, got shape {tuple(tensor.shape)}")
+    batch, query_len, heads, actual_width = tensor.shape
+    if (heads, actual_width) != (_NUM_HEADS, width):
+        raise ValueError(
+            f"{name} must have shape [B,q_len,{_NUM_HEADS},{width}], got "
+            f"{tuple(tensor.shape)}"
+        )
+    strides = tensor.stride()
+    if (
+        strides[3] != 1
+        or strides[2] < width
+        or strides[1] != heads * strides[2]
+        or strides[0] < query_len * strides[1]
+    ):
+        raise ValueError(
+            f"{name} must be row-major with a contiguous feature dimension, "
+            f"got stride {strides}"
+        )
+    if any(stride % 16 for stride in strides[:3]):
+        raise ValueError(
+            f"{name} outer strides must be 16-byte aligned for TMA, "
+            f"got stride {strides}"
+        )
+    if tensor.numel() and tensor.data_ptr() % 16:
+        raise ValueError(
+            f"{name} must be 16-byte aligned, got address 0x{tensor.data_ptr():x}"
+        )
+    return batch, query_len
+
+
 def _require_table_and_lengths(
     owner: str,
     block_tables: torch.Tensor,
@@ -182,7 +230,8 @@ def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 
 def _validate_mixed_inputs(
     *,
-    hot_query: torch.Tensor,
+    hot_query_latent: torch.Tensor,
+    hot_query_rope: torch.Tensor,
     hot_cache: torch.Tensor,
     hot_block_tables: torch.Tensor,
     hot_seq_lens: torch.Tensor,
@@ -204,29 +253,32 @@ def _validate_mixed_inputs(
     out: torch.Tensor,
     lse_out: torch.Tensor,
 ) -> tuple[int, int, int, int]:
-    if not isinstance(hot_query, torch.Tensor):
-        raise TypeError("hot_query must be a torch.Tensor")
-    if not hot_query.is_cuda:
+    if not isinstance(hot_query_latent, torch.Tensor):
+        raise TypeError("hot_query_latent must be a torch.Tensor")
+    if not hot_query_latent.is_cuda:
         raise ValueError("mixed FP8/R31 MLA decode requires CUDA tensors")
-    device = hot_query.device
-    _require_tensor(
-        "hot_query",
-        hot_query,
-        dtype=torch.float8_e4m3fn,
-        ndim=4,
+    device = hot_query_latent.device
+    batch, query_len = _require_query_component(
+        "hot_query_latent",
+        hot_query_latent,
         device=device,
-        alignment=16,
+        width=_LATENT_DIM,
     )
-    batch, query_len, num_heads, hot_width = hot_query.shape
     if batch <= 0:
         raise ValueError(f"query batch must be positive, got {batch}")
     if query_len not in _SUPPORTED_QUERY_LENGTHS:
         raise ValueError(f"mixed MLA supports only q_len 1 or 5, got {query_len}")
-    if (num_heads, hot_width) != (_NUM_HEADS, _LATENT_DIM + _ROPE_DIM):
+    rope_batch, rope_query_len = _require_query_component(
+        "hot_query_rope",
+        hot_query_rope,
+        device=device,
+        width=_ROPE_DIM,
+    )
+    if (rope_batch, rope_query_len) != (batch, query_len):
         raise ValueError(
-            "hot_query must have shape "
-            f"[B,q_len,{_NUM_HEADS},{_LATENT_DIM + _ROPE_DIM}], got "
-            f"{tuple(hot_query.shape)}"
+            "hot query components must have matching batch/query dimensions, "
+            f"got latent={(batch, query_len)} rope="
+            f"{(rope_batch, rope_query_len)}"
         )
     _require_page_rows(
         "hot_cache",
@@ -285,7 +337,7 @@ def _validate_mixed_inputs(
     cold_splits = _resolve_owner_splits(
         "cold_splits", cold_splits, max_seq_len=int(cold_max_seq_len)
     )
-    rows = batch * query_len * num_heads
+    rows = batch * query_len * _NUM_HEADS
     required_bytes = rows * (hot_splits + cold_splits) * (_LATENT_DIM + 1) * 4
     if workspace_buffer.numel() < required_bytes:
         raise ValueError(
@@ -295,7 +347,8 @@ def _validate_mixed_inputs(
 
     writable = (workspace_buffer, out, lse_out)
     readonly = (
-        hot_query,
+        hot_query_latent,
+        hot_query_rope,
         hot_cache,
         hot_block_tables,
         hot_seq_lens,
@@ -323,7 +376,8 @@ def _tensor_signature(tensor: torch.Tensor) -> tuple:
 
 def _get_compiled_mixed_kernel(
     *,
-    hot_query: torch.Tensor,
+    hot_query_latent: torch.Tensor,
+    hot_query_rope: torch.Tensor,
     hot_cache: torch.Tensor,
     hot_block_tables: torch.Tensor,
     hot_workspace: torch.Tensor,
@@ -346,8 +400,9 @@ def _get_compiled_mixed_kernel(
     enable_pdl: bool,
 ) -> Callable:
     key = (
-        hot_query.device.index,
-        _tensor_signature(hot_query),
+        hot_query_latent.device.index,
+        _tensor_signature(hot_query_latent),
+        _tensor_signature(hot_query_rope),
         _tensor_signature(hot_cache),
         _tensor_signature(hot_block_tables),
         _tensor_signature(hot_seq_lens),
@@ -382,7 +437,7 @@ def _get_compiled_mixed_kernel(
                 "safety bound"
             )
 
-        _, query_len = hot_query.shape[:2]
+        batch, query_len = hot_query_latent.shape[:2]
         common = dict(
             acc_dtype=cutlass.Float32,
             lse_dtype=cutlass.Float32,
@@ -411,22 +466,18 @@ def _get_compiled_mixed_kernel(
             tq_s1_scale_stages=3,
             tq_s1_k_rope_stages=1,
             tq_s1_packed_p_scale_math=_use_packed_p_scale_math(
-                hot_query.shape[0], query_len
+                batch, query_len
             ),
-            tq_s1_early_final_pcor=_use_early_final_pcor(hot_query.shape[0], query_len),
+            tq_s1_early_final_pcor=_use_early_final_pcor(batch, query_len),
             tq_r31_async_expand=True,
         )
         kernel = BlackwellMixedFP8R31Producer(hot_kernel, cold_kernel)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        with torch.cuda.device(hot_query.device):
+        with torch.cuda.device(hot_query_latent.device):
             compiled = cute.compile(
                 kernel,
-                _as_cute_tensor(
-                    hot_query[..., :_LATENT_DIM], cutlass.Float8E4M3FN, 3, 16
-                ),
-                _as_cute_tensor(
-                    hot_query[..., _LATENT_DIM:], cutlass.Float8E4M3FN, 3, 16
-                ),
+                _as_cute_tensor(hot_query_latent, cutlass.Float8E4M3FN, 3, 16),
+                _as_cute_tensor(hot_query_rope, cutlass.Float8E4M3FN, 3, 16),
                 _as_cute_tensor(
                     hot_cache[..., :_LATENT_DIM], cutlass.Float8E4M3FN, 2, 16
                 ),
@@ -460,8 +511,9 @@ def _get_compiled_mixed_kernel(
         return compiled
 
 
-def tokenspeed_mla_decode_tq_r31_mixed(
-    hot_query: torch.Tensor,
+def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
+    hot_query_latent: torch.Tensor,
+    hot_query_rope: torch.Tensor,
     hot_cache: torch.Tensor,
     hot_block_tables: torch.Tensor,
     hot_seq_lens: torch.Tensor,
@@ -510,7 +562,8 @@ def tokenspeed_mla_decode_tq_r31_mixed(
         raise TypeError("enable_pdl must be a bool")
 
     batch, query_len, hot_splits, cold_splits = _validate_mixed_inputs(
-        hot_query=hot_query,
+        hot_query_latent=hot_query_latent,
+        hot_query_rope=hot_query_rope,
         hot_cache=hot_cache,
         hot_block_tables=hot_block_tables,
         hot_seq_lens=hot_seq_lens,
@@ -542,7 +595,8 @@ def tokenspeed_mla_decode_tq_r31_mixed(
         _NUM_HEADS, query_len, _MMA_QK_TILER[0]
     )
     compiled = _get_compiled_mixed_kernel(
-        hot_query=hot_query,
+        hot_query_latent=hot_query_latent,
+        hot_query_rope=hot_query_rope,
         hot_cache=hot_cache,
         hot_block_tables=hot_block_tables,
         hot_workspace=hot_workspace,
@@ -567,10 +621,10 @@ def tokenspeed_mla_decode_tq_r31_mixed(
 
     import tvm_ffi
 
-    with torch.cuda.device(hot_query.device), tvm_ffi.use_torch_stream():
+    with torch.cuda.device(hot_query_latent.device), tvm_ffi.use_torch_stream():
         compiled(
-            hot_query[..., :_LATENT_DIM],
-            hot_query[..., _LATENT_DIM:],
+            hot_query_latent,
+            hot_query_rope,
             hot_cache[..., :_LATENT_DIM],
             hot_cache[..., _LATENT_DIM:],
             hot_block_tables,
@@ -605,4 +659,146 @@ def tokenspeed_mla_decode_tq_r31_mixed(
     return out, lse_out
 
 
-__all__ = ["tokenspeed_mla_decode_tq_r31_mixed"]
+def tokenspeed_mla_decode_tq_r31_mixed(
+    hot_query: torch.Tensor,
+    hot_cache: torch.Tensor,
+    hot_block_tables: torch.Tensor,
+    hot_seq_lens: torch.Tensor,
+    hot_causal_seqs: torch.Tensor,
+    hot_max_seq_len: int,
+    cold_query_latent: torch.Tensor,
+    cold_query_rope: torch.Tensor,
+    cold_packed_latent: torch.Tensor,
+    cold_reconstruction_scale: torch.Tensor,
+    cold_high_rope: torch.Tensor,
+    cold_residual_rope: torch.Tensor,
+    cold_block_tables: torch.Tensor,
+    cold_seq_lens: torch.Tensor,
+    cold_causal_seqs: torch.Tensor,
+    cold_max_seq_len: int,
+    workspace_buffer: torch.Tensor,
+    hot_splits: int,
+    cold_splits: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse_out: torch.Tensor,
+    *,
+    output_scale: float = 1.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode mixed owners from the legacy contiguous 576-byte hot query."""
+
+    if not isinstance(hot_query, torch.Tensor):
+        raise TypeError("hot_query must be a torch.Tensor")
+    if not hot_query.is_cuda:
+        raise ValueError("mixed FP8/R31 MLA decode requires CUDA tensors")
+    _require_tensor(
+        "hot_query",
+        hot_query,
+        dtype=torch.float8_e4m3fn,
+        ndim=4,
+        device=hot_query.device,
+        alignment=16,
+    )
+    if tuple(hot_query.shape[2:]) != (_NUM_HEADS, _LATENT_DIM + _ROPE_DIM):
+        raise ValueError(
+            "hot_query must have shape "
+            f"[B,q_len,{_NUM_HEADS},{_LATENT_DIM + _ROPE_DIM}], got "
+            f"{tuple(hot_query.shape)}"
+        )
+    return _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
+        hot_query_latent=hot_query[..., :_LATENT_DIM],
+        hot_query_rope=hot_query[..., _LATENT_DIM:],
+        hot_cache=hot_cache,
+        hot_block_tables=hot_block_tables,
+        hot_seq_lens=hot_seq_lens,
+        hot_causal_seqs=hot_causal_seqs,
+        hot_max_seq_len=hot_max_seq_len,
+        cold_query_latent=cold_query_latent,
+        cold_query_rope=cold_query_rope,
+        cold_packed_latent=cold_packed_latent,
+        cold_reconstruction_scale=cold_reconstruction_scale,
+        cold_high_rope=cold_high_rope,
+        cold_residual_rope=cold_residual_rope,
+        cold_block_tables=cold_block_tables,
+        cold_seq_lens=cold_seq_lens,
+        cold_causal_seqs=cold_causal_seqs,
+        cold_max_seq_len=cold_max_seq_len,
+        workspace_buffer=workspace_buffer,
+        hot_splits=hot_splits,
+        cold_splits=cold_splits,
+        softmax_scale=softmax_scale,
+        out=out,
+        lse_out=lse_out,
+        output_scale=output_scale,
+        enable_pdl=enable_pdl,
+    )
+
+
+def tokenspeed_mla_decode_tq_r31_mixed_split_query(
+    query_latent: torch.Tensor,
+    hot_query_rope: torch.Tensor,
+    hot_cache: torch.Tensor,
+    hot_block_tables: torch.Tensor,
+    hot_seq_lens: torch.Tensor,
+    hot_causal_seqs: torch.Tensor,
+    hot_max_seq_len: int,
+    cold_query_rope: torch.Tensor,
+    cold_packed_latent: torch.Tensor,
+    cold_reconstruction_scale: torch.Tensor,
+    cold_high_rope: torch.Tensor,
+    cold_residual_rope: torch.Tensor,
+    cold_block_tables: torch.Tensor,
+    cold_seq_lens: torch.Tensor,
+    cold_causal_seqs: torch.Tensor,
+    cold_max_seq_len: int,
+    workspace_buffer: torch.Tensor,
+    hot_splits: int,
+    cold_splits: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse_out: torch.Tensor,
+    *,
+    output_scale: float = 1.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode mixed owners while sharing one resident rotated latent query.
+
+    ``query_latent`` is consumed by both the dense-FP8 hot owner and the R31
+    cold owner. Separate 64-byte hot and 256-byte R31 RoPE operands avoid a
+    caller-side 576-byte concatenation or a duplicate latent rotation.
+    """
+
+    return _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
+        hot_query_latent=query_latent,
+        hot_query_rope=hot_query_rope,
+        hot_cache=hot_cache,
+        hot_block_tables=hot_block_tables,
+        hot_seq_lens=hot_seq_lens,
+        hot_causal_seqs=hot_causal_seqs,
+        hot_max_seq_len=hot_max_seq_len,
+        cold_query_latent=query_latent,
+        cold_query_rope=cold_query_rope,
+        cold_packed_latent=cold_packed_latent,
+        cold_reconstruction_scale=cold_reconstruction_scale,
+        cold_high_rope=cold_high_rope,
+        cold_residual_rope=cold_residual_rope,
+        cold_block_tables=cold_block_tables,
+        cold_seq_lens=cold_seq_lens,
+        cold_causal_seqs=cold_causal_seqs,
+        cold_max_seq_len=cold_max_seq_len,
+        workspace_buffer=workspace_buffer,
+        hot_splits=hot_splits,
+        cold_splits=cold_splits,
+        softmax_scale=softmax_scale,
+        out=out,
+        lse_out=lse_out,
+        output_scale=output_scale,
+        enable_pdl=enable_pdl,
+    )
+
+
+__all__ = [
+    "tokenspeed_mla_decode_tq_r31_mixed",
+    "tokenspeed_mla_decode_tq_r31_mixed_split_query",
+]
