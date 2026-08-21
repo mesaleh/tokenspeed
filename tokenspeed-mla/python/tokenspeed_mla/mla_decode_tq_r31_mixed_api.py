@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import numbers
 import threading
-from typing import Callable
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -252,6 +252,7 @@ def _validate_mixed_inputs(
     cold_splits: int,
     out: torch.Tensor,
     lse_out: torch.Tensor,
+    fault_status: Optional[torch.Tensor] = None,
 ) -> tuple[int, int, int, int]:
     if not isinstance(hot_query_latent, torch.Tensor):
         raise TypeError("hot_query_latent must be a torch.Tensor")
@@ -311,6 +312,7 @@ def _validate_mixed_inputs(
         out,
         lse_out,
         True,
+        fault_status,
     )
     if (cold_batch, cold_query_len) != (batch, query_len):
         raise ValueError(
@@ -345,7 +347,11 @@ def _validate_mixed_inputs(
             f"decode requires {required_bytes}"
         )
 
-    writable = (workspace_buffer, out, lse_out)
+    writable = tuple(
+        tensor
+        for tensor in (workspace_buffer, out, lse_out, fault_status)
+        if tensor is not None
+    )
     readonly = (
         hot_query_latent,
         hot_query_rope,
@@ -370,8 +376,11 @@ def _validate_mixed_inputs(
     return batch, query_len, hot_splits, cold_splits
 
 
-def _tensor_signature(tensor: torch.Tensor) -> tuple:
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+def _tensor_signature(
+    tensor: torch.Tensor, *, omit_leading_extent: bool = False
+) -> tuple:
+    shape = tuple(tensor.shape[1:]) if omit_leading_extent else tuple(tensor.shape)
+    return (shape, tuple(tensor.stride()), tensor.dtype)
 
 
 def _get_compiled_mixed_kernel(
@@ -398,30 +407,42 @@ def _get_compiled_mixed_kernel(
     cold_splits: int,
     fold_sq_factor: int,
     enable_pdl: bool,
+    physical_r31: bool,
+    fault_status: Optional[torch.Tensor],
 ) -> Callable:
+    batch, query_len = hot_query_latent.shape[:2]
+    dynamic_batch = physical_r31
     key = (
         hot_query_latent.device.index,
-        _tensor_signature(hot_query_latent),
-        _tensor_signature(hot_query_rope),
-        _tensor_signature(hot_cache),
-        _tensor_signature(hot_block_tables),
-        _tensor_signature(hot_seq_lens),
-        _tensor_signature(hot_causal_seqs),
-        _tensor_signature(cold_query_latent),
-        _tensor_signature(cold_query_rope),
-        _tensor_signature(cold_packed_latent),
-        _tensor_signature(cold_reconstruction_scale),
-        _tensor_signature(cold_high_rope),
-        _tensor_signature(cold_residual_rope),
-        _tensor_signature(cold_block_tables),
-        _tensor_signature(cold_seq_lens),
-        _tensor_signature(cold_causal_seqs),
-        hot_workspace.numel(),
-        cold_workspace.numel(),
+        _tensor_signature(
+            hot_query_latent, omit_leading_extent=dynamic_batch
+        ),
+        _tensor_signature(hot_query_rope, omit_leading_extent=dynamic_batch),
+        _tensor_signature(hot_cache, omit_leading_extent=dynamic_batch),
+        _tensor_signature(hot_block_tables, omit_leading_extent=dynamic_batch),
+        _tensor_signature(hot_seq_lens, omit_leading_extent=dynamic_batch),
+        _tensor_signature(hot_causal_seqs, omit_leading_extent=dynamic_batch),
+        _tensor_signature(
+            cold_query_latent, omit_leading_extent=dynamic_batch
+        ),
+        _tensor_signature(cold_query_rope, omit_leading_extent=dynamic_batch),
+        _tensor_signature(cold_packed_latent, omit_leading_extent=dynamic_batch),
+        _tensor_signature(
+            cold_reconstruction_scale, omit_leading_extent=dynamic_batch
+        ),
+        _tensor_signature(cold_high_rope, omit_leading_extent=dynamic_batch),
+        _tensor_signature(cold_residual_rope, omit_leading_extent=dynamic_batch),
+        _tensor_signature(cold_block_tables, omit_leading_extent=dynamic_batch),
+        _tensor_signature(cold_seq_lens, omit_leading_extent=dynamic_batch),
+        _tensor_signature(cold_causal_seqs, omit_leading_extent=dynamic_batch),
+        True if dynamic_batch else hot_workspace.numel(),
+        True if dynamic_batch else cold_workspace.numel(),
         hot_splits,
         cold_splits,
         fold_sq_factor,
         enable_pdl,
+        physical_r31,
+        fault_status is not None,
     )
     compiled = _COMPILED_MIXED_KERNELS.get(key)
     if compiled is not None:
@@ -437,7 +458,6 @@ def _get_compiled_mixed_kernel(
                 "safety bound"
             )
 
-        batch, query_len = hot_query_latent.shape[:2]
         common = dict(
             acc_dtype=cutlass.Float32,
             lse_dtype=cutlass.Float32,
@@ -461,14 +481,23 @@ def _get_compiled_mixed_kernel(
         cold_kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
             **common,
             use_tq_e2m1=True,
-            use_tq_r31_rope=True,
+            use_tq_r31_rope=not physical_r31,
+            use_tq_r31_physical_split_score=physical_r31,
+            tq_r31_physical_split_score_lookahead=False,
+            tq_r31_physical_split_score_dual_tmem=physical_r31,
             tq_s1_scale_tma=True,
             tq_s1_scale_stages=3,
             tq_s1_k_rope_stages=1,
-            tq_s1_packed_p_scale_math=_use_packed_p_scale_math(
-                batch, query_len
+            tq_s1_packed_p_scale_math=(
+                False
+                if physical_r31
+                else _use_packed_p_scale_math(batch, query_len)
             ),
-            tq_s1_early_final_pcor=_use_early_final_pcor(batch, query_len),
+            tq_s1_early_final_pcor=(
+                False
+                if physical_r31
+                else _use_early_final_pcor(batch, query_len)
+            ),
             tq_r31_async_expand=True,
         )
         kernel = BlackwellMixedFP8R31Producer(hot_kernel, cold_kernel)
@@ -503,6 +532,11 @@ def _get_compiled_mixed_kernel(
                 Float32(1.0),
                 _as_cute_tensor(cold_reconstruction_scale, cutlass.BFloat16, 1, 16),
                 _as_cute_tensor(cold_residual_rope, cutlass.Uint8, 2, 16),
+                (
+                    _as_cute_tensor(fault_status, cutlass.Int32, 0, 4)
+                    if fault_status is not None
+                    else None
+                ),
                 stream,
                 enable_pdl,
                 options="--enable-tvm-ffi --opt-level 3",
@@ -538,6 +572,8 @@ def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
     *,
     output_scale: float = 1.0,
     enable_pdl: bool = False,
+    physical_r31: bool = False,
+    fault_status: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode one batch from disjoint hot-FP8 and cold-R31 page owners.
 
@@ -560,6 +596,12 @@ def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
             raise ValueError(f"{name} must be finite, got {value}")
     if not isinstance(enable_pdl, bool):
         raise TypeError("enable_pdl must be a bool")
+    if not isinstance(physical_r31, bool):
+        raise TypeError("physical_r31 must be a bool")
+    if physical_r31 and fault_status is None:
+        raise ValueError("physical mixed R31 requires caller-owned fault status")
+    if not physical_r31 and fault_status is not None:
+        raise ValueError("fault status is reserved for physical mixed R31")
 
     batch, query_len, hot_splits, cold_splits = _validate_mixed_inputs(
         hot_query_latent=hot_query_latent,
@@ -584,6 +626,7 @@ def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
         cold_splits=cold_splits,
         out=out,
         lse_out=lse_out,
+        fault_status=fault_status,
     )
     rows = batch * query_len * _NUM_HEADS
     hot_workspace_bytes = rows * hot_splits * (_LATENT_DIM + 1) * 4
@@ -617,6 +660,8 @@ def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
         cold_splits=cold_splits,
         fold_sq_factor=fold_sq_factor,
         enable_pdl=enable_pdl,
+        physical_r31=physical_r31,
+        fault_status=fault_status,
     )
 
     import tvm_ffi
@@ -646,6 +691,7 @@ def _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
             Float32(float(output_scale)),
             cold_reconstruction_scale,
             cold_residual_rope,
+            fault_status,
         )
         reduce_mla_mixed_workspace(
             active_workspace,
@@ -798,7 +844,75 @@ def tokenspeed_mla_decode_tq_r31_mixed_split_query(
     )
 
 
+def tokenspeed_mla_decode_tq_r31_physical_mixed_split_query(
+    query_latent: torch.Tensor,
+    hot_query_rope: torch.Tensor,
+    hot_cache: torch.Tensor,
+    hot_block_tables: torch.Tensor,
+    hot_seq_lens: torch.Tensor,
+    hot_causal_seqs: torch.Tensor,
+    hot_max_seq_len: int,
+    cold_query_rope: torch.Tensor,
+    cold_packed_latent: torch.Tensor,
+    cold_reconstruction_scale: torch.Tensor,
+    cold_high_rope: torch.Tensor,
+    cold_residual_rope: torch.Tensor,
+    cold_block_tables: torch.Tensor,
+    cold_seq_lens: torch.Tensor,
+    cold_causal_seqs: torch.Tensor,
+    cold_max_seq_len: int,
+    workspace_buffer: torch.Tensor,
+    hot_splits: int,
+    cold_splits: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse_out: torch.Tensor,
+    fault_status: torch.Tensor,
+    *,
+    output_scale: float = 1.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode hot FP8 and physical-unit R31 owners in one producer grid.
+
+    This entry point is intentionally distinct from the normalized R31 mixed
+    APIs: its cold cache stores RoPE in physical post-RoPE units. The caller
+    owns and clears ``fault_status`` before launch, then rejects the launch if
+    that sticky word is nonzero after stream synchronization.
+    """
+
+    return _tokenspeed_mla_decode_tq_r31_mixed_split_impl(
+        hot_query_latent=query_latent,
+        hot_query_rope=hot_query_rope,
+        hot_cache=hot_cache,
+        hot_block_tables=hot_block_tables,
+        hot_seq_lens=hot_seq_lens,
+        hot_causal_seqs=hot_causal_seqs,
+        hot_max_seq_len=hot_max_seq_len,
+        cold_query_latent=query_latent,
+        cold_query_rope=cold_query_rope,
+        cold_packed_latent=cold_packed_latent,
+        cold_reconstruction_scale=cold_reconstruction_scale,
+        cold_high_rope=cold_high_rope,
+        cold_residual_rope=cold_residual_rope,
+        cold_block_tables=cold_block_tables,
+        cold_seq_lens=cold_seq_lens,
+        cold_causal_seqs=cold_causal_seqs,
+        cold_max_seq_len=cold_max_seq_len,
+        workspace_buffer=workspace_buffer,
+        hot_splits=hot_splits,
+        cold_splits=cold_splits,
+        softmax_scale=softmax_scale,
+        out=out,
+        lse_out=lse_out,
+        output_scale=output_scale,
+        enable_pdl=enable_pdl,
+        physical_r31=True,
+        fault_status=fault_status,
+    )
+
+
 __all__ = [
     "tokenspeed_mla_decode_tq_r31_mixed",
     "tokenspeed_mla_decode_tq_r31_mixed_split_query",
+    "tokenspeed_mla_decode_tq_r31_physical_mixed_split_query",
 ]

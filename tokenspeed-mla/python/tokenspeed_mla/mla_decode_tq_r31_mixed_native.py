@@ -2,6 +2,8 @@
 
 """One-grid SM100 producer for mixed dense-FP8 and packed-R31 MLA."""
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -34,8 +36,23 @@ class BlackwellMixedFP8R31Producer:
     ) -> None:
         if hot_kernel.use_tq_e2m1:
             raise ValueError("the hot mixed producer must use dense FP8")
-        if not (cold_kernel.use_tq_e2m1 and cold_kernel.use_tq_r31_rope):
-            raise ValueError("the cold mixed producer must use packed R31")
+        cold_is_normalized = cold_kernel.use_tq_r31_rope
+        cold_is_physical = cold_kernel.use_tq_r31_physical_split_score
+        if not (
+            cold_kernel.use_tq_e2m1
+            and (cold_is_normalized != cold_is_physical)
+        ):
+            raise ValueError(
+                "the cold mixed producer must use exactly one packed-R31 format"
+            )
+        if cold_is_physical and not (
+            cold_kernel.tq_r31_physical_split_score_dual_tmem
+            and not cold_kernel.tq_r31_physical_split_score_lookahead
+        ):
+            raise ValueError(
+                "the physical cold mixed producer requires dual TMEM without "
+                "lookahead"
+            )
         for name, hot_value, cold_value in (
             ("acc_dtype", hot_kernel.acc_dtype, cold_kernel.acc_dtype),
             ("lse_dtype", hot_kernel.lse_dtype, cold_kernel.lse_dtype),
@@ -186,6 +203,7 @@ class BlackwellMixedFP8R31Producer:
         output_scale: cutlass.Float32,
         cold_scale: cute.Tensor,
         cold_rope_residual: cute.Tensor,
+        cold_fault_status: Optional[cute.Tensor],
         stream: cuda.CUstream,
         use_pdl: cutlass.Constexpr = True,
     ):
@@ -206,6 +224,7 @@ class BlackwellMixedFP8R31Producer:
             output_scale,
             stream,
             use_pdl,
+            None,
             None,
             None,
             None,
@@ -231,6 +250,7 @@ class BlackwellMixedFP8R31Producer:
             cold_scale,
             None,
             cold_rope_residual,
+            cold_fault_status,
             True,
         )
         self.mixed_split_kv_kernel(

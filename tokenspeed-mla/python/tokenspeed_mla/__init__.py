@@ -35,6 +35,7 @@ try:
         reduce_mla_mixed_workspace,
     )
     from tokenspeed_mla.mla_decode_tq_r31_mixed_api import (
+        tokenspeed_mla_decode_tq_r31_physical_mixed_split_query,
         tokenspeed_mla_decode_tq_r31_mixed,
         tokenspeed_mla_decode_tq_r31_mixed_split_query,
     )
@@ -58,6 +59,7 @@ except ImportError as exc:
     tokenspeed_mla_decode = _unavailable
     tokenspeed_mla_decode_tq_e2m1 = _unavailable
     tokenspeed_mla_decode_tq_r31 = _unavailable
+    tokenspeed_mla_decode_tq_r31_physical_mixed_split_query = _unavailable
     tokenspeed_mla_decode_tq_r31_mixed = _unavailable
     tokenspeed_mla_decode_tq_r31_mixed_split_query = _unavailable
     reduce_mla_mixed_workspace = _unavailable
@@ -71,6 +73,7 @@ __all__ = [
     "tokenspeed_mla_decode",
     "tokenspeed_mla_decode_tq_e2m1",
     "tokenspeed_mla_decode_tq_r31",
+    "tokenspeed_mla_decode_tq_r31_physical_mixed_split_query",
     "tokenspeed_mla_decode_tq_r31_mixed",
     "tokenspeed_mla_decode_tq_r31_mixed_split_query",
     "reduce_mla_mixed_workspace",

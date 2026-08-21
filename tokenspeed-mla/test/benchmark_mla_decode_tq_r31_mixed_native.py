@@ -288,6 +288,7 @@ def _compile_mixed_producer(
         Float32(1.0),
         _as_cute_tensor(cold_scale, cutlass.BFloat16, 1, 16),
         _as_cute_tensor(cold_residual_rope, cutlass.Uint8, 2, 16),
+        None,
         stream,
         options="--enable-tvm-ffi --opt-level 3",
     )
@@ -638,6 +639,7 @@ def run(
                 Float32(1.0),
                 state.cold_scale,
                 state.cold_residual,
+                None,
             )
 
     def mixed_launch() -> None:
