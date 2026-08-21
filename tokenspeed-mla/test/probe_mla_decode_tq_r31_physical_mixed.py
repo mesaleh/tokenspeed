@@ -25,6 +25,12 @@ SPLITS = 2
 SOFTMAX_SCALE = 0.125
 
 
+def _padded_pages(sequence_length: int) -> int:
+    """Pad page tables to the four-page QK tile contract."""
+
+    return math.ceil(math.ceil(sequence_length / PAGE) / 4) * 4
+
+
 def _lengths(batch: int, sequence_length: int) -> tuple[list[int], list[int]]:
     patterns = [
         (129, sequence_length - 129),
@@ -50,7 +56,7 @@ def _case(
 ) -> dict[str, object]:
     torch.manual_seed(0xA173E00 + batch * 10 + query_len)
     device = torch.device("cuda:0")
-    pages_per_request = math.ceil(sequence_length / PAGE)
+    pages_per_request = _padded_pages(sequence_length)
     pages = batch * pages_per_request
     query_latent = (torch.randn(batch, query_len, HEADS, LATENT, device=device) * 0.1).to(
         torch.float8_e4m3fn
@@ -88,8 +94,10 @@ def _case(
 
     rows = batch * query_len * HEADS
     owner_bytes = rows * SPLITS * (LATENT + 1) * 4
-    reference_workspace = torch.empty(2 * owner_bytes, device=device, dtype=torch.int8)
-    mixed_workspace = torch.empty_like(reference_workspace)
+    reference_workspace = torch.full(
+        (2 * owner_bytes,), 0x25, device=device, dtype=torch.int8
+    )
+    mixed_workspace = torch.full_like(reference_workspace, -0x26)
     reference_out = torch.empty(
         batch, query_len, HEADS, LATENT, device=device, dtype=torch.bfloat16
     )
@@ -395,6 +403,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int)
     parser.add_argument("--query-len", type=int)
     parser.add_argument("--graph-replays", type=int, default=100)
+    parser.add_argument("--sequence-length", type=int, default=384)
     parser.add_argument("--exercise-faults", action="store_true")
     args = parser.parse_args()
     if (args.batch is None) != (args.query_len is None):
@@ -405,6 +414,7 @@ if __name__ == "__main__":
         _case(
             args.batch,
             args.query_len,
+            sequence_length=args.sequence_length,
             graph_replays=args.graph_replays,
             exercise_faults=args.exercise_faults,
         )
