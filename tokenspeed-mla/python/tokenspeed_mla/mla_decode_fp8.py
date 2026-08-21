@@ -20,6 +20,7 @@
 
 import argparse
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional, Tuple, Type
 
@@ -140,6 +141,15 @@ SplitKVKernelArgs = tuple[
     cute.Layout,
     MLAStaticTileSchedulerParams,
 ]
+
+
+@dataclass(frozen=True)
+class _PhysicalSplitScoreMeta:
+    """Read-only meta references that may cross a runtime CUTLASS branch."""
+
+    common: SimpleNamespace
+    qk: SimpleNamespace
+    pv: SimpleNamespace
 
 # Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
 # For how to construct the Instruction Descriptor value.
@@ -380,6 +390,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
         use_tq_e2m1: bool = False,
         use_tq_r31_rope: bool = False,
+        use_tq_r31_physical_split_score: bool = False,
+        tq_r31_physical_split_score_lookahead: bool = True,
         tq_debug_trace: bool = False,
         tq_s1_scale_ceiling: bool = False,
         tq_s1_scale_diag: bool = False,
@@ -459,6 +471,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.use_runtime_causal_bound = use_runtime_causal_bound
         self.use_tq_e2m1 = use_tq_e2m1
         self.use_tq_r31_rope = use_tq_r31_rope
+        self.use_tq_r31_physical_split_score = use_tq_r31_physical_split_score
+        self.tq_r31_physical_split_score_lookahead = (
+            tq_r31_physical_split_score_lookahead
+        )
+        self.use_tq_r31_any_rope = (
+            self.use_tq_r31_rope or self.use_tq_r31_physical_split_score
+        )
         self.tq_debug_trace = tq_debug_trace
         self.tq_s1_scale_ceiling = tq_s1_scale_ceiling
         self.tq_s1_scale_diag = tq_s1_scale_diag
@@ -473,7 +492,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError("runtime causal bounds require a causal kernel")
         if self.use_runtime_causal_bound and self.cp_world != 1:
             raise ValueError("runtime causal bounds currently require cp_world=1")
-        if self.use_tq_r31_rope and not self.use_tq_e2m1:
+        if self.use_tq_r31_rope and self.use_tq_r31_physical_split_score:
+            raise ValueError("normalized and physical R31 RoPE are mutually exclusive")
+        if self.use_tq_r31_any_rope and not self.use_tq_e2m1:
             raise ValueError("R31 RoPE requires TurboQuant E2M1 latent cache")
         if (
             self.tq_s1_scale_ceiling or self.tq_s1_scale_diag or self.tq_s1_scale_tma
@@ -506,7 +527,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
         if self.tq_s1_k_rope_stages not in (0, 1, 2):
             raise ValueError("S1 key-RoPE stages must be one of 0, 1, or 2")
-        if self.tq_r31_async_expand and not self.use_tq_r31_rope:
+        if self.tq_r31_async_expand and not self.use_tq_r31_any_rope:
             raise ValueError("R31 asynchronous expansion requires the R31 RoPE path")
         if self.use_tq_e2m1 and (cp_world != 1 or mma_qk_tiler_mn[0] != 64):
             raise ValueError("TurboQuant E2M1 K0 only supports cp_world=1 M64")
@@ -559,7 +580,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.iterations_qk_latent = self.latent_dim // self.mma_qk_tiler[2]
         # R31 presents four contiguous E4M3 query operands: high primary,
         # high correction, residual primary, and residual correction.
-        self.iterations_qk_rope = 4 if self.use_tq_r31_rope else 1
+        self.iterations_qk_rope = 4 if self.use_tq_r31_any_rope else 1
         self.iterations_qk = self.iterations_qk_latent + self.iterations_qk_rope
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
@@ -735,7 +756,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.q_dtype = q_latent.element_type
         self.rope_dtype = (
             self.q_dtype
-            if cutlass.const_expr(self.use_tq_r31_rope)
+            if cutlass.const_expr(self.use_tq_r31_any_rope)
             else (
                 cutlass.BFloat16
                 if cutlass.const_expr(self.use_tq_e2m1)
@@ -774,7 +795,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     "TurboQuant E2M1 expects uint8 packed latent, BF16 scale, "
                     "and an E4M3 latent query"
                 )
-            if cutlass.const_expr(self.use_tq_r31_rope):
+            if cutlass.const_expr(self.use_tq_r31_any_rope):
                 if cutlass.const_expr(
                     q_rope.element_type != cutlass.Float8E4M3FN
                     or c_rope.element_type != cutlass.Float8E4M3FN
@@ -861,7 +882,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         else:
             c_latent = _reinterpret_3d_kv(c_latent)
         c_rope = _reinterpret_3d_kv(c_rope)
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             # Keep the persistent ABI compact: 64 E2M1 values occupy 32 bytes.
             # The MMA warp expands the tile to SM100's data-plus-padding SMEM
             # representation after the raw uint8 TMA load completes.
@@ -1095,7 +1116,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.rope_dtype,
             self.load_q_stage * self.iterations_qk_rope,
         )
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             q_rope_smem_layout_staged = cute.logical_divide(
                 q_rope_smem_layout_staged,
                 (None, None, None, self.iterations_qk_rope),
@@ -1142,7 +1163,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.rope_dtype,
             (
                 self.load_k_rope_smem_stage
-                if cutlass.const_expr(self.use_tq_r31_rope)
+                if cutlass.const_expr(self.use_tq_r31_any_rope)
                 else self.iterations_qk_rope * self.load_k_rope_smem_stage
             ),
         )
@@ -1151,7 +1172,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         kc_rope_residual_smem_layout_staged = None
         kc_rope_residual_smem_layout_for_tma = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             residual_cache_bytes = self.rope_dim // 2
             residual_smem_bytes = self.rope_dim
             kc_rope_residual_smem_layout_staged = cute.make_composed_layout(
@@ -1279,7 +1300,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         tma_atom_c_rope_residual = None
         tma_tensor_c_rope_residual = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             kc_rope_residual_smem_layout = cute.select(
                 kc_rope_residual_smem_layout_for_tma,
                 mode=[0],
@@ -1369,7 +1390,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * cute.size(qk_tiled_mma.thr_id.shape)
             * self.iterations_qk_rope
         )
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             kc_rope_copy_size = cute.size_in_bytes(
                 self.rope_dtype,
                 cute.select(kc_rope_smem_layout_staged, mode=[0, 1, 2]),
@@ -1442,6 +1463,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cutlass.Int64, self.load_scale_stage * 2
             ]
             mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
+            latent_score_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64,
+                (
+                    self.mma_s_stage * 2
+                    if cutlass.const_expr(self.use_tq_r31_physical_split_score)
+                    else 0
+                ),
+            ]
             p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
             mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
@@ -1474,7 +1503,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cutlass.Int8,
                     (
                         cute.cosize(kc_rope_residual_smem_layout_staged)
-                        if cutlass.const_expr(self.use_tq_r31_rope)
+                        if cutlass.const_expr(self.use_tq_r31_any_rope)
                         else 0
                     ),
                 ],
@@ -1859,7 +1888,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if warp_idx == self.load_tma_k_warp_id:
             cpasync.prefetch_descriptor(tma_atom_c_latent)
             cpasync.prefetch_descriptor(tma_atom_c_rope)
-            if cutlass.const_expr(self.use_tq_r31_rope):
+            if cutlass.const_expr(self.use_tq_r31_any_rope):
                 cpasync.prefetch_descriptor(tma_atom_c_rope_residual)
             if cutlass.const_expr(self.tq_s1_scale_tma):
                 cpasync.prefetch_descriptor(tma_atom_c_scale)
@@ -1929,6 +1958,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_s_pipeline = self.make_and_init_mma_s_pipeline(
             storage.mma_s_mbar_ptr.data_ptr(), cta_layout_vmnk
         )
+        latent_score_pipeline = None
+        if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+            latent_score_pipeline = self.make_and_init_mma_s_pipeline(
+                storage.latent_score_mbar_ptr.data_ptr(),
+                cta_layout_vmnk,
+            )
         p_mma_pipeline = self.make_and_init_p_mma_pipeline(
             storage.p_mma_mbar_ptr.data_ptr(), cta_layout_vmnk
         )
@@ -1970,7 +2005,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         sKC_rope_residual = None
         sKC_rope_residual_for_tma = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             sKC_rope_residual = storage.smem_kc_rope_residual.get_tensor(
                 kc_rope_residual_smem_layout_staged.outer,
                 swizzle=kc_rope_residual_smem_layout_staged.inner,
@@ -2370,6 +2405,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         sKC=sKC,
                         sKC_rope=sKC_rope,
                         sKC_rope_residual=sKC_rope_residual,
+                        latent_score_pipeline=latent_score_pipeline,
                     )
                     mma_pv_params = SimpleNamespace(
                         p_mma_pipeline=p_mma_pipeline,
@@ -2405,6 +2441,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+                latent_score_pipeline.producer_tail(mma_s_producer_state)
             mma_s_pipeline.producer_tail(mma_s_producer_state)
             mma_o_pipeline.producer_tail(mma_o_producer_state)
             cute.arch.griddepcontrol_launch_dependents()
@@ -2482,6 +2520,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         sP=sP,
                         sScale=sScale,
                         mma_s_pipeline=mma_s_pipeline,
+                        latent_score_pipeline=latent_score_pipeline,
                         p_mma_pipeline=p_mma_pipeline,
                         softmax_scale_log2=softmax_scale_log2,
                     )
@@ -2892,7 +2931,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             else gKR[None, 0, None, None]
         )
         tSgKRResidual = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             gKRResidual = cute.tiled_divide(
                 k_params.mKRResidual,
                 (page_tile_size, self.rope_dim // 2),
@@ -2925,7 +2964,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         tKCsKC_rope_residual = None
         tKRResidualgKRResidual = None
-        if cutlass.const_expr(self.use_tq_r31_rope):
+        if cutlass.const_expr(self.use_tq_r31_any_rope):
             (
                 tKCsKC_rope_residual,
                 tKRResidualgKRResidual,
@@ -3192,7 +3231,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
             for i in cutlass.range_constexpr(
                 1
-                if cutlass.const_expr(self.use_tq_r31_rope)
+                if cutlass.const_expr(self.use_tq_r31_any_rope)
                 else self.iterations_qk_rope
             ):
                 for k in cutlass.range_constexpr(page_per_tile):
@@ -3241,7 +3280,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 k_params.tKCsKC_rope[None, k, 0, 0],
                                 tma_bar_ptr=tma_bar_ptr,
                             )
-            if cutlass.const_expr(self.use_tq_r31_rope):
+            if cutlass.const_expr(self.use_tq_r31_any_rope):
                 residual_stage_base = cute.domain_offset(
                     (0, 0, k_rope_stage),
                     k_params.sKC_rope_residual_full,
@@ -3282,7 +3321,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             for i in cutlass.range_constexpr(
                 1
-                if cutlass.const_expr(self.use_tq_r31_rope)
+                if cutlass.const_expr(self.use_tq_r31_any_rope)
                 else self.iterations_qk_rope
             ):
                 for k in cutlass.range_constexpr(page_per_tile):
@@ -3292,7 +3331,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         k_params.tKCsKC_rope[None, k, 0, load_k_producer_state.index],
                         tma_bar_ptr=tma_bar_ptr,
                     )
-            if cutlass.const_expr(self.use_tq_r31_rope):
+            if cutlass.const_expr(self.use_tq_r31_any_rope):
                 for k in cutlass.range_constexpr(page_per_tile):
                     cute.copy(
                         k_params.tma_atom_c_rope_residual,
@@ -3520,6 +3559,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
         pv_k_index = common_params.k_index
+        if cutlass.const_expr(
+            self.use_tq_r31_physical_split_score
+            and self.tq_r31_physical_split_score_lookahead
+        ):
+            return self.mma_physical_split_score(
+                common_params,
+                qk_params,
+                pv_params,
+                k_tile_count,
+                tiled_mma_qk,
+                tiled_mma_pv,
+                load_q_consumer_state,
+                load_k_consumer_state,
+                load_k_rope_consumer_state,
+                load_v_consumer_state,
+                mma_s_producer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            )
         if common_params.is_leader_cta:
             load_q_release_state = load_q_consumer_state.clone()
             (
@@ -3604,6 +3662,271 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
 
     @cute.jit
+    def mma_physical_split_score(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        pv_params: SimpleNamespace,
+        k_tile_count: cutlass.Int32,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        load_q_consumer_state: pipeline.PipelineState,
+        load_k_consumer_state: pipeline.PipelineState,
+        load_k_rope_consumer_state: pipeline.PipelineState,
+        load_v_consumer_state: pipeline.PipelineState,
+        mma_s_producer_state: pipeline.PipelineState,
+        p_mma_consumer_state: pipeline.PipelineState,
+        mma_o_producer_state: pipeline.PipelineState,
+    ) -> tuple:
+        """Two-stage latent lookahead with in-place physical-RoPE score reuse."""
+
+        load_q_release_state = load_q_consumer_state.clone()
+        pv_k_index = common_params.k_index
+        (
+            load_q_consumer_state,
+            load_k_consumer_state,
+            mma_s_producer_state,
+            current_score_state,
+        ) = self.mma_qk_physical_latent(
+            common_params,
+            qk_params,
+            load_q_consumer_state,
+            load_k_consumer_state,
+            mma_s_producer_state,
+            wait_q=True,
+        )
+        k_tile_count -= 1
+        branch_meta = _PhysicalSplitScoreMeta(common_params, qk_params, pv_params)
+
+        if k_tile_count > 0:
+            (
+                load_q_consumer_state,
+                load_k_consumer_state,
+                mma_s_producer_state,
+                next_score_state,
+            ) = self.mma_qk_physical_latent(
+                branch_meta.common,
+                branch_meta.qk,
+                load_q_consumer_state,
+                load_k_consumer_state,
+                mma_s_producer_state,
+                wait_q=False,
+            )
+            k_tile_count -= 1
+            load_k_rope_consumer_state = self.mma_qk_physical_rope(
+                branch_meta.common,
+                branch_meta.qk,
+                load_k_rope_consumer_state,
+                current_score_state,
+            )
+
+            while k_tile_count > 0:
+                (
+                    load_q_consumer_state,
+                    load_k_consumer_state,
+                    mma_s_producer_state,
+                    new_score_state,
+                ) = self.mma_qk_physical_latent(
+                    branch_meta.common,
+                    branch_meta.qk,
+                    load_q_consumer_state,
+                    load_k_consumer_state,
+                    mma_s_producer_state,
+                    wait_q=False,
+                )
+                k_tile_count -= 1
+                load_k_rope_consumer_state = self.mma_qk_physical_rope(
+                    branch_meta.common,
+                    branch_meta.qk,
+                    load_k_rope_consumer_state,
+                    next_score_state,
+                )
+                (
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma_pv(
+                    branch_meta.common,
+                    branch_meta.pv,
+                    pv_k_index,
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
+                pv_k_index += 1
+                next_score_state = new_score_state
+
+            load_k_rope_consumer_state = self.mma_qk_physical_rope(
+                branch_meta.common,
+                branch_meta.qk,
+                load_k_rope_consumer_state,
+                next_score_state,
+            )
+            (
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            ) = self.mma_pv(
+                branch_meta.common,
+                branch_meta.pv,
+                pv_k_index,
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            )
+            pv_k_index += 1
+
+            branch_meta.common.load_q_pipeline.consumer_release(load_q_release_state)
+            load_q_release_state.advance()
+            (
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            ) = self.mma_pv(
+                branch_meta.common,
+                branch_meta.pv,
+                pv_k_index,
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            )
+        else:
+            load_k_rope_consumer_state = self.mma_qk_physical_rope(
+                branch_meta.common,
+                branch_meta.qk,
+                load_k_rope_consumer_state,
+                current_score_state,
+            )
+            branch_meta.common.load_q_pipeline.consumer_release(load_q_release_state)
+            load_q_release_state.advance()
+            (
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            ) = self.mma_pv(
+                branch_meta.common,
+                branch_meta.pv,
+                pv_k_index,
+                tiled_mma_pv,
+                load_v_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            )
+
+        return (
+            tiled_mma_qk,
+            tiled_mma_pv,
+            load_q_consumer_state,
+            load_k_consumer_state,
+            load_k_rope_consumer_state,
+            load_v_consumer_state,
+            mma_s_producer_state,
+            p_mma_consumer_state,
+            mma_o_producer_state,
+        )
+
+    @cute.jit
+    def mma_qk_physical_latent(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        load_q_consumer_state: pipeline.PipelineState,
+        load_k_consumer_state: pipeline.PipelineState,
+        mma_s_producer_state: pipeline.PipelineState,
+        wait_q: bool,
+    ) -> tuple:
+        """Issue one latent score and publish it for early compute-warp copy."""
+
+        score_state = mma_s_producer_state.clone()
+        tStS = qk_params.tStS_staged[None, None, None, score_state.index]
+        qk_params.mma_s_pipeline.producer_acquire(score_state)
+        qk_params.latent_score_pipeline.producer_acquire(score_state)
+        if cutlass.const_expr(wait_q):
+            common_params.load_q_pipeline.consumer_wait(load_q_consumer_state)
+        for q_stage in cutlass.range_constexpr(self.iterations_qk_latent):
+            common_params.load_k_pipeline.consumer_wait(load_k_consumer_state)
+            for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
+                tcgen05_mma_ws_f8f6f4_one(
+                    qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
+                    qk_params.tSrKC[None, None, k_block, (q_stage, 0)],
+                    tStS,
+                    Int32(_IDESC_F8E4M3_E2M1_F32_M64_N128_KMAJ_1CTA),
+                    Boolean(q_stage != 0 or k_block != 0),
+                )
+            common_params.load_k_pipeline.consumer_release(load_k_consumer_state)
+            load_k_consumer_state.advance()
+        qk_params.latent_score_pipeline.producer_commit(score_state)
+        if cutlass.const_expr(wait_q):
+            load_q_consumer_state.advance()
+        mma_s_producer_state.advance()
+        return (
+            load_q_consumer_state,
+            load_k_consumer_state,
+            mma_s_producer_state,
+            score_state,
+        )
+
+    @cute.jit
+    def mma_qk_physical_rope(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        load_k_rope_consumer_state: pipeline.PipelineState,
+        score_state: pipeline.PipelineState,
+    ) -> pipeline.PipelineState:
+        """Overwrite a copied latent stage with one direct physical-RoPE score."""
+
+        reuse_state = score_state.clone()
+        for _ in cutlass.range_constexpr(self.mma_s_stage):
+            reuse_state.advance()
+        qk_params.latent_score_pipeline.producer_acquire(reuse_state)
+
+        common_params.r31_expand_pipeline.consumer_wait(load_k_rope_consumer_state)
+        rope_stage = (
+            load_k_rope_consumer_state.index
+            if cutlass.const_expr(self.load_k_rope_pipeline_stage > 1)
+            else 0
+        )
+        residual_stage = qk_params.sKC_rope_residual[None, None, rope_stage]
+        tStS = qk_params.tStS_staged[None, None, None, score_state.index]
+        first_rope_mma = True
+        for q_stage in cutlass.range_constexpr(2):
+            for k_block in cutlass.range_constexpr(
+                self.rope_dim // common_params.tiled_mma_rope.shape_mnk[2]
+            ):
+                tcgen05_mma_ws_f8f6f4_one(
+                    qk_params.tSrQ_rope[None, None, k_block, q_stage],
+                    qk_params.tSrKC_rope[None, None, k_block, rope_stage],
+                    tStS,
+                    Int32(_IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA),
+                    Boolean(not first_rope_mma),
+                )
+                first_rope_mma = False
+        for q_stage in cutlass.range_constexpr(2, 4):
+            for k_block in cutlass.range_constexpr(self.rope_dim // 32):
+                tcgen05_mma_ws_f8f6f4_packed_b_one(
+                    qk_params.tSrQ_rope[None, None, k_block, q_stage],
+                    residual_stage,
+                    k_block,
+                    tStS,
+                    Int32(_IDESC_F8E4M3_E2M1_F32_M64_N128_KMAJ_1CTA),
+                    Boolean(True),
+                )
+        common_params.r31_expand_pipeline.consumer_release(
+            load_k_rope_consumer_state
+        )
+        load_k_rope_consumer_state.advance()
+        qk_params.mma_s_pipeline.producer_commit(score_state)
+        return load_k_rope_consumer_state
+
+    @cute.jit
     def mma_qk(
         self,
         common_params: SimpleNamespace,
@@ -3649,6 +3972,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
 
         qk_params.mma_s_pipeline.producer_acquire(mma_s_producer_state)
+        latent_score_producer_state = None
+        if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+            latent_score_producer_state = mma_s_producer_state.clone()
+            qk_params.latent_score_pipeline.producer_acquire(
+                latent_score_producer_state
+            )
         tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
         load_k_pipeline = common_params.load_k_pipeline
@@ -3680,6 +4009,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 load_k_pipeline.consumer_release(load_k_consumer_state)
                 load_k_consumer_state.advance()
 
+            if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+                # Publish the completed latent score, then wait until all four
+                # compute warps have copied this TMEM stage into registers. The
+                # opposite-phase state addresses the same circular slot after
+                # its consumer release, making the subsequent RoPE MMA overwrite
+                # explicit rather than racing an asynchronous TMEM load.
+                qk_params.latent_score_pipeline.producer_commit(
+                    latent_score_producer_state
+                )
+                latent_score_reuse_state = latent_score_producer_state.clone()
+                for _ in cutlass.range_constexpr(self.mma_s_stage):
+                    latent_score_reuse_state.advance()
+                qk_params.latent_score_pipeline.producer_acquire(
+                    latent_score_reuse_state
+                )
+                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, False)
+
             load_k_rope_pipeline = common_params.load_k_rope_pipeline
             if cutlass.const_expr(self.tq_r31_async_expand):
                 common_params.r31_expand_pipeline.consumer_wait(
@@ -3687,7 +4033,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
             else:
                 load_k_rope_pipeline.consumer_wait(load_k_rope_consumer_state)
-            if cutlass.const_expr(self.use_tq_r31_rope):
+            if cutlass.const_expr(self.use_tq_r31_any_rope):
                 residual_stage = qk_params.sKC_rope_residual[
                     None,
                     None,
@@ -3710,7 +4056,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             ],
                             tStS,
                             Int32(_IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA),
-                            Boolean(True),
+                            Boolean(
+                                not self.use_tq_r31_physical_split_score
+                                or q_stage != 0
+                                or k_block != 0
+                            ),
                         )
                         tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
                 for q_stage in cutlass.range_constexpr(2, 4):
@@ -4379,6 +4729,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_s_try_token = softmax_params.mma_s_pipeline.consumer_try_wait(
             mma_s_consumer_state
         )
+        latent_score_consumer_state = None
+        latent_score_try_token = None
+        if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+            latent_score_consumer_state = mma_s_consumer_state.clone()
+            latent_score_try_token = (
+                softmax_params.latent_score_pipeline.consumer_try_wait(
+                    latent_score_consumer_state
+                )
+            )
         load_scale_try_token = None
         if cutlass.const_expr(
             self.use_tq_e2m1 and not (self.tq_s1_scale_ceiling or self.tq_s1_scale_diag)
@@ -4386,14 +4745,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_scale_try_token = common_params.load_scale_pipeline.consumer_try_wait(
                 load_scale_consumer_state
             )
-        softmax_params.mma_s_pipeline.consumer_wait(
-            mma_s_consumer_state, try_wait_token=mma_s_try_token
-        )
-        if cutlass.const_expr(
-            self.use_tq_e2m1 and not (self.tq_s1_scale_ceiling or self.tq_s1_scale_diag)
-        ):
-            common_params.load_scale_pipeline.consumer_wait(
-                load_scale_consumer_state, try_wait_token=load_scale_try_token
+        if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+            softmax_params.latent_score_pipeline.consumer_wait(
+                latent_score_consumer_state,
+                try_wait_token=latent_score_try_token,
             )
 
         # load S from tmem
@@ -4439,6 +4794,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tTR_tS = tmem_thr_copy.partition_D(cS)
 
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
+        tTR_rLatent = None
+        if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+            tTR_rLatent = cute.make_fragment_like(tTR_tS, self.acc_dtype)
+            cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rLatent)
+            cute.arch.fence_view_async_tmem_load()
+            softmax_params.latent_score_pipeline.consumer_release(
+                latent_score_consumer_state
+            )
+
+        softmax_params.mma_s_pipeline.consumer_wait(
+            mma_s_consumer_state, try_wait_token=mma_s_try_token
+        )
+        if cutlass.const_expr(
+            self.use_tq_e2m1 and not (self.tq_s1_scale_ceiling or self.tq_s1_scale_diag)
+        ):
+            common_params.load_scale_pipeline.consumer_wait(
+                load_scale_consumer_state, try_wait_token=load_scale_try_token
+            )
 
         row_max_new = row_max
         carrier_reciprocal = cutlass.Float32(1.0)
@@ -4457,8 +4830,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         arch = BaseDSL._get_dsl().get_arch_enum()
 
         if cutlass.const_expr(self.use_tq_e2m1):
-            # Latent and reciprocal-RoPE already share this score fragment.
-            # Apply the per-token reconstruction scale once before softmax.
+            # Normalized R31 shares latent and reciprocal-RoPE in this score.
+            # Physical split-score instead loaded latent into registers before
+            # the MMA warp overwrote this TMEM stage with physical RoPE.
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             cute.arch.fence_view_async_tmem_load()
             softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
@@ -4512,7 +4886,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                     else:
                         scale = s_scale[token].to(cutlass.Float32)
-                    tTR_rAcc[element] = tTR_rAcc[element] * scale
+                    if cutlass.const_expr(self.use_tq_r31_physical_split_score):
+                        tTR_rAcc[element] = (
+                            tTR_rLatent[element] * scale + tTR_rAcc[element]
+                        )
+                    else:
+                        tTR_rAcc[element] = tTR_rAcc[element] * scale
                     if cutlass.const_expr(self.tq_s1_scale_tma):
                         local_scale_max = cute.arch.fmax(local_scale_max, scale)
                     elif cute.elem_less(logical_token, common_params.K):

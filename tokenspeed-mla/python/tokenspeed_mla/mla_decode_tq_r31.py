@@ -379,6 +379,8 @@ def _get_compiled_tq_r31_kernel(
     causal_mask: bool,
     enable_pdl: bool,
     producer_only: bool,
+    physical_split_score: bool = False,
+    physical_split_score_lookahead: bool = True,
 ) -> Callable:
     """Compile/cache a shape-specialized compact R31 kernel."""
     key = (
@@ -398,6 +400,8 @@ def _get_compiled_tq_r31_kernel(
         causal_mask,
         enable_pdl,
         producer_only,
+        physical_split_score,
+        physical_split_score_lookahead,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
     if compiled is not None:
@@ -434,7 +438,11 @@ def _get_compiled_tq_r31_kernel(
                 seq_len_q=query_len,
                 cp_world=1,
                 use_tq_e2m1=True,
-                use_tq_r31_rope=True,
+                use_tq_r31_rope=not physical_split_score,
+                use_tq_r31_physical_split_score=physical_split_score,
+                tq_r31_physical_split_score_lookahead=(
+                    physical_split_score_lookahead
+                ),
                 tq_s1_scale_tma=True,
                 tq_s1_scale_stages=3,
                 tq_s1_k_rope_stages=1,
@@ -500,6 +508,8 @@ def tokenspeed_mla_decode_tq_r31(
     lse_out: Optional[torch.Tensor] = None,
     split_kv_override: Optional[int] = None,
     producer_only: bool = False,
+    _physical_split_score: bool = False,
+    _physical_split_score_lookahead: bool = True,
 ):
     """Decode MLA attention directly from the compact 354-byte R31 cache.
 
@@ -532,6 +542,12 @@ def tokenspeed_mla_decode_tq_r31(
         raise TypeError("return_lse must be a bool")
     if causal_mask is not None and not isinstance(causal_mask, bool):
         raise TypeError("causal_mask must be a bool or None")
+    if not isinstance(_physical_split_score, bool):
+        raise TypeError("_physical_split_score must be a bool")
+    if not isinstance(_physical_split_score_lookahead, bool):
+        raise TypeError("_physical_split_score_lookahead must be a bool")
+    if _physical_split_score_lookahead and not _physical_split_score:
+        _physical_split_score_lookahead = False
 
     batch, query_len = _validate_r31_inputs(
         query_latent,
@@ -625,6 +641,8 @@ def tokenspeed_mla_decode_tq_r31(
         causal_mask=resolved_causal_mask,
         enable_pdl=enable_pdl,
         producer_only=producer_only,
+        physical_split_score=_physical_split_score,
+        physical_split_score_lookahead=_physical_split_score_lookahead,
     )
 
     import tvm_ffi
