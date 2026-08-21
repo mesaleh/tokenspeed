@@ -411,6 +411,7 @@ def _get_compiled_mixed_kernel(
     fault_status: Optional[torch.Tensor],
 ) -> Callable:
     batch, query_len = hot_query_latent.shape[:2]
+    physical_q5_packed_p = physical_r31 and query_len == 5
     dynamic_batch = physical_r31
     key = (
         hot_query_latent.device.index,
@@ -442,6 +443,7 @@ def _get_compiled_mixed_kernel(
         fold_sq_factor,
         enable_pdl,
         physical_r31,
+        physical_q5_packed_p,
         fault_status is not None,
     )
     compiled = _COMPILED_MIXED_KERNELS.get(key)
@@ -489,12 +491,12 @@ def _get_compiled_mixed_kernel(
             tq_s1_scale_stages=3,
             tq_s1_k_rope_stages=1,
             tq_s1_packed_p_scale_math=(
-                False
+                physical_q5_packed_p
                 if physical_r31
                 else _use_packed_p_scale_math(batch, query_len)
             ),
             tq_s1_early_final_pcor=(
-                False
+                physical_q5_packed_p
                 if physical_r31
                 else _use_early_final_pcor(batch, query_len)
             ),
