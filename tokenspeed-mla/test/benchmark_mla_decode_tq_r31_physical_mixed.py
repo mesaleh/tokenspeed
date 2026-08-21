@@ -27,6 +27,11 @@ HOT_SPLITS = 3
 COLD_SPLITS = 11
 SOFTMAX_SCALE = 0.125
 
+# SGLang keeps every captured decode graph alive. Retain closures as well as
+# graph objects so their backing tensors cannot be returned to the allocator
+# while later shapes are compiled and captured.
+_RETAINED_CASES: list[tuple[object, ...]] = []
+
 
 def _padded_pages(length: int) -> int:
     return math.ceil(math.ceil(length / PAGE) / 4) * 4
@@ -238,6 +243,16 @@ def _case(
     sequential_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(sequential_graph):
         sequential_launch()
+    _RETAINED_CASES.append(
+        (
+            normalized_graph,
+            physical_graph,
+            sequential_graph,
+            normalized_launch,
+            physical_launch,
+            sequential_launch,
+        )
+    )
 
     normalized_samples: list[float] = []
     physical_samples: list[float] = []
@@ -308,18 +323,66 @@ def run(
     hot_splits: int = HOT_SPLITS,
     cold_splits: int = COLD_SPLITS,
 ) -> list[dict[str, object]]:
-    cells = [
+    _RETAINED_CASES.clear()
+    capture_cells = [
         _case(
             batch,
             query_len,
-            windows=windows,
-            replays=replays,
+            windows=1,
+            replays=min(replays, 50),
             hot_splits=hot_splits,
             cold_splits=cold_splits,
         )
         for query_len in (1, 5)
         for batch in (8, 5, 1)
     ]
+    cells = []
+    for capture_cell, retained in zip(
+        capture_cells, _RETAINED_CASES, strict=True
+    ):
+        normalized_graph, physical_graph, sequential_graph = retained[:3]
+        normalized_samples: list[float] = []
+        physical_samples: list[float] = []
+        sequential_samples: list[float] = []
+        window_deltas: list[float] = []
+        for _ in range(windows):
+            normalized_a = _measure(normalized_graph, replays)
+            physical = _measure(physical_graph, replays)
+            sequential = _measure(sequential_graph, replays)
+            normalized_b = _measure(normalized_graph, replays)
+            normalized = (normalized_a + normalized_b) / 2.0
+            normalized_samples.extend((normalized_a, normalized_b))
+            physical_samples.append(physical)
+            sequential_samples.append(sequential)
+            window_deltas.append((physical / normalized - 1.0) * 100.0)
+        normalized_us = sum(normalized_samples) / len(normalized_samples)
+        physical_us = sum(physical_samples) / len(physical_samples)
+        sequential_us = sum(sequential_samples) / len(sequential_samples)
+        cell = dict(capture_cell)
+        cell.update(
+            {
+                "measurement_phase": "all_graphs_retained",
+                "windows": windows,
+                "replays": replays,
+                "normalized_samples_us": normalized_samples,
+                "physical_samples_us": physical_samples,
+                "sequential_samples_us": sequential_samples,
+                "window_delta_pct": window_deltas,
+                "normalized_us": normalized_us,
+                "physical_us": physical_us,
+                "sequential_physical_us": sequential_us,
+                "physical_vs_normalized_pct": (
+                    physical_us / normalized_us - 1.0
+                )
+                * 100.0,
+                "physical_vs_sequential_pct": (
+                    physical_us / sequential_us - 1.0
+                )
+                * 100.0,
+            }
+        )
+        cells.append(cell)
+        print(json.dumps(cell, sort_keys=True), flush=True)
     mean_pct = sum(float(cell["physical_vs_normalized_pct"]) for cell in cells) / len(
         cells
     )
