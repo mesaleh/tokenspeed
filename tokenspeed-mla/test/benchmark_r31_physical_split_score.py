@@ -83,6 +83,8 @@ def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str,
         workspace_buffer=candidate_workspace,
         out=candidate_out,
         _physical_split_score=True,
+        _physical_split_score_lookahead=False,
+        _physical_split_score_dual_tmem=True,
     )
     torch.cuda.synchronize()
     control_graph = torch.cuda.CUDAGraph()
@@ -106,6 +108,8 @@ def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str,
             workspace_buffer=candidate_workspace,
             out=candidate_out,
             _physical_split_score=True,
+            _physical_split_score_lookahead=False,
+            _physical_split_score_dual_tmem=True,
         )
     control_a_us = _measure(control_graph)
     serial_us = _measure(serial_graph)

@@ -381,6 +381,7 @@ def _get_compiled_tq_r31_kernel(
     producer_only: bool,
     physical_split_score: bool = False,
     physical_split_score_lookahead: bool = True,
+    physical_split_score_dual_tmem: bool = False,
 ) -> Callable:
     """Compile/cache a shape-specialized compact R31 kernel."""
     key = (
@@ -402,6 +403,7 @@ def _get_compiled_tq_r31_kernel(
         producer_only,
         physical_split_score,
         physical_split_score_lookahead,
+        physical_split_score_dual_tmem,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
     if compiled is not None:
@@ -442,6 +444,9 @@ def _get_compiled_tq_r31_kernel(
                 use_tq_r31_physical_split_score=physical_split_score,
                 tq_r31_physical_split_score_lookahead=(
                     physical_split_score_lookahead
+                ),
+                tq_r31_physical_split_score_dual_tmem=(
+                    physical_split_score_dual_tmem
                 ),
                 tq_s1_scale_tma=True,
                 tq_s1_scale_stages=3,
@@ -510,6 +515,7 @@ def tokenspeed_mla_decode_tq_r31(
     producer_only: bool = False,
     _physical_split_score: bool = False,
     _physical_split_score_lookahead: bool = True,
+    _physical_split_score_dual_tmem: bool = False,
 ):
     """Decode MLA attention directly from the compact 354-byte R31 cache.
 
@@ -546,8 +552,14 @@ def tokenspeed_mla_decode_tq_r31(
         raise TypeError("_physical_split_score must be a bool")
     if not isinstance(_physical_split_score_lookahead, bool):
         raise TypeError("_physical_split_score_lookahead must be a bool")
+    if not isinstance(_physical_split_score_dual_tmem, bool):
+        raise TypeError("_physical_split_score_dual_tmem must be a bool")
     if _physical_split_score_lookahead and not _physical_split_score:
         _physical_split_score_lookahead = False
+    if _physical_split_score_dual_tmem and not _physical_split_score:
+        raise ValueError("dual-TMEM requires physical split-score")
+    if _physical_split_score_dual_tmem and _physical_split_score_lookahead:
+        raise ValueError("dual-TMEM and lookahead are mutually exclusive")
 
     batch, query_len = _validate_r31_inputs(
         query_latent,
@@ -643,6 +655,7 @@ def tokenspeed_mla_decode_tq_r31(
         producer_only=producer_only,
         physical_split_score=_physical_split_score,
         physical_split_score_lookahead=_physical_split_score_lookahead,
+        physical_split_score_dual_tmem=_physical_split_score_dual_tmem,
     )
 
     import tvm_ffi
