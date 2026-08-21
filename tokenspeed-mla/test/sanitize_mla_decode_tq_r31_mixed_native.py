@@ -6,11 +6,13 @@ import argparse
 import json
 from types import SimpleNamespace
 
-import cutlass
 import torch
-from cutlass import Float32, Int32
 
 import benchmark_mla_decode_tq_r31_mixed_native as benchmark
+from tokenspeed_mla import (
+    reduce_mla_mixed_workspace,
+    tokenspeed_mla_decode_tq_r31_mixed,
+)
 
 
 def _effective_splits(sequence_length: int, declared_splits: int) -> int:
@@ -62,20 +64,14 @@ def run(fixture_path: str) -> dict[str, object]:
             cold_high=cold_high_rope,
             cold_residual=cold_residual_rope,
         )
-        arena_backing.append(
-            benchmark._move_cold_to_layer_sharded_arena(cold_state)
-        )
+        arena_backing.append(benchmark._move_cold_to_layer_sharded_arena(cold_state))
         cold_cache = cold_state.packed_cold
         cold_scale = cold_state.cold_scale
         cold_high_rope = cold_state.cold_high
         cold_residual_rope = cold_state.cold_residual
-        hot_cache, hot_arena = benchmark._move_hot_to_layer_sharded_arena(
-            hot_cache
-        )
+        hot_cache, hot_arena = benchmark._move_hot_to_layer_sharded_arena(hot_cache)
         arena_backing.append(hot_arena)
-        arena_metadata = benchmark._arena_metadata(
-            cold_state, hot_cache, arena_layout
-        )
+        arena_metadata = benchmark._arena_metadata(cold_state, hot_cache, arena_layout)
     else:
         arena_metadata = {
             "arena_layout": arena_layout,
@@ -99,9 +95,7 @@ def run(fixture_path: str) -> dict[str, object]:
         dtype=torch.int8,
         device="cuda",
     )
-    hot_workspace = workspace[:hot_workspace_bytes]
-    cold_workspace = workspace[hot_workspace_bytes:]
-    output_sentinel = torch.empty(
+    output = torch.empty(
         batch,
         query_len,
         benchmark.HEADS,
@@ -109,54 +103,55 @@ def run(fixture_path: str) -> dict[str, object]:
         dtype=torch.bfloat16,
         device="cuda",
     )
-    compiled = benchmark._compile_mixed_producer(
-        hot_query,
-        hot_cache,
-        hot_table,
-        hot_workspace,
+    output_lse = torch.empty(
+        batch,
+        query_len,
+        benchmark.HEADS,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    reference_output = torch.empty_like(output)
+    reference_lse = torch.empty_like(output_lse)
+
+    reduce_mla_mixed_workspace(
+        reference_workspace,
         hot_seq,
-        cold_query_latent,
-        cold_query_rope,
-        cold_cache,
-        cold_high_rope,
-        cold_table,
-        cold_workspace,
         cold_seq,
-        output_sentinel,
-        cold_scale,
-        cold_residual_rope,
+        hot_splits,
+        cold_splits,
+        reference_output,
+        reference_lse,
     )
 
     workspace.view(torch.float32).fill_(float("nan"))
-    import tvm_ffi
-
-    with tvm_ffi.use_torch_stream():
-        compiled(
-            hot_query[..., : benchmark.LATENT],
-            hot_query[..., benchmark.LATENT :],
-            hot_cache[..., : benchmark.LATENT],
-            hot_cache[..., benchmark.LATENT :],
-            hot_table,
-            hot_workspace,
-            Int32(hot_splits),
-            hot_seq,
-            hot_causal_seq,
-            cold_query_latent,
-            cold_query_rope,
-            cold_cache,
-            cold_high_rope,
-            cold_table,
-            cold_workspace,
-            Int32(cold_splits),
-            cold_seq,
-            cold_causal_seq,
-            output_sentinel,
-            Float32(benchmark.SOFTMAX_SCALE),
-            Float32(1.0),
-            cold_scale,
-            cold_residual_rope,
-        )
+    tokenspeed_mla_decode_tq_r31_mixed(
+        hot_query=hot_query,
+        hot_cache=hot_cache,
+        hot_block_tables=hot_table,
+        hot_seq_lens=hot_seq,
+        hot_causal_seqs=hot_causal_seq,
+        hot_max_seq_len=max(1, int(hot_seq.max().item())),
+        cold_query_latent=cold_query_latent,
+        cold_query_rope=cold_query_rope,
+        cold_packed_latent=cold_cache,
+        cold_reconstruction_scale=cold_scale,
+        cold_high_rope=cold_high_rope,
+        cold_residual_rope=cold_residual_rope,
+        cold_block_tables=cold_table,
+        cold_seq_lens=cold_seq,
+        cold_causal_seqs=cold_causal_seq,
+        cold_max_seq_len=max(1, int(cold_seq.max().item())),
+        workspace_buffer=workspace,
+        hot_splits=hot_splits,
+        cold_splits=cold_splits,
+        softmax_scale=benchmark.SOFTMAX_SCALE,
+        out=output,
+        lse_out=output_lse,
+        enable_pdl=True,
+    )
     torch.cuda.synchronize()
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(output_lse, reference_lse, rtol=0, atol=0)
 
     candidate = workspace.view(torch.float32)
     reference = reference_workspace.view(torch.float32)
@@ -170,9 +165,7 @@ def run(fixture_path: str) -> dict[str, object]:
     reference_hot_acc = reference[: rows * hot_splits * benchmark.LATENT].view(
         rows, hot_splits, benchmark.LATENT
     )
-    reference_hot_lse = reference[hot_lse_start:hot_region_end].view(
-        rows, hot_splits
-    )
+    reference_hot_lse = reference[hot_lse_start:hot_region_end].view(rows, hot_splits)
 
     cold_offset = rows * hot_splits * (benchmark.LATENT + 1)
     cold_acc = candidate[
@@ -240,6 +233,7 @@ def run(fixture_path: str) -> dict[str, object]:
             **arena_metadata,
         },
         "active_workspace_bit_exact": True,
+        "output_and_lse_bit_exact": True,
     }
 
 

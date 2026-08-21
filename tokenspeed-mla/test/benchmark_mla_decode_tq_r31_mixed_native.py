@@ -17,6 +17,7 @@ from tokenspeed_mla import (
     reduce_mla_mixed_workspace,
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_tq_r31,
+    tokenspeed_mla_decode_tq_r31_mixed,
 )
 from tokenspeed_mla.mla_decode_fp8 import (
     BlackwellMultiHeadLatentAttentionForwardFP8,
@@ -27,7 +28,6 @@ from tokenspeed_mla.mla_decode_tq_r31_mixed_native import (
 )
 from tokenspeed_mla.mla_helpers import get_mla_decode_fold_sq_factor
 from tokenspeed_mla.utils import get_max_active_clusters
-
 
 PAGE = fixture.PAGE
 LATENT = fixture.LATENT
@@ -333,9 +333,9 @@ def run(
     if arena_layout == "layer-sharded":
         arena_backing.append(_move_cold_to_layer_sharded_arena(state))
     torch.manual_seed(0xA173100)
-    source = (
-        torch.randn(BATCH, SEQ_LEN, LATENT + ROPE, device="cuda") * 0.1
-    ).to(torch.bfloat16)
+    source = (torch.randn(BATCH, SEQ_LEN, LATENT + ROPE, device="cuda") * 0.1).to(
+        torch.bfloat16
+    )
     query_source = (
         torch.randn(BATCH, QUERY_LEN, HEADS, LATENT + ROPE, device="cuda") * 0.1
     ).to(torch.bfloat16)
@@ -356,9 +356,9 @@ def run(
         scale=1.0 / math.sqrt(LATENT),
         out=rotated_hot_latent,
     )
-    hot_cache = torch.cat(
-        (rotated_hot_latent, hot_source[..., LATENT:]), dim=-1
-    ).to(torch.float8_e4m3fn)
+    hot_cache = torch.cat((rotated_hot_latent, hot_source[..., LATENT:]), dim=-1).to(
+        torch.float8_e4m3fn
+    )
     hot_cache = hot_cache.view(-1, PAGE, LATENT + ROPE)
     contiguous_hot_cache = hot_cache
     if arena_layout == "layer-sharded":
@@ -390,9 +390,7 @@ def run(
     reference_hot_workspace = reference_workspace[:hot_workspace_bytes]
     reference_cold_workspace = reference_workspace[hot_workspace_bytes:]
     contiguous_workspace = (
-        torch.empty_like(shared_workspace)
-        if arena_layout == "layer-sharded"
-        else None
+        torch.empty_like(shared_workspace) if arena_layout == "layer-sharded" else None
     )
     contiguous_hot_workspace = (
         contiguous_workspace[:hot_workspace_bytes]
@@ -412,17 +410,16 @@ def run(
         BATCH, QUERY_LEN, HEADS, dtype=torch.float32, device="cuda"
     )
     contiguous_output = (
-        torch.empty_like(output_sentinel)
-        if arena_layout == "layer-sharded"
-        else None
+        torch.empty_like(output_sentinel) if arena_layout == "layer-sharded" else None
     )
     contiguous_lse = (
-        torch.empty_like(reference_lse)
-        if arena_layout == "layer-sharded"
-        else None
+        torch.empty_like(reference_lse) if arena_layout == "layer-sharded" else None
     )
     mixed_output = torch.empty_like(output_sentinel)
     mixed_lse = torch.empty_like(reference_lse)
+    public_workspace = torch.empty_like(shared_workspace)
+    public_output = torch.empty_like(output_sentinel)
+    public_lse = torch.empty_like(reference_lse)
     baseline_workspace = torch.empty(
         rows * 64 * (LATENT + 1) * 4, dtype=torch.int8, device="cuda"
     )
@@ -430,9 +427,7 @@ def run(
     baseline_lse = torch.empty_like(reference_lse)
     hot_max_seq_len = int(state.hot_seq.max().item())
     cold_max_seq_len = int(state.prefix_seq.max().item())
-    hot_causal_seq = state.hot_seq + (
-        (QUERY_LEN - 1) if causal_owner == "cold" else 0
-    )
+    hot_causal_seq = state.hot_seq + ((QUERY_LEN - 1) if causal_owner == "cold" else 0)
     cold_causal_seq = state.prefix_seq + (
         (QUERY_LEN - 1) if causal_owner == "hot" else 0
     )
@@ -652,21 +647,110 @@ def run(
             mixed_lse,
         )
 
+    public_kwargs = {
+        "hot_query": hot_query,
+        "hot_cache": hot_cache,
+        "hot_block_tables": state.hot_table,
+        "hot_seq_lens": state.hot_seq,
+        "hot_causal_seqs": hot_causal_seq,
+        "hot_max_seq_len": hot_max_seq_len,
+        "cold_query_latent": state.r31_query_latent,
+        "cold_query_rope": state.r31_query_rope,
+        "cold_packed_latent": state.packed_cold,
+        "cold_reconstruction_scale": state.cold_scale,
+        "cold_high_rope": state.cold_high,
+        "cold_residual_rope": state.cold_residual,
+        "cold_block_tables": state.prefix_table,
+        "cold_seq_lens": state.prefix_seq,
+        "cold_causal_seqs": cold_causal_seq,
+        "cold_max_seq_len": cold_max_seq_len,
+        "workspace_buffer": public_workspace,
+        "hot_splits": HOT_SPLITS,
+        "cold_splits": COLD_SPLITS,
+        "softmax_scale": SOFTMAX_SCALE,
+        "out": public_output,
+        "lse_out": public_lse,
+        "enable_pdl": True,
+    }
+
+    def public_launch() -> None:
+        tokenspeed_mla_decode_tq_r31_mixed(**public_kwargs)
+
     reference_workspace.view(torch.float32).fill_(float("nan"))
     shared_workspace.view(torch.float32).fill_(float("nan"))
+    public_workspace.view(torch.float32).fill_(float("nan"))
     if contiguous_workspace is not None:
         contiguous_workspace.view(torch.float32).fill_(float("nan"))
         contiguous_oracle_launch()
     reference_launch()
     mixed_launch()
+    public_launch()
     torch.cuda.synchronize()
     torch.testing.assert_close(mixed_output, reference_output, rtol=0, atol=0)
     torch.testing.assert_close(mixed_lse, reference_lse, rtol=0, atol=0)
+    torch.testing.assert_close(public_output, mixed_output, rtol=0, atol=0)
+    torch.testing.assert_close(public_lse, mixed_lse, rtol=0, atol=0)
     if contiguous_output is not None and contiguous_lse is not None:
         torch.testing.assert_close(mixed_output, contiguous_output, rtol=0, atol=0)
         torch.testing.assert_close(mixed_lse, contiguous_lse, rtol=0, atol=0)
     if not torch.isfinite(mixed_output).all() or not torch.isfinite(mixed_lse).all():
         raise AssertionError("mixed producer consumed a poisoned workspace slot")
+
+    steady_allocated_before = torch.cuda.memory_allocated()
+    for _ in range(8):
+        public_launch()
+    torch.cuda.synchronize()
+    steady_allocated_after = torch.cuda.memory_allocated()
+    if steady_allocated_after != steady_allocated_before:
+        raise AssertionError(
+            "public mixed API allocated persistent CUDA storage after warmup: "
+            f"before={steady_allocated_before} after={steady_allocated_after}"
+        )
+
+    fail_closed_cases = {
+        "short_workspace": {
+            "workspace_buffer": public_workspace[:-1],
+            "error": "mixed decode requires",
+        },
+        "zero_hot_splits": {"hot_splits": 0, "error": "hot_splits must be"},
+        "wrong_hot_causal_dtype": {
+            "hot_causal_seqs": hot_causal_seq.to(torch.int64),
+            "error": "hot_causal_seqs must have dtype",
+        },
+        "hot_max_exceeds_table": {
+            "hot_max_seq_len": state.hot_table.shape[1] * PAGE + 1,
+            "error": "exceeds block-table capacity",
+        },
+        "nonfinite_softmax_scale": {
+            "softmax_scale": float("nan"),
+            "error": "softmax_scale must be finite",
+        },
+        "malformed_hot_row_stride": {
+            "hot_cache": torch.as_strided(
+                hot_cache,
+                size=hot_cache.shape,
+                stride=(hot_cache.stride(0), LATENT + ROPE - 1, 1),
+            ),
+            "error": "hot_cache rows must be contiguous",
+        },
+        "output_aliases_workspace": {
+            "out": public_workspace[: public_output.numel() * 2]
+            .view(torch.bfloat16)
+            .view_as(public_output),
+            "error": "must not alias",
+        },
+    }
+    for case_name, case in fail_closed_cases.items():
+        overrides = {key: value for key, value in case.items() if key != "error"}
+        try:
+            tokenspeed_mla_decode_tq_r31_mixed(**(public_kwargs | overrides))
+        except (TypeError, ValueError) as exc:
+            if case["error"] not in str(exc):
+                raise AssertionError(
+                    f"{case_name} raised unexpected error: {exc}"
+                ) from exc
+        else:
+            raise AssertionError(f"{case_name} did not fail closed")
 
     if sanitizer_fixture is not None:
         torch.save(
@@ -719,10 +803,13 @@ def run(
             },
             "correctness": {
                 "bit_exact_vs_two_producers": True,
+                "bit_exact_public_api_vs_direct_mixed": True,
                 "bit_exact_vs_contiguous_oracle": (
                     True if arena_layout == "layer-sharded" else None
                 ),
                 "poisoned_unwritten_slots_ignored": True,
+                "fail_closed_validation_cases": sorted(fail_closed_cases),
+                "steady_state_cuda_allocation_delta_bytes": 0,
             },
         }
 
@@ -730,22 +817,31 @@ def run(
     reference_graph = _capture(reference_launch)
     concurrent_graph = _capture(concurrent_reference_launch)
     mixed_graph = _capture(mixed_launch)
+    public_graph = _capture(public_launch)
     producer_graph = _capture(mixed_producer_launch)
     for _ in range(10):
         _measure(baseline_graph, replays)
         _measure(reference_graph, replays)
         _measure(concurrent_graph, replays)
         _measure(mixed_graph, replays)
-    samples = {"baseline": [], "reference": [], "concurrent": [], "mixed": []}
+        _measure(public_graph, replays)
+    samples = {
+        "baseline": [],
+        "reference": [],
+        "concurrent": [],
+        "mixed": [],
+        "public": [],
+    }
     graph_by_name = {
         "baseline": baseline_graph,
         "reference": reference_graph,
         "concurrent": concurrent_graph,
         "mixed": mixed_graph,
+        "public": public_graph,
     }
     orders = (
-        ("baseline", "reference", "concurrent", "mixed"),
-        ("mixed", "concurrent", "reference", "baseline"),
+        ("baseline", "reference", "concurrent", "mixed", "public"),
+        ("public", "mixed", "concurrent", "reference", "baseline"),
     )
     for window in range(windows):
         for name in orders[window % len(orders)]:
@@ -754,14 +850,12 @@ def run(
     timing = {name: _summary(values) for name, values in samples.items()}
     timing["mixed_producer"] = _summary(producer_samples)
     delta_us = timing["mixed"]["mean_us"] - timing["reference"]["mean_us"]
-    attention_added_us = timing["mixed"]["mean_us"] - timing["baseline"]["mean_us"]
+    attention_added_us = timing["public"]["mean_us"] - timing["baseline"]["mean_us"]
     charged_complete_added_us = attention_added_us + WRITER_DELTA_US
     # Only q5 has a fresh production-control TPOT budget.  q1 remains useful
     # as a descriptive shape guard, but must not emit a formal pass/fail until
     # its control is rerun under the same request contract.
-    component_ceiling_us = (
-        Q5_COMPONENT_CEILINGS_US[BATCH] if QUERY_LEN == 5 else None
-    )
+    component_ceiling_us = Q5_COMPONENT_CEILINGS_US[BATCH] if QUERY_LEN == 5 else None
     schema = (
         "r31-r5-f2-exact-arena-v1"
         if arena_layout == "layer-sharded"
@@ -780,13 +874,19 @@ def run(
         },
         "correctness": {
             "bit_exact_vs_two_producers": True,
+            "bit_exact_public_api_vs_direct_mixed": True,
             "bit_exact_vs_contiguous_oracle": (
                 True if arena_layout == "layer-sharded" else None
             ),
             "poisoned_unwritten_slots_ignored": True,
+            "fail_closed_validation_cases": sorted(fail_closed_cases),
+            "steady_state_cuda_allocation_delta_bytes": 0,
         },
         "timing": timing,
         "mixed_minus_reference_us": delta_us,
+        "public_minus_mixed_us": (
+            timing["public"]["mean_us"] - timing["mixed"]["mean_us"]
+        ),
         "mixed_minus_concurrent_us": (
             timing["mixed"]["mean_us"] - timing["concurrent"]["mean_us"]
         ),

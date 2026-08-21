@@ -14,6 +14,7 @@ from tokenspeed_mla import (
     reduce_mla_mixed_workspace,
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_tq_r31,
+    tokenspeed_mla_decode_tq_r31_mixed,
 )
 
 
@@ -58,11 +59,9 @@ def _merge(
     merged_lse = maximum + torch.log2(
         torch.exp2(hot_lse - maximum) + torch.exp2(cold_lse - maximum)
     )
-    merged_output = hot_output.float() * torch.exp2(
-        hot_lse - merged_lse
-    ).unsqueeze(-1) + cold_output.float() * torch.exp2(
-        cold_lse - merged_lse
-    ).unsqueeze(-1)
+    merged_output = hot_output.float() * torch.exp2(hot_lse - merged_lse).unsqueeze(
+        -1
+    ) + cold_output.float() * torch.exp2(cold_lse - merged_lse).unsqueeze(-1)
     return merged_output.to(torch.bfloat16), merged_lse
 
 
@@ -100,9 +99,7 @@ def _reference_owner(
         dtype=torch.int8,
         device="cuda",
     )
-    sequence = torch.tensor(
-        [sequence_length], dtype=torch.int32, device="cuda"
-    )
+    sequence = torch.tensor([sequence_length], dtype=torch.int32, device="cuda")
     if cold_query_rope is None:
         tokenspeed_mla_decode(
             query=query,
@@ -171,9 +168,7 @@ def run() -> dict[str, object]:
     finally:
         fixture._layout_lengths = original_layout
 
-    hot_latent = state.hot_cache[..., : benchmark.LATENT].reshape(
-        -1, benchmark.LATENT
-    )
+    hot_latent = state.hot_cache[..., : benchmark.LATENT].reshape(-1, benchmark.LATENT)
     rotated_hot_latent = torch.empty_like(hot_latent, dtype=torch.bfloat16)
     hadamard_transform_with_signs(
         hot_latent.to(torch.bfloat16),
@@ -237,25 +232,16 @@ def run() -> dict[str, object]:
     )
 
     rows = benchmark.BATCH * benchmark.QUERY_LEN * benchmark.HEADS
-    hot_workspace_bytes = (
-        rows
-        * benchmark.HOT_SPLITS
-        * (benchmark.LATENT + 1)
-        * 4
-    )
-    cold_workspace_bytes = (
-        rows
-        * benchmark.COLD_SPLITS
-        * (benchmark.LATENT + 1)
-        * 4
-    )
+    hot_workspace_bytes = rows * benchmark.HOT_SPLITS * (benchmark.LATENT + 1) * 4
+    cold_workspace_bytes = rows * benchmark.COLD_SPLITS * (benchmark.LATENT + 1) * 4
     workspace = torch.empty(
         hot_workspace_bytes + cold_workspace_bytes,
         dtype=torch.int8,
         device="cuda",
     )
-    hot_workspace = workspace[:hot_workspace_bytes]
-    cold_workspace = workspace[hot_workspace_bytes:]
+    direct_workspace = torch.empty_like(workspace)
+    hot_workspace = direct_workspace[:hot_workspace_bytes]
+    cold_workspace = direct_workspace[hot_workspace_bytes:]
     output = torch.empty(
         benchmark.BATCH,
         benchmark.QUERY_LEN,
@@ -271,6 +257,8 @@ def run() -> dict[str, object]:
         dtype=torch.float32,
         device="cuda",
     )
+    direct_output = torch.empty_like(output)
+    direct_output_lse = torch.empty_like(output_lse)
     sentinel = torch.empty_like(output)
     compiled = benchmark._compile_mixed_producer(
         hot_query,
@@ -290,7 +278,7 @@ def run() -> dict[str, object]:
         state.cold_residual,
     )
 
-    def candidate_launch() -> None:
+    def direct_launch() -> None:
         import tvm_ffi
 
         with tvm_ffi.use_torch_stream():
@@ -320,18 +308,49 @@ def run() -> dict[str, object]:
                 state.cold_residual,
             )
         reduce_mla_mixed_workspace(
-            workspace,
+            direct_workspace,
             hot_seq,
             cold_seq,
             benchmark.HOT_SPLITS,
             benchmark.COLD_SPLITS,
-            output,
-            output_lse,
+            direct_output,
+            direct_output_lse,
         )
 
+    def candidate_launch() -> None:
+        tokenspeed_mla_decode_tq_r31_mixed(
+            hot_query=hot_query,
+            hot_cache=hot_cache,
+            hot_block_tables=hot_table,
+            hot_seq_lens=hot_seq,
+            hot_causal_seqs=hot_causal_seq,
+            hot_max_seq_len=max(hot_runtime),
+            cold_query_latent=state.r31_query_latent,
+            cold_query_rope=state.r31_query_rope,
+            cold_packed_latent=state.packed_cold,
+            cold_reconstruction_scale=state.cold_scale,
+            cold_high_rope=state.cold_high,
+            cold_residual_rope=state.cold_residual,
+            cold_block_tables=cold_table,
+            cold_seq_lens=cold_seq,
+            cold_causal_seqs=cold_causal_seq,
+            cold_max_seq_len=max(cold_runtime),
+            workspace_buffer=workspace,
+            hot_splits=benchmark.HOT_SPLITS,
+            cold_splits=benchmark.COLD_SPLITS,
+            softmax_scale=benchmark.SOFTMAX_SCALE,
+            out=output,
+            lse_out=output_lse,
+            enable_pdl=True,
+        )
+
+    direct_workspace.view(torch.float32).fill_(float("nan"))
     workspace.view(torch.float32).fill_(float("nan"))
+    direct_launch()
     candidate_launch()
     torch.cuda.synchronize()
+    torch.testing.assert_close(output, direct_output, rtol=0, atol=0)
+    torch.testing.assert_close(output_lse, direct_output_lse, rtol=0, atol=0)
     first_output = output.clone()
     first_lse = output_lse.clone()
     graph = torch.cuda.CUDAGraph()
@@ -397,6 +416,7 @@ def run() -> dict[str, object]:
         "empty_hot_requests": [1, 3],
         "empty_cold_requests": [0],
         "all_nonempty_final_pages_partial": True,
+        "bit_exact_public_api_vs_direct_mixed": True,
         "graph_replay_bit_exact": True,
         "output_max_abs": output_max_abs,
         "lse_max_abs": lse_max_abs,
