@@ -59,6 +59,7 @@ def _case(
     replays: int = 100,
     hot_splits: int = HOT_SPLITS,
     cold_splits: int = COLD_SPLITS,
+    emit: bool = True,
 ) -> dict[str, object]:
     device = torch.device("cuda:0")
     hot_page_count = _padded_pages(HOT_LENGTH)
@@ -304,7 +305,8 @@ def _case(
         "physical_fault_status": int(physical_fault.item()),
         "sequential_fault_status": int(sequential_fault.item()),
     }
-    print(json.dumps(result, sort_keys=True), flush=True)
+    if emit:
+        print(json.dumps(result, sort_keys=True), flush=True)
     if (
         result["output_max_abs"] > 0.02
         or result["lse_max_abs"] > 2.0e-5
@@ -322,6 +324,7 @@ def run(
     replays: int = 100,
     hot_splits: int = HOT_SPLITS,
     cold_splits: int = COLD_SPLITS,
+    compact: bool = False,
 ) -> list[dict[str, object]]:
     _RETAINED_CASES.clear()
     capture_cells = [
@@ -332,6 +335,7 @@ def run(
             replays=min(replays, 50),
             hot_splits=hot_splits,
             cold_splits=cold_splits,
+            emit=not compact,
         )
         for query_len in (1, 5)
         for batch in (8, 5, 1)
@@ -382,12 +386,41 @@ def run(
             }
         )
         cells.append(cell)
-        print(json.dumps(cell, sort_keys=True), flush=True)
+        if compact:
+            print(
+                json.dumps(
+                    {
+                        key: cell[key]
+                        for key in (
+                            "batch",
+                            "query_len",
+                            "normalized_us",
+                            "physical_us",
+                            "sequential_physical_us",
+                            "physical_vs_normalized_pct",
+                            "physical_vs_sequential_pct",
+                            "output_max_abs",
+                            "lse_max_abs",
+                            "graph_output_max_abs",
+                            "graph_lse_max_abs",
+                            "physical_fault_status",
+                            "sequential_fault_status",
+                        )
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        else:
+            print(json.dumps(cell, sort_keys=True), flush=True)
     mean_pct = sum(float(cell["physical_vs_normalized_pct"]) for cell in cells) / len(
         cells
     )
     summary = {"cells": cells, "arithmetic_mean_pct": mean_pct}
-    print(json.dumps(summary, sort_keys=True), flush=True)
+    if compact:
+        print(json.dumps({"arithmetic_mean_pct": mean_pct}, sort_keys=True), flush=True)
+    else:
+        print(json.dumps(summary, sort_keys=True), flush=True)
     if any(float(cell["physical_vs_normalized_pct"]) > 10.0 for cell in cells):
         raise AssertionError("a Q3E cell exceeded the 10% regression gate")
     if mean_pct > 5.0:
@@ -403,11 +436,18 @@ if __name__ == "__main__":
     parser.add_argument("--replays", type=int, default=100)
     parser.add_argument("--hot-splits", type=int, default=HOT_SPLITS)
     parser.add_argument("--cold-splits", type=int, default=COLD_SPLITS)
+    parser.add_argument("--compact", action="store_true")
     args = parser.parse_args()
     if (args.batch is None) != (args.query_len is None):
         parser.error("--batch and --query-len must be provided together")
     if args.batch is None:
-        run(args.windows, args.replays, args.hot_splits, args.cold_splits)
+        run(
+            args.windows,
+            args.replays,
+            args.hot_splits,
+            args.cold_splits,
+            args.compact,
+        )
     else:
         _case(
             args.batch,
@@ -416,4 +456,5 @@ if __name__ == "__main__":
             replays=args.replays,
             hot_splits=args.hot_splits,
             cold_splits=args.cold_splits,
+            emit=not args.compact,
         )
