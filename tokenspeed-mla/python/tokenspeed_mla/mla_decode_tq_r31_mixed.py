@@ -112,7 +112,7 @@ def _reduce_mixed_workspace_kernel(
         weight = tl.where(
             active & has_mass, tl.exp2(local_lse - safe_global_lse), 0.0
         )
-        accumulator += partial * weight
+        accumulator += tl.where(weight > 0.0, partial * weight, 0.0)
     for split in range(COLD_DECLARED):
         active = split < cold_effective
         local_lse = tl.load(
@@ -128,7 +128,7 @@ def _reduce_mixed_workspace_kernel(
         weight = tl.where(
             active & has_mass, tl.exp2(local_lse - safe_global_lse), 0.0
         )
-        accumulator += partial * weight
+        accumulator += tl.where(weight > 0.0, partial * weight, 0.0)
 
     accumulator = tl.where(has_mass, accumulator, 0.0)
     tl.store(output + row * D + features, accumulator, mask=feature_mask)

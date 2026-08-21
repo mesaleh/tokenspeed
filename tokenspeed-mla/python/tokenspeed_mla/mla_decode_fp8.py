@@ -5365,9 +5365,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Pre-compute the output scale factor once to avoid redundant MUFU.RCP
         # instructions inside the per-element loop (rcp_approx generates MUFU.RCP
         # which has 8-cycle throughput; hoisting it saves up to ~500 cycles).
-        epi_scale = (
-            epilogue_params.output_scale * carrier_scale * cute.arch.rcp_approx(row_sum)
-        )
+        row_reciprocal = cute.arch.rcp_approx(row_sum)
+        if cutlass.const_expr(self.producer_only):
+            # A mixed-owner q5 boundary can schedule a real owner split whose
+            # first query rows have no causally visible keys. The masking path
+            # deliberately uses -1e6 rather than -inf, so such a row has a
+            # positive row_sum but row_max remains exactly the mask sentinel.
+            # Publish an exact zero partial; the corresponding very-negative
+            # LSE gives it zero mass in the mixed reducer.
+            producer_row_has_mass = row_max > cutlass.Float32(-1.0e6)
+            row_reciprocal = cutlass.Float32(
+                cutlass.select_(
+                    producer_row_has_mass,
+                    row_reciprocal,
+                    cutlass.Float32(0.0),
+                )
+            )
+        epi_scale = epilogue_params.output_scale * carrier_scale * row_reciprocal
 
         # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
@@ -5454,6 +5468,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         cute.math.log2(row_sum, fastmath=True)
                         + epilogue_params.softmax_scale_log2 * row_max
                     )
+                    if cutlass.const_expr(self.producer_only):
+                        lse = cutlass.Float32(
+                            cutlass.select_(
+                                producer_row_has_mass,
+                                lse,
+                                cutlass.Float32(float("-inf")),
+                            )
+                        )
                     gLSE = cute.local_tile(
                         epilogue_params.mLSE,
                         (cta_pv_tiler[0], 1, 1),
@@ -5485,6 +5507,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cute.math.log2(row_sum, fastmath=True)
                     + epilogue_params.softmax_scale_log2 * row_max
                 )
+                if cutlass.const_expr(self.producer_only):
+                    lse = cutlass.Float32(
+                        cutlass.select_(
+                            producer_row_has_mass,
+                            lse,
+                            cutlass.Float32(float("-inf")),
+                        )
+                    )
                 gLSE = cute.local_tile(
                     epilogue_params.mAccLSE[
                         None, common_params.blk_coord[3], None, None

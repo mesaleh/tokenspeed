@@ -22,7 +22,7 @@ def _page_table(lengths: list[int]) -> torch.Tensor:
     pages_per_request = [
         (length + fixture.PAGE - 1) // fixture.PAGE for length in lengths
     ]
-    width = max(1, max(pages_per_request))
+    width = max(4, math.ceil(max(pages_per_request) / 4) * 4)
     rows = []
     offset = 0
     for page_count in pages_per_request:
@@ -78,9 +78,10 @@ def _reference_owner(
     cold_high_rope: torch.Tensor | None = None,
     cold_residual_rope: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    query_len = query.shape[1]
     output = torch.empty(
         1,
-        benchmark.QUERY_LEN,
+        query_len,
         benchmark.HEADS,
         benchmark.LATENT,
         dtype=torch.bfloat16,
@@ -88,18 +89,19 @@ def _reference_owner(
     )
     lse = torch.empty(
         1,
-        benchmark.QUERY_LEN,
+        query_len,
         benchmark.HEADS,
         dtype=torch.float32,
         device="cuda",
     )
-    rows = benchmark.QUERY_LEN * benchmark.HEADS
+    rows = query_len * benchmark.HEADS
     workspace = torch.empty(
         rows * 64 * (benchmark.LATENT + 1) * 4,
         dtype=torch.int8,
         device="cuda",
     )
     sequence = torch.tensor([sequence_length], dtype=torch.int32, device="cuda")
+    reference_splits = min(splits, max(1, math.ceil(sequence_length / 128)))
     if cold_query_rope is None:
         tokenspeed_mla_decode(
             query=query,
@@ -114,7 +116,7 @@ def _reference_owner(
             out=output,
             causal_mask=causal,
             enable_pdl=True,
-            split_kv_override=splits,
+            split_kv_override=reference_splits,
             return_lse=True,
             lse_out=lse,
         )
@@ -137,7 +139,7 @@ def _reference_owner(
             out=output,
             causal_mask=causal,
             enable_pdl=True,
-            split_kv_override=splits,
+            split_kv_override=reference_splits,
             return_lse=True,
             lse_out=lse,
         )
@@ -157,7 +159,12 @@ def run() -> dict[str, object]:
     fixture.QUERY_LEN = benchmark.QUERY_LEN
     fixture.HOT_CAPACITY = 2_560 * benchmark.BATCH
 
-    hot_lengths = [10_752, 0, 4_096, 0, 2_048, 1_024, 1_536, 1_024]
+    # Request 0's runtime length ends one token beyond the hot/cold boundary.
+    # Its q5 query has four early rows with no visible cold key and is the
+    # regression shape for masked producer partials. Physical fixture lengths
+    # remain page-aligned; request 2 compensates for the shifted page so the
+    # frozen aggregate hot capacity is unchanged.
+    hot_lengths = [10_720, 0, 4_128, 0, 2_048, 1_024, 1_536, 1_024]
     cold_lengths = [fixture.SEQ_LEN - value for value in hot_lengths]
     if sum(hot_lengths) != fixture.HOT_CAPACITY:
         raise AssertionError("edge layout changed the frozen hot capacity")
@@ -199,12 +206,18 @@ def run() -> dict[str, object]:
     # Preserve the physical page allocation while making every non-empty final
     # page partial. This covers zero-length owners and non-page-aligned bounds
     # in the same graph-stable batch.
-    hot_runtime = [length - 3 if length else 0 for length in hot_lengths]
-    cold_runtime = [length - 5 if length else 0 for length in cold_lengths]
+    hot_runtime = [
+        length - 1 if request == 0 else length - 3 if length else 0
+        for request, length in enumerate(hot_lengths)
+    ]
+    cold_runtime = [
+        1 if request == 0 else length - 5 if length else 0
+        for request, length in enumerate(cold_lengths)
+    ]
     hot_seq = torch.tensor(hot_runtime, dtype=torch.int32, device="cuda")
     cold_seq = torch.tensor(cold_runtime, dtype=torch.int32, device="cuda")
     causal_owner = [
-        "hot",
+        "straddle",
         "cold",
         "hot",
         "cold",
@@ -216,16 +229,26 @@ def run() -> dict[str, object]:
     causal_delta = benchmark.QUERY_LEN - 1
     hot_causal_seq = torch.tensor(
         [
-            length + (0 if owner == "hot" else causal_delta)
-            for length, owner in zip(hot_runtime, causal_owner, strict=True)
+            hot_runtime[0] + cold_runtime[0],
+            *[
+                length + (0 if owner == "hot" else causal_delta)
+                for length, owner in zip(
+                    hot_runtime[1:], causal_owner[1:], strict=True
+                )
+            ],
         ],
         dtype=torch.int32,
         device="cuda",
     )
     cold_causal_seq = torch.tensor(
         [
-            length + (0 if owner == "cold" else causal_delta)
-            for length, owner in zip(cold_runtime, causal_owner, strict=True)
+            cold_runtime[0],
+            *[
+                length + (0 if owner == "cold" else causal_delta)
+                for length, owner in zip(
+                    cold_runtime[1:], causal_owner[1:], strict=True
+                )
+            ],
         ],
         dtype=torch.int32,
         device="cuda",
@@ -347,6 +370,31 @@ def run() -> dict[str, object]:
     direct_workspace.view(torch.float32).fill_(float("nan"))
     workspace.view(torch.float32).fill_(float("nan"))
     direct_launch()
+    cold_float = cold_workspace.view(torch.float32)
+    cold_acc = cold_float[: rows * benchmark.COLD_SPLITS * benchmark.LATENT].view(
+        rows,
+        benchmark.COLD_SPLITS,
+        benchmark.LATENT,
+    )
+    cold_lse = cold_float[
+        rows * benchmark.COLD_SPLITS * benchmark.LATENT :
+    ].view(rows, benchmark.COLD_SPLITS)
+    fully_masked_rows = (benchmark.QUERY_LEN - 1) * benchmark.HEADS
+    masked_cold_acc = cold_acc[:fully_masked_rows, 0]
+    if not torch.equal(masked_cold_acc, torch.zeros_like(masked_cold_acc)):
+        raise AssertionError(
+            "producer did not zero fully masked q5 partials: "
+            f"nan={int(torch.isnan(masked_cold_acc).sum())}, "
+            f"nonzero={int(torch.count_nonzero(masked_cold_acc))}"
+        )
+    masked_cold_lse = cold_lse[:fully_masked_rows, 0]
+    if not torch.isneginf(masked_cold_lse).all():
+        raise AssertionError(
+            "producer did not publish zero-mass LSE for masked q5 rows: "
+            f"nan={int(torch.isnan(masked_cold_lse).sum())}, "
+            f"min={float(torch.nan_to_num(masked_cold_lse).min())}, "
+            f"max={float(torch.nan_to_num(masked_cold_lse).max())}"
+        )
     candidate_launch()
     torch.cuda.synchronize()
     torch.testing.assert_close(output, direct_output, rtol=0, atol=0)
@@ -365,6 +413,72 @@ def run() -> dict[str, object]:
     reference_outputs = []
     reference_lses = []
     for request in range(benchmark.BATCH):
+        if causal_owner[request] == "straddle":
+            request_outputs = []
+            request_lses = []
+            for query_index in range(benchmark.QUERY_LEN):
+                visible_hot = max(
+                    0,
+                    min(
+                        hot_runtime[request],
+                        int(hot_causal_seq[request])
+                        - (benchmark.QUERY_LEN - 1)
+                        + query_index,
+                    ),
+                )
+                visible_cold = max(
+                    0,
+                    min(
+                        cold_runtime[request],
+                        int(cold_causal_seq[request])
+                        - (benchmark.QUERY_LEN - 1)
+                        + query_index,
+                    ),
+                )
+                hot_output = hot_lse = None
+                cold_output = cold_lse = None
+                if visible_hot:
+                    hot_output, hot_lse = _reference_owner(
+                        query=hot_query[
+                            request : request + 1,
+                            query_index : query_index + 1,
+                        ],
+                        cache=hot_cache,
+                        table=hot_table[request : request + 1],
+                        sequence_length=visible_hot,
+                        causal=False,
+                        splits=benchmark.HOT_SPLITS,
+                    )
+                if visible_cold:
+                    cold_output, cold_lse = _reference_owner(
+                        query=state.r31_query_latent[
+                            request : request + 1,
+                            query_index : query_index + 1,
+                        ],
+                        cache=state.packed_cold,
+                        table=cold_table[request : request + 1],
+                        sequence_length=visible_cold,
+                        causal=False,
+                        splits=benchmark.COLD_SPLITS,
+                        cold_query_rope=state.r31_query_rope[
+                            request : request + 1,
+                            query_index : query_index + 1,
+                        ],
+                        cold_scale=state.cold_scale,
+                        cold_high_rope=state.cold_high,
+                        cold_residual_rope=state.cold_residual,
+                    )
+                merged_output, merged_lse = _merge(
+                    hot_output,
+                    hot_lse,
+                    cold_output,
+                    cold_lse,
+                )
+                request_outputs.append(merged_output[0, 0])
+                request_lses.append(merged_lse[0, 0])
+            reference_outputs.append(torch.stack(request_outputs))
+            reference_lses.append(torch.stack(request_lses))
+            continue
         hot_output = hot_lse = None
         cold_output = cold_lse = None
         if hot_runtime[request]:
@@ -413,11 +527,25 @@ def run() -> dict[str, object]:
         "hot_lengths": hot_runtime,
         "cold_lengths": cold_runtime,
         "causal_owner": causal_owner,
-        "empty_hot_requests": [1, 3],
-        "empty_cold_requests": [0],
+        "q5_boundary_straddle": {
+            "request": 0,
+            "hot_length": hot_runtime[0],
+            "cold_length": cold_runtime[0],
+            "hot_causal": int(hot_causal_seq[0]),
+            "cold_causal": int(cold_causal_seq[0]),
+            "fully_masked_cold_rows": 4,
+        },
+        "empty_hot_requests": [
+            index for index, length in enumerate(hot_runtime) if length == 0
+        ],
+        "empty_cold_requests": [
+            index for index, length in enumerate(cold_runtime) if length == 0
+        ],
         "all_nonempty_final_pages_partial": True,
         "bit_exact_public_api_vs_direct_mixed": True,
         "graph_replay_bit_exact": True,
+        "fully_masked_producer_partials_zero": True,
+        "fully_masked_producer_lse_negative_infinity": True,
         "output_max_abs": output_max_abs,
         "lse_max_abs": lse_max_abs,
         "within_tolerance": True,

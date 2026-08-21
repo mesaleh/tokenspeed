@@ -24,6 +24,51 @@ def _effective_splits(length: int, declared: int) -> int:
 
 @unittest.skipUnless(_is_sm100(), "mixed MLA reduction requires SM100")
 class TestMixedMLAReduction(unittest.TestCase):
+    def test_q5_ignores_fully_masked_owner_partials(self) -> None:
+        """A q5 boundary owner may have active splits but no visible keys."""
+
+        batch, query_len, heads, latent = 1, 5, 8, 512
+        hot_declared = cold_declared = 1
+        rows = batch * query_len * heads
+        owner_bytes = rows * (latent + 1) * 4
+        workspace = torch.empty(
+            2 * owner_bytes,
+            dtype=torch.int8,
+            device="cuda",
+        )
+        hot_float = workspace[:owner_bytes].view(torch.float32)
+        cold_float = workspace[owner_bytes:].view(torch.float32)
+        hot_float[: rows * latent].fill_(1.0)
+        hot_float[rows * latent :].zero_()
+        # Model the early rows of a q5 hot/cold boundary straddle: the cold
+        # split exists, but every key is causally masked. Its partial must be
+        # ignored even if the producer-side accumulator is undefined.
+        cold_float[: rows * latent].fill_(float("nan"))
+        cold_float[rows * latent :].fill_(-float("inf"))
+
+        lengths = torch.ones((batch,), dtype=torch.int32, device="cuda")
+        output = torch.empty(
+            (batch, query_len, heads, latent), dtype=torch.bfloat16, device="cuda"
+        )
+        output_lse = torch.empty(
+            (batch, query_len, heads), dtype=torch.float32, device="cuda"
+        )
+        reduce_mla_mixed_workspace(
+            workspace,
+            lengths,
+            lengths,
+            hot_declared,
+            cold_declared,
+            output,
+            output_lse,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+        torch.testing.assert_close(
+            output_lse, torch.zeros_like(output_lse), rtol=0, atol=0
+        )
+
     def test_q5_ignores_poisoned_declared_gaps_and_graph_replays(self) -> None:
         torch.manual_seed(0xA1736)
         batch, query_len, heads, latent = 3, 5, 8, 512
