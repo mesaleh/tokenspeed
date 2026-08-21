@@ -1,4 +1,4 @@
-"""Matched graph benchmark for normalized, serial, and lookahead R31."""
+"""Repeated matched-graph benchmark for normalized and physical R31."""
 
 from __future__ import annotations
 
@@ -24,7 +24,12 @@ def _measure(graph: torch.cuda.CUDAGraph, repeats: int = 100) -> float:
     return begin.elapsed_time(end) * 1000.0 / repeats
 
 
-def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str, object]:
+def _case(
+    batch: int,
+    query_len: int,
+    sequence_length: int = 7_440,
+    windows: int = 9,
+) -> dict[str, object]:
     device = torch.device("cuda:0")
     page_count = math.ceil(math.ceil(sequence_length / 32) / 4) * 4
     pages = batch * page_count
@@ -54,6 +59,7 @@ def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str,
     )
     candidate_out = torch.empty_like(control_out)
     serial_out = torch.empty_like(control_out)
+    candidate_fault_status = torch.zeros((1,), device=device, dtype=torch.int32)
 
     common = dict(
         query_latent=query_latent,
@@ -85,8 +91,10 @@ def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str,
         _physical_split_score=True,
         _physical_split_score_lookahead=False,
         _physical_split_score_dual_tmem=True,
+        _physical_split_score_fault_status=candidate_fault_status,
     )
     torch.cuda.synchronize()
+    candidate_eager = candidate_out.clone()
     control_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(control_graph):
         tokenspeed_mla_decode_tq_r31(
@@ -110,24 +118,53 @@ def _case(batch: int, query_len: int, sequence_length: int = 7_440) -> dict[str,
             _physical_split_score=True,
             _physical_split_score_lookahead=False,
             _physical_split_score_dual_tmem=True,
+            _physical_split_score_fault_status=candidate_fault_status,
         )
-    control_a_us = _measure(control_graph)
+    # A single 100-replay event window occasionally shows unrelated timing
+    # interference on this shared cluster.  Repeat identical A/candidate/B
+    # brackets and aggregate raw times so one interruption cannot decide a
+    # sub-10% verdict.
+    control_samples: list[float] = []
+    candidate_samples: list[float] = []
+    window_deltas: list[float] = []
+    for _ in range(windows):
+        control_a = _measure(control_graph)
+        candidate = _measure(candidate_graph)
+        control_b = _measure(control_graph)
+        control = (control_a + control_b) / 2.0
+        control_samples.extend((control_a, control_b))
+        candidate_samples.append(candidate)
+        window_deltas.append((candidate / control - 1.0) * 100.0)
     serial_us = _measure(serial_graph)
-    candidate_us = _measure(candidate_graph)
-    control_b_us = _measure(control_graph)
-    control_us = (control_a_us + control_b_us) / 2.0
+    torch.cuda.synchronize()
+    control_us = sum(control_samples) / len(control_samples)
+    candidate_us = sum(candidate_samples) / len(candidate_samples)
+    sorted_window_deltas = sorted(window_deltas)
+    median_window_delta = sorted_window_deltas[len(sorted_window_deltas) // 2]
+    graph_delta = (candidate_out.float() - candidate_eager.float()).abs()
     result = {
         "batch": batch,
         "query_len": query_len,
         "sequence_length": sequence_length,
-        "control_a_us": control_a_us,
+        "windows": windows,
+        "control_samples_us": control_samples,
+        "candidate_samples_us": candidate_samples,
+        "candidate_window_delta_pct": window_deltas,
+        "candidate_median_window_delta_pct": median_window_delta,
+        "candidate_worst_window_delta_pct": max(window_deltas),
+        "control_us": control_us,
         "serial_us": serial_us,
         "candidate_us": candidate_us,
-        "control_b_us": control_b_us,
         "candidate_delta_pct": (candidate_us / control_us - 1.0) * 100.0,
         "serial_delta_pct": (serial_us / control_us - 1.0) * 100.0,
+        "candidate_fault_status": int(candidate_fault_status.item()),
+        "candidate_graph_replay_max_abs": float(graph_delta.max()),
     }
     print(json.dumps(result, sort_keys=True), flush=True)
+    if result["candidate_fault_status"] != 0:
+        raise AssertionError(result)
+    if result["candidate_graph_replay_max_abs"] != 0.0:
+        raise AssertionError(result)
     return result
 
 

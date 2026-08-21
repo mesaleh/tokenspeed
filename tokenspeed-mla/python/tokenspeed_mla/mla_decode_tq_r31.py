@@ -139,6 +139,7 @@ def _validate_r31_inputs(
     out: Optional[torch.Tensor],
     lse_out: Optional[torch.Tensor],
     return_lse: bool,
+    fault_status: Optional[torch.Tensor] = None,
 ) -> tuple[int, int]:
     if not isinstance(query_latent, torch.Tensor):
         raise TypeError("query_latent must be a torch.Tensor")
@@ -329,9 +330,24 @@ def _validate_r31_inputs(
             )
         if not return_lse:
             raise ValueError("lse_out requires return_lse=True")
+    if fault_status is not None:
+        _require_tensor(
+            "fault_status",
+            fault_status,
+            dtype=torch.int32,
+            ndim=1,
+            device=device,
+            alignment=4,
+        )
+        if tuple(fault_status.shape) != (1,):
+            raise ValueError(
+                f"fault_status must have shape (1,), got {tuple(fault_status.shape)}"
+            )
 
     writable = tuple(
-        tensor for tensor in (out, lse_out, workspace_buffer) if tensor is not None
+        tensor
+        for tensor in (out, lse_out, workspace_buffer, fault_status)
+        if tensor is not None
     )
     readonly = (
         query_latent,
@@ -382,6 +398,7 @@ def _get_compiled_tq_r31_kernel(
     physical_split_score: bool = False,
     physical_split_score_lookahead: bool = True,
     physical_split_score_dual_tmem: bool = False,
+    fault_status: Optional[torch.Tensor] = None,
 ) -> Callable:
     """Compile/cache a shape-specialized compact R31 kernel."""
     key = (
@@ -404,6 +421,7 @@ def _get_compiled_tq_r31_kernel(
         physical_split_score,
         physical_split_score_lookahead,
         physical_split_score_dual_tmem,
+        fault_status is not None,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
     if compiled is not None:
@@ -486,6 +504,11 @@ def _get_compiled_tq_r31_kernel(
                 _as_cute_tensor(reconstruction_scale, cutlass.BFloat16, 1, 16),
                 None,
                 _as_cute_tensor(residual_rope, cutlass.Uint8, 2, 16),
+                (
+                    _as_cute_tensor(fault_status, cutlass.Int32, 0, 4)
+                    if fault_status is not None
+                    else None
+                ),
                 options="--enable-tvm-ffi --opt-level 3",
             )
         _COMPILED_R31_KERNELS[key] = compiled
@@ -516,6 +539,7 @@ def tokenspeed_mla_decode_tq_r31(
     _physical_split_score: bool = False,
     _physical_split_score_lookahead: bool = True,
     _physical_split_score_dual_tmem: bool = False,
+    _physical_split_score_fault_status: Optional[torch.Tensor] = None,
 ):
     """Decode MLA attention directly from the compact 354-byte R31 cache.
 
@@ -533,6 +557,10 @@ def tokenspeed_mla_decode_tq_r31(
     ``producer_only=True`` is the mixed-cache stage-1 contract: it publishes
     split partials to ``workspace_buffer``, requires caller-owned ``out``, does
     not write ``out`` or a final LSE, and returns ``None``.
+
+    The diagnostic dual-TMEM arm requires a caller-owned zero-initialized fault
+    word.  Its output is valid only when that word remains zero after stream
+    completion; a nonzero sticky value rejects the entire launch.
     """
     for name, value in (
         ("softmax_scale", softmax_scale),
@@ -560,6 +588,13 @@ def tokenspeed_mla_decode_tq_r31(
         raise ValueError("dual-TMEM requires physical split-score")
     if _physical_split_score_dual_tmem and _physical_split_score_lookahead:
         raise ValueError("dual-TMEM and lookahead are mutually exclusive")
+    if _physical_split_score_dual_tmem and _physical_split_score_fault_status is None:
+        raise ValueError("dual-TMEM requires caller-owned fault status")
+    if (
+        not _physical_split_score_dual_tmem
+        and _physical_split_score_fault_status is not None
+    ):
+        raise ValueError("fault status is reserved for dual-TMEM physical R31")
 
     batch, query_len = _validate_r31_inputs(
         query_latent,
@@ -575,6 +610,7 @@ def tokenspeed_mla_decode_tq_r31(
         out,
         lse_out,
         return_lse,
+        _physical_split_score_fault_status,
     )
     resolved_causal_mask = query_len > 1 if causal_mask is None else causal_mask
 
@@ -656,6 +692,7 @@ def tokenspeed_mla_decode_tq_r31(
         physical_split_score=_physical_split_score,
         physical_split_score_lookahead=_physical_split_score_lookahead,
         physical_split_score_dual_tmem=_physical_split_score_dual_tmem,
+        fault_status=_physical_split_score_fault_status,
     )
 
     import tvm_ffi
@@ -679,6 +716,7 @@ def tokenspeed_mla_decode_tq_r31(
             reconstruction_scale,
             None,
             residual_rope,
+            _physical_split_score_fault_status,
         )
 
     if producer_only:

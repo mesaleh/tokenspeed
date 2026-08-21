@@ -140,6 +140,7 @@ SplitKVKernelArgs = tuple[
     Optional[cute.ComposedLayout],
     cute.Layout,
     MLAStaticTileSchedulerParams,
+    Optional[cute.Tensor],
 ]
 
 
@@ -276,6 +277,19 @@ def expand_r31_e2m1_smem_in_place(packed_b: cute.Tensor):
         (u64_ptr + destination).store(values[batch])
         (u64_ptr + destination + 1).store(cutlass.Uint64(0))
     cute.arch.sync_warp()
+
+
+@cute.jit
+def is_valid_r31_physical_scale(value: cutlass.Float32) -> cutlass.Boolean:
+    """Return whether a BF16-promoted scale is valid for physical R31."""
+
+    # Valid scales are positive, finite FP32 values in one contiguous bit
+    # interval.  Unsigned subtraction turns values below the lower bound into
+    # a wrapped delta, so one compare also rejects zero, negatives, inf, NaN,
+    # and values above the upper bound.
+    bits = value.bitcast(cutlass.Uint32)
+    delta = bits - cutlass.Uint32(0x37800000)  # bits(2^-16)
+    return cutlass.Boolean(delta <= cutlass.Uint32(0x13E00000))
 
 
 @cute.jit
@@ -541,6 +555,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError("S1 key-RoPE stages must be one of 0, 1, or 2")
         if self.tq_r31_async_expand and not self.use_tq_r31_any_rope:
             raise ValueError("R31 asynchronous expansion requires the R31 RoPE path")
+        if (
+            self.tq_r31_physical_split_score_dual_tmem
+            and not self.tq_s1_scale_tma
+        ):
+            raise ValueError("dual-TMEM physical R31 requires TMA scale delivery")
+        if (
+            self.tq_r31_physical_split_score_dual_tmem
+            and not self.tq_r31_async_expand
+        ):
+            raise ValueError(
+                "dual-TMEM physical R31 requires asynchronous residual expansion"
+            )
         if self.use_tq_e2m1 and (cp_world != 1 or mma_qk_tiler_mn[0] != 64):
             raise ValueError("TurboQuant E2M1 K0 only supports cp_world=1 M64")
         if mma_qk_tiler_mn[0] == 128:
@@ -723,6 +749,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         c_scale: Optional[cute.Tensor] = None,
         c_scale_diag: Optional[cute.Tensor] = None,
         c_rope_residual: Optional[cute.Tensor] = None,
+        tq_fault_status: Optional[cute.Tensor] = None,
         prepare_only: cutlass.Constexpr = False,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
@@ -820,6 +847,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     raise TypeError(
                         "R31 expects E4M3 query/high RoPE and uint8 packed "
                         "E2M1 residual RoPE"
+                    )
+                if cutlass.const_expr(
+                    self.tq_r31_physical_split_score_dual_tmem
+                    and (
+                        tq_fault_status is None
+                        or tq_fault_status.element_type != cutlass.Int32
+                    )
+                ):
+                    raise TypeError(
+                        "dual-TMEM physical R31 requires caller-owned int32 "
+                        "fault status"
                     )
             elif cutlass.const_expr(
                 q_rope.element_type != cutlass.BFloat16
@@ -1618,6 +1656,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             vc_smem_layout_for_tma,
             cta_layout_vmnk,
             tile_sched_params,
+            tq_fault_status,
         )
         if cutlass.const_expr(prepare_only):
             return split_kv_kernel_args, grid, SplitKVKernelSharedStorage
@@ -1888,6 +1927,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             vc_smem_layout_for_tma,
             cta_layout_vmnk,
             tile_sched_params,
+            tq_fault_status,
         ) = kernel_args
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2317,6 +2357,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     pipeline.PipelineUserType.Consumer,
                     self.load_k_rope_pipeline_stage,
                 )
+                scale_sanitize_state = None
+                if cutlass.const_expr(
+                    self.tq_r31_physical_split_score_dual_tmem
+                ):
+                    # The residual-expansion warp is already on the critical
+                    # publication path to physical-RoPE MMA.  Validate each
+                    # token scale here once, while its Gather4 stage is live,
+                    # instead of repeating the full range test for every
+                    # query/head score and again during P conversion.
+                    scale_sanitize_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer,
+                        self.load_scale_stage,
+                    )
                 expand_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, 1
                 )
@@ -2327,11 +2380,47 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 work_tile = tile_sched.initial_work_tile_info()
                 while work_tile.is_valid_tile:
                     blk_coord = work_tile.tile_idx
-                    _, k_tile_count, _ = self.get_k_tile_count(
+                    k_index, k_tile_count, _ = self.get_k_tile_count(
                         split_kv, cache_seqs, block_split_kvs, blk_coord
                     )
                     while k_tile_count > 0:
                         load_k_rope_pipeline.consumer_wait(load_k_rope_expand_state)
+                        if cutlass.const_expr(
+                            self.tq_r31_physical_split_score_dual_tmem
+                        ):
+                            load_scale_pipeline.consumer_wait(scale_sanitize_state)
+                            lane = tidx % self.threads_per_warp
+                            for i in cutlass.range_constexpr(
+                                self.mma_qk_tiler[1] // self.threads_per_warp
+                            ):
+                                token = lane + i * self.threads_per_warp
+                                logical_token = k_index * self.mma_qk_tiler[1] + token
+                                loaded_scale = sScale[
+                                    token,
+                                    0,
+                                    0,
+                                    scale_sanitize_state.index,
+                                ].to(cutlass.Float32)
+                                sanitized_scale = cutlass.Float32(0.0)
+                                if cute.elem_less(
+                                    logical_token, cache_seqs[blk_coord[2]]
+                                ):
+                                    valid_scale = is_valid_r31_physical_scale(
+                                        loaded_scale
+                                    )
+                                    if valid_scale:
+                                        sanitized_scale = loaded_scale
+                                    else:
+                                        cute.arch.atomic_add(
+                                            tq_fault_status.iterator.llvm_ptr,
+                                            Int32(1),
+                                        )
+                                sScale[
+                                    token,
+                                    0,
+                                    0,
+                                    scale_sanitize_state.index,
+                                ] = sanitized_scale.to(cutlass.BFloat16)
                         residual_stage = sKC_rope_residual[None, None, 0]
                         expand_r31_e2m1_smem_in_place(residual_stage)
                         cute.arch.fence_view_async_shared()
@@ -2344,6 +2433,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             load_k_rope_expand_state
                         )
                         load_k_rope_expand_state.advance()
+                        if cutlass.const_expr(
+                            self.tq_r31_physical_split_score_dual_tmem
+                        ):
+                            # Compute owns the scale pipeline release.  This
+                            # read-only consumer state only orders sanitization
+                            # before the expand-ready publication awaited by MMA.
+                            scale_sanitize_state.advance()
+                        k_index += 1
                         k_tile_count -= 1
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
@@ -4914,19 +5011,60 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             0,
                             load_scale_consumer_state.index,
                         ].to(cutlass.Float32)
-                        scale = cutlass.Float32(
-                            cutlass.select_(
-                                cute.elem_less(logical_token, common_params.K),
-                                loaded_scale,
-                                cutlass.Float32(0.0),
-                            )
+                        is_live_scale = cute.elem_less(
+                            logical_token, common_params.K
                         )
+                        if cutlass.const_expr(
+                            self.tq_r31_physical_split_score_dual_tmem
+                        ):
+                            # The expansion warp has range-checked this shared
+                            # stage and replaced every invalid/tail scale by
+                            # zero before MMA can publish the score tile.
+                            valid_physical_scale = cutlass.Boolean(False)
+                            if is_live_scale:
+                                # The expansion owner publishes sanitized zero
+                                # through r31_expand before rope-score MMA can
+                                # complete.  Keep this hot-path check minimal;
+                                # the caller-owned sticky status is the
+                                # authoritative validity gate for the launch.
+                                valid_physical_scale = cutlass.Boolean(
+                                    loaded_scale > cutlass.Float32(0.0)
+                                )
+                            scale = cutlass.Float32(
+                                cutlass.select_(
+                                    valid_physical_scale,
+                                    loaded_scale,
+                                    cutlass.Float32(0.0),
+                                )
+                            )
+                        else:
+                            scale = cutlass.Float32(
+                                cutlass.select_(
+                                    is_live_scale,
+                                    loaded_scale,
+                                    cutlass.Float32(0.0),
+                                )
+                            )
                     else:
                         scale = s_scale[token].to(cutlass.Float32)
                     if cutlass.const_expr(self.use_tq_r31_physical_split_score):
-                        tTR_rAcc[element] = (
-                            tTR_rLatent[element] * scale + tTR_rAcc[element]
-                        )
+                        if cutlass.const_expr(
+                            self.tq_r31_physical_split_score_dual_tmem
+                        ):
+                            physical_score = (
+                                tTR_rLatent[element] * scale + tTR_rAcc[element]
+                            )
+                            tTR_rAcc[element] = cutlass.Float32(
+                                cutlass.select_(
+                                    valid_physical_scale,
+                                    physical_score,
+                                    cutlass.Float32(-1.0e6),
+                                )
+                            )
+                        else:
+                            tTR_rAcc[element] = (
+                                tTR_rLatent[element] * scale + tTR_rAcc[element]
+                            )
                     else:
                         tTR_rAcc[element] = tTR_rAcc[element] * scale
                     if cutlass.const_expr(self.tq_s1_scale_tma):
@@ -5220,11 +5358,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         0,
                         load_scale_consumer_state.index,
                     ].to(cutlass.Float32)
+                    live0 = cute.elem_less(logical_token0, common_params.K)
                     token_scale0 = cutlass.Float32(
                         cutlass.select_(
-                            cute.elem_less(logical_token0, common_params.K),
-                            loaded_scale0,
-                            cutlass.Float32(0.0),
+                            live0, loaded_scale0, cutlass.Float32(0.0)
                         )
                     )
 
@@ -5236,11 +5373,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         0,
                         load_scale_consumer_state.index,
                     ].to(cutlass.Float32)
+                    live1 = cute.elem_less(logical_token1, common_params.K)
                     token_scale1 = cutlass.Float32(
                         cutlass.select_(
-                            cute.elem_less(logical_token1, common_params.K),
-                            loaded_scale1,
-                            cutlass.Float32(0.0),
+                            live1, loaded_scale1, cutlass.Float32(0.0)
                         )
                     )
 
@@ -5276,9 +5412,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 0,
                                 load_scale_consumer_state.index,
                             ].to(cutlass.Float32)
+                            live_scale = cute.elem_less(
+                                logical_token, common_params.K
+                            )
                             token_scale = cutlass.Float32(
                                 cutlass.select_(
-                                    cute.elem_less(logical_token, common_params.K),
+                                    live_scale,
                                     loaded_scale,
                                     cutlass.Float32(0.0),
                                 )
