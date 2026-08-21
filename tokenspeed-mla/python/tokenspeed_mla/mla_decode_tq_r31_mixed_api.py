@@ -411,14 +411,7 @@ def _get_compiled_mixed_kernel(
     fault_status: Optional[torch.Tensor],
 ) -> Callable:
     batch, query_len = hot_query_latent.shape[:2]
-    physical_specialized_q5_b1 = (
-        physical_r31 and batch == 1 and query_len == 5
-    )
-    # Share the generic q1 and q5 c8/c5 modules, but retain the existing q5/c1
-    # packed-P specialization. In the mixed grid, the hot producer and global
-    # reducer expose the generic q5/c1 cold-child floor that was hidden by the
-    # standalone Q3D measurement.
-    dynamic_batch = physical_r31 and not physical_specialized_q5_b1
+    dynamic_batch = physical_r31
     key = (
         hot_query_latent.device.index,
         _tensor_signature(
@@ -449,7 +442,6 @@ def _get_compiled_mixed_kernel(
         fold_sq_factor,
         enable_pdl,
         physical_r31,
-        physical_specialized_q5_b1,
         fault_status is not None,
     )
     compiled = _COMPILED_MIXED_KERNELS.get(key)
@@ -497,12 +489,12 @@ def _get_compiled_mixed_kernel(
             tq_s1_scale_stages=3,
             tq_s1_k_rope_stages=1,
             tq_s1_packed_p_scale_math=(
-                physical_specialized_q5_b1
+                False
                 if physical_r31
                 else _use_packed_p_scale_math(batch, query_len)
             ),
             tq_s1_early_final_pcor=(
-                physical_specialized_q5_b1
+                False
                 if physical_r31
                 else _use_early_final_pcor(batch, query_len)
             ),
