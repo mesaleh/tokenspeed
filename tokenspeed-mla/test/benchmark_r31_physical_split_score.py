@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 
@@ -169,21 +170,46 @@ def _case(
 
 
 def run() -> list[dict[str, object]]:
-    cells = [_case(batch, query_len) for query_len in (1, 5) for batch in (1, 5, 8)]
+    # SGLang captures the largest decode graph first so smaller graphs can reuse
+    # its memory pool.  Keep the qualification order production-representative:
+    # ascending capture can create an allocator-state slowdown that serving
+    # never exercises.
+    cells = [_case(batch, query_len) for query_len in (1, 5) for batch in (8, 5, 1)]
+    arithmetic_mean_pct = sum(
+        float(cell["candidate_delta_pct"]) for cell in cells
+    ) / len(cells)
     print(
         json.dumps(
             {
                 "cells": cells,
-                "arithmetic_mean_pct": sum(
-                    float(cell["candidate_delta_pct"]) for cell in cells
-                )
-                / len(cells),
+                "arithmetic_mean_pct": arithmetic_mean_pct,
             },
             sort_keys=True,
         )
     )
+    if any(float(cell["candidate_delta_pct"]) > 10.0 for cell in cells):
+        raise AssertionError("a component cell exceeded the 10% regression gate")
+    if arithmetic_mean_pct > 5.0:
+        raise AssertionError("component arithmetic mean exceeded the 5% gate")
     return cells
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int)
+    parser.add_argument("--batches", type=int, nargs="+")
+    parser.add_argument("--query-len", type=int)
+    parser.add_argument("--windows", type=int, default=9)
+    args = parser.parse_args()
+    if args.batch is not None and args.batches is not None:
+        parser.error("--batch and --batches are mutually exclusive")
+    selected_batches = args.batches or (
+        [args.batch] if args.batch is not None else []
+    )
+    if bool(selected_batches) != (args.query_len is not None):
+        parser.error("a batch selection and --query-len must be provided together")
+    if not selected_batches:
+        run()
+    else:
+        for selected_batch in selected_batches:
+            _case(selected_batch, args.query_len, windows=args.windows)

@@ -400,19 +400,66 @@ def _get_compiled_tq_r31_kernel(
     physical_split_score_dual_tmem: bool = False,
     fault_status: Optional[torch.Tensor] = None,
 ) -> Callable:
-    """Compile/cache a shape-specialized compact R31 kernel."""
+    """Compile/cache a policy-specialized compact R31 kernel."""
+    batch, query_len = query_latent.shape[:2]
+    use_packed_p_scale_math = _use_packed_p_scale_math(batch, query_len)
+    use_early_final_pcor = _use_early_final_pcor(batch, query_len)
+    if physical_split_score_dual_tmem:
+        # The B1/q5 packed-P route would require a second q5 module after the
+        # generic B8/B5 capture.  Reuse the generic dynamic-batch module: its
+        # arithmetic is exact and avoids the late-capture module-state cliff.
+        use_packed_p_scale_math = False
+        use_early_final_pcor = False
+
+    # Every tensor passed to CuTe below has a runtime-dynamic layout.  The
+    # dual-TMEM policy is identical across batch sizes after selecting the
+    # generic q5 P-scale route above, so share its compiled kernel across the
+    # batch extent.
+    # This matches SGLang's descending multi-shape graph capture without
+    # retaining redundant batch-specialized modules.
+    dynamic_batch_cache = physical_split_score_dual_tmem
+    query_latent_shape_key = (
+        tuple(query_latent.shape[1:])
+        if dynamic_batch_cache
+        else tuple(query_latent.shape)
+    )
+    query_rope_shape_key = (
+        tuple(query_rope.shape[1:])
+        if dynamic_batch_cache
+        else tuple(query_rope.shape)
+    )
+    packed_latent_shape_key = (
+        tuple(packed_latent.shape[1:])
+        if dynamic_batch_cache
+        else tuple(packed_latent.shape)
+    )
+    high_rope_shape_key = (
+        tuple(high_rope.shape[1:])
+        if dynamic_batch_cache
+        else tuple(high_rope.shape)
+    )
+    residual_rope_shape_key = (
+        tuple(residual_rope.shape[1:])
+        if dynamic_batch_cache
+        else tuple(residual_rope.shape)
+    )
+    block_tables_shape_key = (
+        tuple(block_tables.shape[1:])
+        if dynamic_batch_cache
+        else tuple(block_tables.shape)
+    )
     key = (
         query_latent.device.index,
-        tuple(query_latent.shape),
-        tuple(query_rope.shape),
-        tuple(packed_latent.shape),
+        query_latent_shape_key,
+        query_rope_shape_key,
+        packed_latent_shape_key,
         tuple(packed_latent.stride()),
         tuple(reconstruction_scale.stride()),
-        tuple(high_rope.shape),
+        high_rope_shape_key,
         tuple(high_rope.stride()),
-        tuple(residual_rope.shape),
+        residual_rope_shape_key,
         tuple(residual_rope.stride()),
-        tuple(block_tables.shape),
+        block_tables_shape_key,
         workspace is not None,
         lse is not None,
         causal_mask,
@@ -422,6 +469,8 @@ def _get_compiled_tq_r31_kernel(
         physical_split_score_lookahead,
         physical_split_score_dual_tmem,
         fault_status is not None,
+        use_packed_p_scale_math,
+        use_early_final_pcor,
     )
     compiled = _COMPILED_R31_KERNELS.get(key)
     if compiled is not None:
@@ -437,9 +486,6 @@ def _get_compiled_tq_r31_kernel(
                 "safety bound"
             )
 
-        batch, query_len = query_latent.shape[:2]
-        use_packed_p_scale_math = _use_packed_p_scale_math(batch, query_len)
-        use_early_final_pcor = _use_early_final_pcor(batch, query_len)
         with torch.cuda.device(query_latent.device):
             kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
                 acc_dtype=cutlass.Float32,

@@ -454,6 +454,16 @@ def run_invalid_scale() -> dict[str, object]:
     return result
 
 
+def run_dynamic_batch_reuse() -> list[dict[str, object]]:
+    """Validate one dual-TMEM module across production capture batch order."""
+
+    return [
+        run(batch=batch, query_len=query_len)
+        for query_len in (1, 5)
+        for batch in (8, 5, 1)
+    ]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-length", type=int, default=384)
@@ -461,10 +471,13 @@ if __name__ == "__main__":
     parser.add_argument("--query-len", type=int, choices=(1, 5), default=1)
     parser.add_argument("--invalid-scale", action="store_true")
     parser.add_argument("--masked-split-graph", action="store_true")
+    parser.add_argument("--dynamic-batch-reuse", action="store_true")
     args = parser.parse_args()
     if args.invalid_scale:
         run_invalid_scale()
     elif args.masked_split_graph:
         run_masked_split_graph()
+    elif args.dynamic_batch_reuse:
+        run_dynamic_batch_reuse()
     else:
         run(args.sequence_length, args.batch, args.query_len)
